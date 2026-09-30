@@ -54,7 +54,7 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     cparams.n_batch           = 512;
     cparams.n_ubatch          = 512;
     cparams.n_seq_max         = (uint32_t) n_seq_max_;
-    cparams.n_outputs_max_per_seq = 512;
+    cparams.n_outputs_max_per_seq = 128;   // A2(M7): 每问仅 1 decide + n_opts 个输出,512->128 省输出缓冲
     cparams.embeddings        = true;
     cparams.pooling_type      = LLAMA_POOLING_TYPE_NONE;
     cparams.n_threads         = (int32_t) n_threads_;
@@ -95,16 +95,23 @@ KevRows KevModel::rows_of(const KevEnc & enc, std::string * err) const {
 }
 
 bool KevModel::decode_seq(const std::vector<int32_t> & tokens, int start_pos,
-                          llama_seq_id seq, std::string * err) {
+                          llama_seq_id seq, std::string * err,
+                          const std::vector<int32_t> & logits_pos) {
     const int32_t n = (int32_t) tokens.size();
     if (n == 0) { if (err) *err = "empty sequence to decode"; return false; }
+    // A2(M7): 只在需要 hidden 的位置(<decide>/<opt>)设 batch.logits[i]=1,去掉全 token 输出。
+    // 空集合 => 纯 prefill,不产生任何输出。(llama.cpp 侧 output_ids[i]=i,故 output row 索引
+    // 仍等于 token 下标,hidden_at_output(idx) 的调用方式不变,概率保持逐位一致。)
     llama_batch batch = llama_batch_init(n, /*embd=*/0, n_seq_max_);
     for (int32_t i = 0; i < n; ++i) {
         batch.token[i] = (llama_token) tokens[i];
         batch.pos[i]   = (llama_pos)(start_pos + i);
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = seq;
-        batch.logits[i] = 1;   // output embeddings for all tokens (pooling NONE)
+        batch.logits[i] = 0;
+    }
+    for (int32_t p : logits_pos) {
+        if (p >= 0 && p < n) batch.logits[p] = 1;
     }
     batch.n_tokens = n;
     const int r = llama_decode(ctx_, batch);
@@ -134,7 +141,7 @@ int KevModel::ensure_state(const std::vector<int32_t> & state_ids, double * ps_s
     llama_memory_t mem = llama_get_memory(ctx_);
     llama_memory_seq_rm(mem, evict, 0, -1);
     std::string err;
-    if (!decode_seq(state_ids, /*start_pos=*/0, evict, &err)) {
+    if (!decode_seq(state_ids, /*start_pos=*/0, evict, &err, {})) {
         std::fprintf(stderr, "kev_model: state prefill failed: %s\n", err.c_str());
         return -1;
     }
@@ -156,7 +163,13 @@ std::vector<std::vector<float>> KevModel::rows_from_slot(const KevRows & rows, i
     for (const auto & r : rows.rows) {
         double t0 = now_ms();
         llama_memory_seq_cp(mem, slot, scratch_seq_, 0, -1);   // replicate state prefix (KV + recurrent) to scratch
-        if (!decode_seq(r.ids, Ls, scratch_seq_, &err)) {
+        // A2(M7): 只需 <decide> 与各 <opt> 位置的 hidden,构造 logits 位置集合(去重)。
+        std::vector<int32_t> out_pos;
+        out_pos.push_back(r.decide);
+        for (int32_t o : r.opts) {
+            if (std::find(out_pos.begin(), out_pos.end(), o) == out_pos.end()) out_pos.push_back(o);
+        }
+        if (!decode_seq(r.ids, Ls, scratch_seq_, &err, out_pos)) {
             std::fprintf(stderr, "kev_model: branch decode failed: %s\n", err.c_str());
             probs.clear(); return probs;
         }

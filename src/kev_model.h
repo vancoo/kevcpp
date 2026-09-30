@@ -78,7 +78,12 @@ private:
     std::vector<std::vector<float>> rows_from_slot(const KevRows & rows, int slot, double * t_rows,
                                                    std::vector<std::vector<float>> * out_hidden = nullptr,
                                                    std::vector<double> * rows_ms = nullptr);
-    bool decode_seq(const std::vector<int32_t> & tokens, int start_pos, llama_seq_id seq, std::string * err);
+    // 解码 token 序列(续接在 start_pos 之后,写入 seq)。
+    // logits_pos: 需要输出 hidden(=embeddings) 的 token 位置集合(分支的 <decide>/<opt> 处)。
+    //             传空 vector = 不输出任何 hidden(用于 state prefill,省输出缓冲与 GET_ROWS 计算)。
+    // 语义保证: 每个位置的 output row 索引 == 该位置在 tokens 中的下标(利用 output_ids[i]=i)。
+    bool decode_seq(const std::vector<int32_t> & tokens, int start_pos, llama_seq_id seq,
+                    std::string * err, const std::vector<int32_t> & logits_pos);
     std::vector<float> hidden_at_output(int out_idx, std::string * err);  // 从上次 decode 的 output 取 hidden[1024]
 
     llama_context  * ctx_   = nullptr;
