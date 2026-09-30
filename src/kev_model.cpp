@@ -51,8 +51,12 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx             = (uint32_t) (opt.n_ctx > 0 ? opt.n_ctx : 2048);
+    // P.3(PERF): n_ubatch 512 -> 256。n_ubatch 决定 graph_reserve 与 CPU compute buffer 宽度
+    // (491MB -> 245MB, 省一半内存); n_batch 保持 512 = 单次 llama_decode 的容量上限不变
+    // (state<=384 / 单 branch 的通用场景不缩水)。实时行宽(state 38 / branch 89)远小于 256,
+    // 故每次 decode 仍是单 ubatch, 无切批开销。实测同负载冷启动 latency 中性, 概率逐位一致。
     cparams.n_batch           = 512;
-    cparams.n_ubatch          = 512;
+    cparams.n_ubatch          = 256;
     cparams.n_seq_max         = (uint32_t) n_seq_max_;
     cparams.n_outputs_max_per_seq = 128;   // A2(M7): 每问仅 1 decide + n_opts 个输出,512->128 省输出缓冲
     cparams.embeddings        = true;
