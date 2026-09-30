@@ -1,0 +1,8 @@
+{
+  "state": "The quick brown fox jumps over the lazy dog while the weather is sunny and calm today.",
+  "questions": [
+    {"instr": "Based only on the state, is the fox fast?", "options": ["no", "yes"]},
+    {"instr": "What best describes today's weather?", "options": ["sunny", "rainy", "windy", "cold"]},
+    {"instr": "Rate how calm the day is from 1 to 5.", "options": ["very calm", "calm", "neutral", "rough", "very rough"]}
+  ]
+}
