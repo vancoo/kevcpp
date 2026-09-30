@@ -115,3 +115,35 @@ if (MSVC)
     target_compile_options(m7_bench PRIVATE /utf-8)
     target_compile_options(main_server PRIVATE /utf-8)
 endif()
+
+# ---- 仅追加(不修改上方任何已存在段) ----
+# P.4 对照 bench: 等长多问"批量 decode" vs "逐问 decode" 逐位一致性 + 耗时。
+add_executable(m8_bench
+    src/m8_bench.cpp
+    src/kev_api.cpp
+    src/kev_head.cpp
+    src/kev_encode.cpp
+    src/kev_prefix.cpp
+    src/kev_model.cpp
+)
+target_link_libraries(m8_bench PRIVATE llama)
+target_include_directories(m8_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_compile_features(m8_bench PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(m8_bench PRIVATE /utf-8)
+endif()
+
+# ---- 仅追加(不修改上方任何已存在段) ----
+# cold_profile: 受控性能计时探针, 隔离 cold 请求的 图构建/调度固定开销 vs 前向带宽。
+# 独立 bench, 只用 llama C API, 不经过 KevModel。新增 src/cold_profile.cpp。
+add_executable(cold_profile
+    src/cold_profile.cpp
+)
+target_link_libraries(cold_profile PRIVATE llama)
+target_include_directories(cold_profile PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_compile_features(cold_profile PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(cold_profile PRIVATE /utf-8)
+endif()

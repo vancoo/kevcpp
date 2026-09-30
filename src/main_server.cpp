@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
+#include <fstream>
 #include <string>
 
 using nlohmann::json;
@@ -69,6 +70,7 @@ static json model_card(const kev::KevModel & m, const std::string & base) {
 
 int main(int argc, char ** argv) {
     std::string model_path, head, lora_path, host = "127.0.0.1";
+    std::string prewarm_file;   // 可选: 启动预热 state 文本文件(--prewarm <file>)
     int port = 8008, lru = 2, threads = 0, ctx = 2048; float lora_scale = 1.0f;
     bool quiet = false;
     for (int i = 1; i < argc; ++i) {
@@ -83,6 +85,7 @@ int main(int argc, char ** argv) {
         else if (a == "--lora-scale") lora_scale = (float) std::atof(next().c_str());
         else if (a == "--threads" || a == "-t") threads = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
+        else if (a == "--prewarm") prewarm_file = next();
         else if (a == "--quiet") quiet = true;
         else if (a == "--help" || a == "-h") {
             std::fprintf(stderr,
@@ -93,13 +96,14 @@ int main(int argc, char ** argv) {
               "  --threads N / -t N  compute threads (0 or unset = auto detect cores, cap 32)\n"
               "  --ctx N             context size (default 8192; 2048 typical for short states)\n"
               "  --lru N             state cache slots (default 2)\n"
+              "  --prewarm <file>    startup-prewarm a state: read raw state text, prefill into LRU (optional)\n"
               "  --quiet             suppress per-request log lines\n");
             return 0;
         }
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: main_server --model model.gguf [--head head.bin] [--host ip] [--port p] [--lru n] [--lora lora.gguf] [--lora-scale f] [--threads N] [--ctx N] [--quiet]\n");
+        std::fprintf(stderr, "usage: main_server --model model.gguf [--head head.bin] [--host ip] [--port p] [--lru n] [--lora lora.gguf] [--lora-scale f] [--threads N] [--ctx N] [--prewarm file] [--quiet]\n");
         return 2;
     }
 
@@ -120,6 +124,29 @@ int main(int argc, char ** argv) {
                  head.empty() ? "-" : head.c_str(), lora_path.empty() ? "-" : lora_path.c_str());
         std::fprintf(stderr, "kevcpp using %d threads %s (n_threads_batch=%d)\n",
                  model.threads_actual(), threads == 0 ? "(auto)" : "(set)", model.threads_batch_actual());
+    }
+
+    // 可选启动预热(P0a): state 文本 encode 后 prefill 进状态缓存。默认不指定 => 完全不影响现状。
+    if (!prewarm_file.empty()) {
+        std::ifstream pf(prewarm_file, std::ios::binary);
+        if (!pf) {
+            std::fprintf(stderr, "kevcpp error: cannot open prewarm file: %s\n", prewarm_file.c_str());
+            return 1;
+        }
+        std::string state_text((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
+        if (!state_text.empty() && state_text.back() == '\n') state_text.pop_back(); // 去尾换行, 与 body 的 state 一致
+        // 仅取 state 部分 ids: 空 questions => enc 全为 state 段。
+        kev::KevEnc e = model.encode(kev::KevRequest{state_text, {}, {}}, nullptr);
+        auto rows = model.rows_of(e, nullptr);
+        if (!rows.state_ids.empty()) {
+            if (model.prewarm_state(rows.state_ids)) {
+                if (!quiet) std::fprintf(stderr, "kevcpp prewarmed state (%zu tokens) into LRU\n", rows.state_ids.size());
+            } else if (!quiet) {
+                std::fprintf(stderr, "kevcpp warning: prewarm_state failed for %s\n", prewarm_file.c_str());
+            }
+        } else if (!quiet) {
+            std::fprintf(stderr, "kevcpp warning: prewarm state produced no tokens: %s\n", prewarm_file.c_str());
+        }
     }
 
     const char * api_key = std::getenv("KEV_API_KEY");

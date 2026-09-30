@@ -14,6 +14,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,10 @@ struct KevModelOptions {
 
 class KevModel {
 public:
+    // P.4: 一次共享同 state 前缀、等长 branch 批量 decode 时最多并行 branch seq 数。
+    // 分配在 scratch 之前, 直接计入 n_seq_max(全注意力 KV 层 n_stream=n_seq_max, 故不宜过大)。
+    // 超过此数的等长问会拆成多个组各自批量, 或回退逐问(行为不变, 仍逐位一致)。
+    static constexpr int kMaxBatch = 8;
     KevModel() = default;
     ~KevModel();
     KevModel(const KevModel &) = delete;
@@ -55,11 +60,22 @@ public:
         double  t_total_ms  = 0.0;
     };
     ProbsResult probs(const KevRequest & req, std::string * err = nullptr);
+    // 复用外部已算好的 encode(省掉一次重复的 encode+rows_of): 仍会 rows_of(enc)。
+    // 与单参 probs(req) 数值完全一致(原本就是 encode->rows_of->ensure_state->rows_from_slot)。
+    ProbsResult probs(const KevEnc & enc, std::string * err = nullptr);
+
+    // 预热: 把 state_ids 预填进状态缓存(未命中则 prefill)。启动预热专用, 默认不调用不影响行为。
+    bool prewarm_state(const std::vector<int32_t> & state_ids);
 
     // 诊断
     const PrefixLRU & lru() const { return lru_; }
     int n_seq_max() const { return n_seq_max_; }
     int scratch_seq() const { return scratch_seq_; }
+    int branch_seq(int k) const { return branch_seq_base_ + k; }  // 第 k 个可批 branch seq
+    int max_batch() const { return kMaxBatch; }
+    // 在 init 后设置(对拍用): batch_enabled=false 强制逐问 decode(验证批量逐位一致)。
+    void set_batch_enabled(bool v) { batch_enabled_ = v; }
+    bool batch_enabled() const { return batch_enabled_; }
     int threads() const { return n_threads_; }
     int threads_actual() const { return ctx_ ? llama_n_threads(ctx_) : 0; }
     int threads_batch_actual() const { return ctx_ ? llama_n_threads_batch(ctx_) : 0; }
@@ -84,7 +100,22 @@ private:
     // 语义保证: 每个位置的 output row 索引 == 该位置在 tokens 中的下标(利用 output_ids[i]=i)。
     bool decode_seq(const std::vector<int32_t> & tokens, int start_pos, llama_seq_id seq,
                     std::string * err, const std::vector<int32_t> & logits_pos);
-    std::vector<float> hidden_at_output(int out_idx, std::string * err);  // 从上次 decode 的 output 取 hidden[1024]
+
+    // P.4: 在单次 llama_decode 中解码多个 branch(共享 state 前缀, 等长 n_seq_tokens)。
+    // branches: [Q] 每项 = {branch token 序列, start_pos(=Ls), seq_id, decide 与 opts 的 branch 内位置}。
+    // seq-major 布局: 第 s 个 branch 的第 t 个 token 是 batch 下标 s*L + t。
+    // hidden_decide[s] 在第 (s*L + branches[s].decide) 行。
+    struct BranchDec {
+        std::vector<int32_t> ids;        // branch token (长度 L, 全部相等)
+        int start_pos;                   // = Ls (state 长度)
+        llama_seq_id seq;                // 该 branch 写入的 seq(branch seq 池之一)
+        int decide;                      // branch 内 decide 位置
+        std::vector<int32_t> opts;       // branch 内 opt 位置
+    };
+    bool decode_batch(const std::vector<BranchDec> & branches, std::string * err);
+
+    // 从上次 decode 的 output 取 hidden[1024](out_idx = batch 内 token 下标)
+    std::vector<float> hidden_at_output(int out_idx, std::string * err);
 
     llama_context  * ctx_   = nullptr;
     llama_model    * model_ = nullptr;
@@ -94,8 +125,14 @@ private:
     PrefixLRU    lru_{2, 1};
     int n_seq_max_   = 0;
     int scratch_seq_ = 1;
+    int branch_seq_base_ = 1;  // base(cap slots) 之后, scratch 之前: 可批 branch seq 池
     int n_threads_   = 0;
+    // P.4: 是否启用等长 branch 批量 decode。init 时读环境变量 KEV_NO_BATCH(=1 关闭)。
+    bool batch_enabled_ = true;
     bool ok_         = false;
+    // 并发加固(P0b): 串行化所有访问共享 llama ctx/lru/scratch 的计算段。
+    // 不改变单请求计算顺序或数值, 仅把并发竞态降为严格串行。
+    std::mutex compute_mutex_;
 };
 
 } // namespace kev

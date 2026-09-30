@@ -191,11 +191,16 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
     int input_tokens = (int) enc.ids.size();
 
     auto t0 = std::chrono::steady_clock::now();
-    auto res = model.probs(ps.rec, err);
+    // P.1: 复用已算好的 enc, 避免 probs(req) 内部再 encode+rows_of 一遍(消除原两次重复 encode + 正则重写)。
+    auto res = model.probs(enc, &enc_err);
     double model_ms = (double) std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count() / 1e3;
     if (t_model_ms) *t_model_ms = model_ms;
-    if (res.probs.empty()) return json(nullptr);
+    if (res.probs.empty()) {
+        // 失败时把内部错误上抛给调用方(维持原 422 detail 语义)。
+        if (err && err->empty() && !enc_err.empty()) *err = enc_err;
+        return json(nullptr);
+    }
 
     std::string model_name = body.value("model", std::string("kev-latest"));
     auto answers = to_answers(res.probs, ps.meta);

@@ -34,7 +34,13 @@ std::pair<bool, int> PrefixLRU::lookup(const std::vector<int32_t> & ids, int * e
 }
 
 void PrefixLRU::register_(const std::vector<int32_t> & ids, int seq) {
-    for (auto & e : entries_) if (e.seq == seq) e.ids = ids, e.last_use = ++clock_, e.ids = ids; // refresh
+    // 防御: 若 entries_ 已含同 seq(latent 隐患), 原位刷新(设 ids + last_use)并返回, 不产生重复项。
+    for (auto & e : entries_) {
+        if (e.seq == seq) {
+            e.ids = ids; e.last_use = ++clock_;
+            return;
+        }
+    }
     entries_.push_back({ids, seq, ++clock_});
 }
 

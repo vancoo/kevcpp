@@ -261,7 +261,13 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    // forward decl: `make_gf_shape_key` returns `graph_shape_key` by value, but the
+    // full `struct graph_shape_key` definition lives later in this header (as a member).
+    struct graph_shape_key;
+
+    llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch, llm_graph_type gtype);
+
+    graph_shape_key make_gf_shape_key(const llama_ubatch & ubatch, llm_graph_type gtype) const;
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -374,8 +380,69 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Persistent per-shape graph cache (P.2b).
+    //
+    // Buckets are keyed by the topology-determining shape fields only (see
+    // `graph_shape_key`). Separate buckets give batches with and without outputs
+    // distinct cache keys. The ultimate authority on whether a cached graph is
+    // equivalent to a freshly-built one is `llm_graph_result::can_reuse`, which
+    // additionally validates runtime state that is baked into the graph at build
+    // time (e.g. recurrent memory `head` / `rs_z`), so a coarse key can never
+    // cause an unsafe reuse.
+    struct graph_shape_key {
+        llm_arch       arch  = LLM_ARCH_UNKNOWN;
+        llm_graph_type gtype = LLM_GRAPH_TYPE_DEFAULT;
+
+        // ubatch fields that determine recurrent chunked/AR pathing and state dims
+        uint32_t n_tokens     = 0;
+        uint32_t n_seq_tokens = 0;
+        uint32_t n_seqs       = 0;
+        uint32_t n_seqs_unq   = 0;
+        bool     equal_seqs   = false;
+        // whether the batch supplies tokens, embd, or both (input builder choice)
+        bool     has_token    = false;
+        bool     has_embd     = false;
+
+        uint32_t n_outputs = 0;
+
+        bool nextn_layer_offset     = false;
+        bool embeddings              = false;
+        bool embeddings_nextn        = false;
+        bool embeddings_nextn_masked = false;
+        bool causal_attn             = false;
+
+        bool operator<(const graph_shape_key & o) const {
+            if (arch != o.arch) return arch < o.arch;
+            if (gtype != o.gtype) return gtype < o.gtype;
+            if (n_tokens != o.n_tokens) return n_tokens < o.n_tokens;
+            if (n_seq_tokens != o.n_seq_tokens) return n_seq_tokens < o.n_seq_tokens;
+            if (n_seqs != o.n_seqs) return n_seqs < o.n_seqs;
+            if (n_seqs_unq != o.n_seqs_unq) return n_seqs_unq < o.n_seqs_unq;
+            if (equal_seqs != o.equal_seqs) return equal_seqs < o.equal_seqs;
+            if (has_token != o.has_token) return has_token < o.has_token;
+            if (has_embd  != o.has_embd)  return has_embd  < o.has_embd;
+            if (n_outputs != o.n_outputs) return n_outputs < o.n_outputs;
+            if (nextn_layer_offset != o.nextn_layer_offset) return nextn_layer_offset < o.nextn_layer_offset;
+            if (embeddings != o.embeddings) return embeddings < o.embeddings;
+            if (embeddings_nextn != o.embeddings_nextn) return embeddings_nextn < o.embeddings_nextn;
+            if (embeddings_nextn_masked != o.embeddings_nextn_masked) return embeddings_nextn_masked < o.embeddings_nextn_masked;
+            if (causal_attn != o.causal_attn) return causal_attn < o.causal_attn;
+            return false;
+        }
+
+        bool operator==(const graph_shape_key & o) const {
+            return arch  == o.arch  && gtype == o.gtype &&
+                   n_tokens == o.n_tokens && n_seq_tokens == o.n_seq_tokens &&
+                   n_seqs == o.n_seqs && n_seqs_unq == o.n_seqs_unq &&
+                   equal_seqs == o.equal_seqs && has_token == o.has_token &&
+                   has_embd == o.has_embd && n_outputs == o.n_outputs &&
+                   nextn_layer_offset == o.nextn_layer_offset &&
+                   embeddings == o.embeddings && embeddings_nextn == o.embeddings_nextn &&
+                   embeddings_nextn_masked == o.embeddings_nextn_masked && causal_attn == o.causal_attn;
+        }
+    };
+
+    std::map<graph_shape_key, llm_graph_result_ptr> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
