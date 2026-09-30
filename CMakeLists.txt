@@ -74,6 +74,20 @@ target_include_directories(m5_bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(m5_bench PRIVATE cxx_std_17)
 
+# M7 CPU 慢定位 (TypeSafe systemone 分段计时)
+add_executable(m7_bench
+    src/m7_bench.cpp
+    src/kev_api.cpp
+    src/kev_head.cpp
+    src/kev_encode.cpp
+    src/kev_prefix.cpp
+    src/kev_model.cpp
+)
+target_link_libraries(m7_bench PRIVATE llama)
+target_include_directories(m7_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_compile_features(m7_bench PRIVATE cxx_std_17)
+
 # M4 HTTP 服务 (TypeSafe /v1/systemone)
 add_executable(main_server
     src/main_server.cpp
@@ -98,5 +112,6 @@ if (MSVC)
     target_compile_options(headbench PRIVATE /utf-8)
     target_compile_options(m3_bench PRIVATE /utf-8)
     target_compile_options(m5_bench PRIVATE /utf-8)
+    target_compile_options(m7_bench PRIVATE /utf-8)
     target_compile_options(main_server PRIVATE /utf-8)
 endif()

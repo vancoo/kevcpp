@@ -69,7 +69,7 @@ static json model_card(const kev::KevModel & m, const std::string & base) {
 
 int main(int argc, char ** argv) {
     std::string model_path, head, lora_path, host = "127.0.0.1";
-    int port = 8008, lru = 2; float lora_scale = 1.0f;
+    int port = 8008, lru = 2, threads = 0, ctx = 8192; float lora_scale = 1.0f;
     bool quiet = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -81,11 +81,25 @@ int main(int argc, char ** argv) {
         else if (a == "--lru") lru = std::atoi(next().c_str());
         else if (a == "--lora") lora_path = next();
         else if (a == "--lora-scale") lora_scale = (float) std::atof(next().c_str());
+        else if (a == "--threads" || a == "-t") threads = std::atoi(next().c_str());
+        else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--quiet") quiet = true;
+        else if (a == "--help" || a == "-h") {
+            std::fprintf(stderr,
+              "usage: main_server --model gguf [options]\n"
+              "  --head <bin>        pointer head .bin\n"
+              "  --lora <gguf>       LoRA adapter (optional); --lora-scale f\n"
+              "  --host ip  --port p listen address/port (default 127.0.0.1:8008)\n"
+              "  --threads N / -t N  compute threads (0 or unset = auto detect cores, cap 32)\n"
+              "  --ctx N             context size (default 8192; 2048 typical for short states)\n"
+              "  --lru N             state cache slots (default 2)\n"
+              "  --quiet             suppress per-request log lines\n");
+            return 0;
+        }
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: main_server --model model.gguf [--head head.bin] [--host ip] [--port p] [--lru n] [--lora lora.gguf] [--lora-scale f] [--quiet]\n");
+        std::fprintf(stderr, "usage: main_server --model model.gguf [--head head.bin] [--host ip] [--port p] [--lru n] [--lora lora.gguf] [--lora-scale f] [--threads N] [--ctx N] [--quiet]\n");
         return 2;
     }
 
@@ -94,14 +108,19 @@ int main(int argc, char ** argv) {
 
     if (!quiet) std::fprintf(stderr, "kevcpp server loading model: %s\n", model_path.c_str());
     kev::KevModelOptions opt;
-    opt.model_path = model_path; opt.head_path = head; opt.lru_capacity = lru; opt.n_ctx = 8192;
+    opt.model_path = model_path; opt.head_path = head; opt.lru_capacity = lru;
+    opt.n_ctx = ctx > 0 ? ctx : 8192; opt.n_threads = threads;
     if (!lora_path.empty()) { opt.lora_path = lora_path; opt.lora_scale = lora_scale; }
     kev::KevModel model;
     std::string err;
     if (!model.init(opt, &err)) { std::fprintf(stderr, "kevcpp error: init failed: %s\n", err.c_str()); return 1; }
-    if (!quiet) std::fprintf(stderr, "kevcpp server model ready (n_embd=%d temp=%.3f head=%s lora=%s)\n",
+    if (!quiet) {
+        std::fprintf(stderr, "kevcpp server model ready (n_embd=%d temp=%.3f head=%s lora=%s)\n",
                  model.n_seq_max() ? model.dim_in() : 0, model.temperature(),
                  head.empty() ? "-" : head.c_str(), lora_path.empty() ? "-" : lora_path.c_str());
+        std::fprintf(stderr, "kevcpp using %d threads %s (n_threads_batch=%d)\n",
+                 model.threads_actual(), threads == 0 ? "(auto)" : "(set)", model.threads_batch_actual());
+    }
 
     const char * api_key = std::getenv("KEV_API_KEY");
 

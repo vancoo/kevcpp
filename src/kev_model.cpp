@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <set>
 #include <string>
+#include <thread>
 
 namespace kev {
 
@@ -42,7 +43,11 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     n_seq_max_ = scratch + 1;
     scratch_seq_ = scratch;
     lru_ = PrefixLRU(cap, base);
-    n_threads_ = opt.n_threads;
+    // A3(M7): n_threads==0 时按逻辑/物理核数自动检测, 默认开满核(上限 32 防超大核过度);
+    // 否则 llama.cpp 默认 0/1 线程导致 ~1.1s。--threads N 可显式覆盖。
+    n_threads_ = opt.n_threads > 0 ? opt.n_threads : (int) std::thread::hardware_concurrency();
+    if (n_threads_ <= 0) n_threads_ = 1;
+    if (n_threads_ > 32) n_threads_ = 32;
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx             = (uint32_t) (opt.n_ctx > 0 ? opt.n_ctx : 4096);
@@ -139,12 +144,14 @@ int KevModel::ensure_state(const std::vector<int32_t> & state_ids, double * ps_s
 }
 
 std::vector<std::vector<float>> KevModel::rows_from_slot(const KevRows & rows, int slot, double * t_rows,
-                                                         std::vector<std::vector<float>> * out_hidden) {
+                                                         std::vector<std::vector<float>> * out_hidden,
+                                                         std::vector<double> * rows_ms) {
     *t_rows = 0.0;
     const int Ls = (int) rows.state_ids.size();
     llama_memory_t mem = llama_get_memory(ctx_);
     std::vector<std::vector<float>> probs;
     if (out_hidden) out_hidden->clear();
+    if (rows_ms) rows_ms->clear();
     std::string err;
     for (const auto & r : rows.rows) {
         double t0 = now_ms();
@@ -163,7 +170,9 @@ std::vector<std::vector<float>> KevModel::rows_from_slot(const KevRows & rows, i
         if (hd.empty()) { probs.clear(); return probs; }
         probs.push_back(head_.probs(hd.data(), optp));
         if (out_hidden) out_hidden->push_back(std::move(hd));
-        *t_rows += now_ms() - t0;
+        double tq = now_ms() - t0;
+        if (rows_ms) rows_ms->push_back(tq);
+        *t_rows += tq;
     }
     return probs;
 }
@@ -177,7 +186,7 @@ KevModel::ProbsResult KevModel::probs(const KevRequest & req, std::string * err)
 
     int slot = ensure_state(rows.state_ids, &res.t_state_ms, &res.state_hit);
     if (slot < 0) { if (err) *err = "ensure_state failed"; return res; }
-    res.probs = rows_from_slot(rows, slot, &res.t_rows_ms, &res.hidden_decide);
+    res.probs = rows_from_slot(rows, slot, &res.t_rows_ms, &res.hidden_decide, &res.rows_ms_per_q);
     res.t_total_ms = now_ms() - t0;
     return res;
 }

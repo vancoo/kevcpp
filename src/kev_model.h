@@ -48,6 +48,7 @@ public:
     struct ProbsResult {
         std::vector<std::vector<float>> probs;  // [Q][K]
         std::vector<std::vector<float>> hidden_decide; // [Q][1024] decide 隐藏向量 (调试/对拍)
+        std::vector<double> rows_ms_per_q;      // [Q] 每问 branch decode(+seq_cp 复制) 耗时 ms (M7)
         bool    state_hit = false;
         double  t_state_ms  = 0.0;   // ensure_state 耗时(命中态=缓存查找;未命中=prefill)
         double  t_rows_ms   = 0.0;   // 全部 question branch decode + head
@@ -59,6 +60,9 @@ public:
     const PrefixLRU & lru() const { return lru_; }
     int n_seq_max() const { return n_seq_max_; }
     int scratch_seq() const { return scratch_seq_; }
+    int threads() const { return n_threads_; }
+    int threads_actual() const { return ctx_ ? llama_n_threads(ctx_) : 0; }
+    int threads_batch_actual() const { return ctx_ ? llama_n_threads_batch(ctx_) : 0; }
 
     // 用 GGUF 分词器统计文本 token 数(output_tokens 计费用: api.output_tokens)
     int count_tokens(const std::string & text) const;
@@ -72,7 +76,8 @@ private:
     int ensure_state(const std::vector<int32_t> & state_ids, double * ps_state, bool * hit);
     // 用缓存的 slot 对每问做 readout
     std::vector<std::vector<float>> rows_from_slot(const KevRows & rows, int slot, double * t_rows,
-                                                   std::vector<std::vector<float>> * out_hidden = nullptr);
+                                                   std::vector<std::vector<float>> * out_hidden = nullptr,
+                                                   std::vector<double> * rows_ms = nullptr);
     bool decode_seq(const std::vector<int32_t> & tokens, int start_pos, llama_seq_id seq, std::string * err);
     std::vector<float> hidden_at_output(int out_idx, std::string * err);  // 从上次 decode 的 output 取 hidden[1024]
 

@@ -70,7 +70,7 @@ $buildLog = Join-Path $buildDir "build.log"
 # "Checking Build System" and no error. Single-node msbuild works. We also build via
 # cmd.exe with cmd-level file redirection (PowerShell piping of a CMake/MSBuild child
 # is blocked by the sandbox as well).
-$projFiles = @("kev.vcxproj", "headbench.vcxproj", "m3_bench.vcxproj", "m5_bench.vcxproj", "main_server.vcxproj")
+$projFiles = @("kev.vcxproj", "headbench.vcxproj", "m3_bench.vcxproj", "m5_bench.vcxproj", "m7_bench.vcxproj", "main_server.vcxproj")
 
 foreach ($p in $projFiles) {
     $proj = Join-Path $buildDir $p
