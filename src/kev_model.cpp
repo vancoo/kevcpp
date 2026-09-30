@@ -50,7 +50,7 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     if (n_threads_ > 32) n_threads_ = 32;
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx             = (uint32_t) (opt.n_ctx > 0 ? opt.n_ctx : 4096);
+    cparams.n_ctx             = (uint32_t) (opt.n_ctx > 0 ? opt.n_ctx : 2048);
     cparams.n_batch           = 512;
     cparams.n_ubatch          = 512;
     cparams.n_seq_max         = (uint32_t) n_seq_max_;

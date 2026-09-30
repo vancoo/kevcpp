@@ -24,7 +24,7 @@ struct KevModelOptions {
     std::string head_path;
     std::string lora_path;      // 可选 llama.cpp GGUF lora 适配器 (M5)
     float       lora_scale = 1.0f;
-    int n_ctx          = 4096;
+    int n_ctx          = 2048;
     int n_threads      = 0;      // 0 = auto
     int lru_capacity   = 2;      // 状态缓存 slot 数
     // 派生: n_seq_max = lru_capacity + 1(scratch)
