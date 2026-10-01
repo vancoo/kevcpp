@@ -267,6 +267,12 @@ private:
 
     llm_graph_result * get_gf_res_prev(const llama_ubatch & ubatch, llm_graph_type gtype);
 
+    // kevcpp LRU: mark a shape key as recently-used and, if the cache is over capacity,
+    // evict the least-recently-used bucket (destroying only that bucket's graph topology /
+    // metadata; the shared scheduler compute buffer is reserved once and is unaffected).
+    void touch_gf_res_prev(const graph_shape_key & key);
+    void evict_gf_res_prev_lru();
+
     graph_shape_key make_gf_shape_key(const llama_ubatch & ubatch, llm_graph_type gtype) const;
 
     llm_graph_params graph_params(
@@ -405,6 +411,13 @@ private:
 
         uint32_t n_outputs = 0;
 
+        // ordered set of unique sequence ids in the ubatch (matches the seq_id_unq the
+        // graph's per-sequence memory-buffer offsets are baked against). Two ubatches with
+        // the same token-shape but different sequences produce different graphs when
+        // equal_seqs (per-stream state-write/attention offsets), so the sequence assignment
+        // must be part of the bucket identity to let identical repeated requests reuse.
+        std::vector<llama_seq_id> seq_id_unq;
+
         bool nextn_layer_offset     = false;
         bool embeddings              = false;
         bool embeddings_nextn        = false;
@@ -422,6 +435,11 @@ private:
             if (has_token != o.has_token) return has_token < o.has_token;
             if (has_embd  != o.has_embd)  return has_embd  < o.has_embd;
             if (n_outputs != o.n_outputs) return n_outputs < o.n_outputs;
+            const size_t n = std::min(seq_id_unq.size(), o.seq_id_unq.size());
+            for (size_t i = 0; i < n; ++i) {
+                if (seq_id_unq[i] != o.seq_id_unq[i]) return seq_id_unq[i] < o.seq_id_unq[i];
+            }
+            if (seq_id_unq.size() != o.seq_id_unq.size()) return seq_id_unq.size() < o.seq_id_unq.size();
             if (nextn_layer_offset != o.nextn_layer_offset) return nextn_layer_offset < o.nextn_layer_offset;
             if (embeddings != o.embeddings) return embeddings < o.embeddings;
             if (embeddings_nextn != o.embeddings_nextn) return embeddings_nextn < o.embeddings_nextn;
@@ -436,6 +454,7 @@ private:
                    n_seqs == o.n_seqs && n_seqs_unq == o.n_seqs_unq &&
                    equal_seqs == o.equal_seqs && has_token == o.has_token &&
                    has_embd == o.has_embd && n_outputs == o.n_outputs &&
+                   seq_id_unq == o.seq_id_unq &&
                    nextn_layer_offset == o.nextn_layer_offset &&
                    embeddings == o.embeddings && embeddings_nextn == o.embeddings_nextn &&
                    embeddings_nextn_masked == o.embeddings_nextn_masked && causal_attn == o.causal_attn;
@@ -444,6 +463,14 @@ private:
 
     std::map<graph_shape_key, llm_graph_result_ptr> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // kevcpp LRU bookkeeping for the per-shape bucket cache. `gf_lru_stamp` holds a
+    // monotonically-increasing recency stamp per shape key; when the cache exceeds
+    // `gf_cache_lru_cap` buckets, the key with the smallest stamp (least-recently-used)
+    // is evicted. Env: KEV_GRAPH_CACHE_LRU (0 = unlimited, default = 16).
+    std::map<graph_shape_key, uint64_t> gf_lru_stamp;
+    uint64_t gf_lru_counter = 0;
+    int      gf_cache_lru_cap = -1;   // set from env in ctor; -1 = not yet read
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
@@ -471,4 +498,9 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // kevcpp graph-cache stats (dynamic buckets): how often the shape bucket was hit vs rebuilt.
+    // Logged at context destruction when env KEV_GRAPH_CACHE_STATS is set.
+    mutable int64_t n_graph_reuse_buckets = 0; // process_ubatch reuse of an existing bucket
+    mutable int64_t n_graph_build_buckets = 0; // process_ubatch rebuild/new bucket
 };

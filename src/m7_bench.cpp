@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <algorithm>
 
 using nlohmann::json;
 
@@ -21,6 +22,7 @@ int main(int argc, char ** argv) {
     std::string model_path, head, lora_path, reqfile;
     int ctx = 8192, threads = 0, lru = 2;
     bool warm = false;
+    int iters = 1;   // kevcpp graph-cache A/B: repeat the (warm) request N times
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -32,10 +34,12 @@ int main(int argc, char ** argv) {
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--lru") lru = std::atoi(next().c_str());
         else if (a == "--warm") warm = true;
+        else if (a == "--iters") iters = std::max(1, std::atoi(next().c_str()));
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
+    if (warm && iters < 2) iters = 2;   // --warm implies at least a cold + one warm run
     if (model_path.empty() || reqfile.empty()) {
-        std::fprintf(stderr, "usage: m7_bench --model gguf --head head.bin [--lora lora.gguf] --req systemone.json [--ctx 8192] [--threads 0] [--lru 2] [--warm]\n");
+        std::fprintf(stderr, "usage: m7_bench --model gguf --head head.bin [--lora lora.gguf] --req systemone.json [--ctx 8192] [--threads 0] [--lru 2] [--warm] [--iters N]\n");
         return 2;
     }
 
@@ -81,7 +85,15 @@ int main(int argc, char ** argv) {
     };
 
     run_one(true);                    // cold (state miss)
-    if (warm) run_one(false);         // warm (state hit)
+    if (warm) {
+        for (int it = 1; it < std::max(iters, 2); ++it) {
+            std::string e2;
+            auto res = model.probs(ps.rec, &e2);
+            std::printf("warm%d: state_hit=%s  state=%.1fms  rows=%.1fms  total=%.1fms\n",
+                        it, res.state_hit ? "Y" : "N",
+                        res.t_state_ms, res.t_rows_ms, res.t_total_ms);
+        }
+    }
     model.close();
     return 0;
 }

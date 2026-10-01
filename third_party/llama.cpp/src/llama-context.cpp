@@ -285,6 +285,23 @@ llama_context::llama_context(
         }
     }
 
+    // kevcpp per-shape graph-cache LRU capacity. KEV_GRAPH_CACHE_LRU=N sets the max number
+    // of distinct shape buckets retained (0/absent = unlimited, default 16). Each bucket
+    // holds only that shape's graph topology/metadata (single-digit MB); the big compute
+    // buffer is reserved once and shared, so this bounds retained topologies, not weights.
+    {
+        const char * KEV_GRAPH_CACHE_LRU = getenv("KEV_GRAPH_CACHE_LRU");
+        gf_cache_lru_cap = KEV_GRAPH_CACHE_LRU ? atoi(KEV_GRAPH_CACHE_LRU) : 16;
+        if (gf_cache_lru_cap <= 0) {
+            gf_cache_lru_cap = 0;   // 0 / negative => unlimited
+        }
+        if (gf_cache_lru_cap > 0) {
+            LLAMA_LOG_INFO("%s: per-shape graph-cache LRU capacity = %d buckets\n", __func__, gf_cache_lru_cap);
+        } else {
+            LLAMA_LOG_INFO("%s: per-shape graph-cache LRU capacity = unlimited\n", __func__);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -501,6 +518,25 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // kevcpp graph-cache stats for A/B measurement (env KEV_GRAPH_CACHE_STATS=1)
+    if (getenv("KEV_GRAPH_CACHE_STATS")) {
+        // aggregate per-bucket metadata (the graph topology buffer each bucket owns; the
+        // ~hundreds-of-MB scheduler compute buffer is shared once and not counted here).
+        size_t agg_meta = 0, max_bucket = 0;
+        for (const auto & [key, res] : gf_res_prev) {
+            if (!res) continue;
+            agg_meta  += res->buf_compute_meta.size();
+            max_bucket = std::max(max_bucket, res->buf_compute_meta.size());
+        }
+        LLAMA_LOG_INFO("graph-cache stats: buckets_retained=%zu lru_cap=%d builds=%lld reuses=%lld reuse_rate=%.3f agg_bucket_meta=%zuKB max_bucket_meta=%zuKB\n",
+            gf_res_prev.size(), gf_cache_lru_cap,
+            (long long) n_graph_build_buckets, (long long) n_graph_reuse_buckets,
+            n_graph_reuse_buckets + n_graph_build_buckets > 0
+                ? (double) n_graph_reuse_buckets / (n_graph_reuse_buckets + n_graph_build_buckets)
+                : 0.0,
+            agg_meta / 1024, max_bucket / 1024);
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -631,9 +667,12 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    for (auto & [key, res] : gf_res_prev) {
-        res.reset();
-    }
+    // kevcpp (P.2b/LRU): keep the persistent per-shape buckets across scheduler
+    // re-reservation instead of destroying them. The graph topology in each bucket lives
+    // in its own no_alloc buf_compute_meta and is independent of the scheduler's buffer
+    // layout; when the new (recreated) scheduler is used, the process_ubatch reuse path
+    // re-binds a cached topology via reset+alloc_graph and can_reuse() re-validates it.
+    // We only drop the "bound to the scheduler" marker.
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
@@ -864,13 +903,15 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
-        // reset the previous graph results to make sure that they won't be reused
-        // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
-        for (auto & [key, res] : gf_res_prev) {
-            if (res) {
-                res->reset();
-            }
-        }
+        // kevcpp (P.2b/LRU): do NOT wipe every persistent per-shape bucket here. A blanket
+        // res->reset() zeroed each bucket's params + graph, so every llama_decode saw an
+        // empty bucket and rebuilt the same shape (the "reset-on-every-decode" graph-cache
+        // miss). Keeping the buckets is safe because reuse is already gated by the strict
+        // llm_graph_result::can_reuse() (which re-binds the live memory context and
+        // re-validates head/rs_z/attn-mask dims); any real memory re-layout that made a
+        // cached graph unsafe is caught there and forces a rebuild. We only drop the
+        // "currently bound to the scheduler" marker so the reuse path re-binds the cached
+        // topology to the current scheduler/memory module.
         gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
@@ -1439,18 +1480,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        n_graph_reuse_buckets++;
     } else {
+        n_graph_build_buckets++;
+
+        int64_t t_build_us = getenv("KEV_GRAPH_CACHE_STATS") ? ggml_time_us() : 0;
+
         gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
-
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (t_build_us != 0) {
+            LLAMA_LOG_INFO("[GCBUILD] n_tokens=%u n_seqs=%u n_seq_tokens=%u n_outputs=%u build_ms=%.2f\n",
+                ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seq_tokens, (uint32_t) n_outputs,
+                (ggml_time_us() - t_build_us) / 1000.0);
+        }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -2461,6 +2509,16 @@ llama_context::graph_shape_key llama_context::make_gf_shape_key(const llama_ubat
 
     key.n_outputs = n_outputs;
 
+    // capture the ordered unique sequence assignment: two ubatches may share the exact
+    // token-shape yet bake different per-sequence memory offsets into the graph when
+    // equal_seqs, so the sequence ids must be part of the bucket identity for a correct
+    // (and reusable) persistent per-shape cache.
+    key.seq_id_unq.clear();
+    key.seq_id_unq.reserve(ubatch.n_seqs_unq);
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq && ubatch.seq_id_unq != nullptr; ++s) {
+        key.seq_id_unq.push_back(ubatch.seq_id_unq[s]);
+    }
+
     key.nextn_layer_offset     = cparams.nextn_layer_offset;
     key.embeddings              = cparams.embeddings;
     key.embeddings_nextn        = cparams.embeddings_nextn;
@@ -2476,8 +2534,59 @@ llm_graph_result * llama_context::get_gf_res_prev(const llama_ubatch & ubatch, l
     auto & res = gf_res_prev[key];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+
+        // kevcpp LRU: a new bucket was added; enforce the capacity bound by evicting the
+        // least-recently-used bucket if we are now over the limit.
+        if (gf_cache_lru_cap > 0 && (int) gf_res_prev.size() > gf_cache_lru_cap) {
+            evict_gf_res_prev_lru();
+        }
     }
+
+    // mark (or refresh) the recency stamp for this shape key
+    touch_gf_res_prev(key);
+
     return res.get();
+}
+
+// mark the given key as the most-recently-used shape
+void llama_context::touch_gf_res_prev(const graph_shape_key & key) {
+    gf_lru_stamp[key] = ++gf_lru_counter;
+}
+
+// evict the least-recently-used bucket from the per-shape cache.
+// Only that bucket's own graph topology / metadata (llm_graph_result) is destroyed; the
+// shared ggml_backend_sched compute buffer is reserved once at sched_reserve() and is
+// deliberately not touched here (eviction must not thrash the ~hundreds-of-MB buffer).
+void llama_context::evict_gf_res_prev_lru() {
+    if (gf_res_prev.empty() || gf_cache_lru_cap <= 0) {
+        return;
+    }
+
+    // find the key with the smallest recency stamp (least-recently-used)
+    const graph_shape_key * lru_key = nullptr;
+    uint64_t min_stamp = std::numeric_limits<uint64_t>::max();
+    for (const auto & [key, stamp] : gf_lru_stamp) {
+        if (gf_res_prev.count(key) && stamp < min_stamp) {
+            min_stamp = stamp;
+            lru_key   = &key;
+        }
+    }
+    if (!lru_key) {
+        return;
+    }
+
+    // never evict the bucket the scheduler is currently bound to: doing so would leave a
+    // dangling gf_res_prev_active. In practice the active bucket was just touched, so it
+    // cannot be the LRU; this guard is purely defensive.
+    if (gf_res_prev_active && gf_res_prev.count(*lru_key) && gf_res_prev[*lru_key].get() == gf_res_prev_active) {
+        return;
+    }
+
+    LLAMA_LOG_DEBUG("%s: evicting graph-cache bucket (buckets %zu -> %zu)\n",
+                    __func__, gf_res_prev.size(), gf_res_prev.size() - 1);
+
+    gf_res_prev.erase(*lru_key);
+    gf_lru_stamp.erase(*lru_key);
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -2550,11 +2659,11 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
-    for (auto & [key, res] : gf_res_prev) {
-        if (res) {
-            res->reset();
-        }
-    }
+    // kevcpp (P.2b/LRU): the blanket bucket wipe here was another cause of the
+    // "reset-on-every-decode" graph-cache miss (graph_reserve runs on every worst-case
+    // re-reserve and during sched_reserve). Keep each bucket's cached topology; the reuse
+    // path re-binds it to the (just-reset) scheduler and can_reuse() re-validates it. We
+    // only drop the "bound to the scheduler" marker.
     gf_res_prev_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
