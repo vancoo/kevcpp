@@ -55,6 +55,7 @@ add_executable(m3_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_merge.cpp
 )
 target_link_libraries(m3_bench PRIVATE llama)
 target_include_directories(m3_bench PRIVATE
@@ -68,6 +69,7 @@ add_executable(m5_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_merge.cpp
 )
 target_link_libraries(m5_bench PRIVATE llama)
 target_include_directories(m5_bench PRIVATE
@@ -82,6 +84,7 @@ add_executable(m7_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_merge.cpp
 )
 target_link_libraries(m7_bench PRIVATE llama)
 target_include_directories(m7_bench PRIVATE
@@ -96,6 +99,7 @@ add_executable(main_server
     src/kev_prefix.cpp
     src/kev_encode.cpp
     src/kev_head.cpp
+    src/kev_merge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib/httplib.cpp
 )
 target_link_libraries(main_server PRIVATE llama)
@@ -125,6 +129,7 @@ add_executable(m8_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_merge.cpp
 )
 target_link_libraries(m8_bench PRIVATE llama)
 target_include_directories(m8_bench PRIVATE
@@ -146,4 +151,33 @@ target_include_directories(cold_profile PRIVATE
 target_compile_features(cold_profile PRIVATE cxx_std_17)
 if (MSVC)
     target_compile_options(cold_profile PRIVATE /utf-8)
+endif()
+
+# ---- merged-LoRA: 生成把 LoRA fold 进基础权重的 merged GGUF (只写 src/, 不动 vendored) ----
+add_executable(merge_lora
+    src/merge_lora_tool.cpp
+    src/kev_merge.cpp
+)
+target_link_libraries(merge_lora PRIVATE)
+target_compile_features(merge_lora PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(merge_lora PRIVATE /utf-8)
+endif()
+
+# ---- merged-vs-separate LoRA 对拍 / 性能 A/B ----
+add_executable(lora_ab
+    src/lora_ab.cpp
+    src/kev_api.cpp
+    src/kev_model.cpp
+    src/kev_prefix.cpp
+    src/kev_encode.cpp
+    src/kev_head.cpp
+    src/kev_merge.cpp
+)
+target_link_libraries(lora_ab PRIVATE llama)
+target_include_directories(lora_ab PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_compile_features(lora_ab PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(lora_ab PRIVATE /utf-8)
 endif()

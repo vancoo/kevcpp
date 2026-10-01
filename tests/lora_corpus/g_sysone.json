@@ -1,0 +1,5 @@
+{"model":"kev-latest","state":"Qwen3.5 is a hybrid causal decision model.","questions":{
+ "is_valid":{"type":"noul","instructions":"Is the statement true?","criteria":{"false":"no","true":"yes"}},
+ "best":{"type":"choice","instructions":"Pick the best answer.","criteria":{"A":"First one","B":"Second one","C":"Third option"}},
+ "level":{"type":"score","instructions":"Rate it 0-4.","criteria":["very low","low","medium","high","very high"]}
+}}

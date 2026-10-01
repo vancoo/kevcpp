@@ -25,6 +25,12 @@ struct KevModelOptions {
     std::string head_path;
     std::string lora_path;      // 可选 llama.cpp GGUF lora 适配器 (M5)
     float       lora_scale = 1.0f;
+    // merged-LoRA: 把 lora_path fold 进 model_path 的 Q8_0 权重, 前向走单份权重。
+    // merge_lora=true 且 lora_path 非空时, init 会把 LoRA 合并进基础模型(产出 merged GGUF,
+    // 由 merged_model_path 指定或自动放在 model_path 同目录), 再加载 merged 作为普通模型,
+    // 不再挂独立 LoRA adapter。默认读环境变量 KEV_MERGE_LORA(=1 开启), 否则走分离 LoRA。
+    bool        merge_lora = false;
+    std::string merged_model_path;   // 可选: merged GGUF 的落盘位置
     int n_ctx          = 2048;
     int n_threads      = 0;      // 0 = auto
     int lru_capacity   = 2;      // 状态缓存 slot 数

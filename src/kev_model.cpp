@@ -1,11 +1,13 @@
 // kev_model.cpp
 #include "kev_model.h"
+#include "kev_merge.h"
 #include "llama.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <set>
 #include <string>
 #include <thread>
@@ -22,6 +24,26 @@ bool env_force_per_question() {
     static const bool v = std::getenv("KEV_NO_BATCH") != nullptr;
     return v;
 }
+// merged-LoRA: 默认启用 merged(把 LoRA 折叠进基础权重, 前向走单份权重)。
+// KEV_MERGE_LORA=0 显式回退到分离 LoRA(保留位一致 / 对拍用)。
+bool env_force_merge_lora() {
+    const char * v = std::getenv("KEV_MERGE_LORA");
+    if (v) return std::string(v) != "0";   // 显式值: "0"=off, 其余=on
+    return true;                            // 默认 merged
+}
+// 默认 merged GGUF 落盘路径: <model 同目录>/<basename>-merged.gguf
+std::string default_merged_path(const std::string & model_path) {
+    namespace fs = std::filesystem;
+    try {
+        fs::path p(model_path);
+        std::string base = p.stem().string();           // 去掉 .gguf
+        fs::path dir = p.parent_path();
+        if (dir.empty()) dir = fs::current_path();
+        return (dir / (base + "-merged.gguf")).string();
+    } catch (...) {
+        return model_path + ".merged.gguf";
+    }
+}
 } // namespace
 
 KevModel::~KevModel() { close(); }
@@ -37,10 +59,33 @@ void KevModel::close() {
 
 bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     llama_backend_init();
+    // merged-LoRA: 默认启用(把 LoRA fold 进基础权重, 前向走单份权重)。
+    // KEV_MERGE_LORA=0 或 opt.merge_lora=false 走分离 LoRA。merged 输出无法落盘时
+    // 自动回退到分离 LoRA(不硬失败), 保证生产路径可回退。
+    const bool use_merged = opt.merge_lora || env_force_merge_lora();
+    std::string model_path = opt.model_path;
+    bool merged_active = false;
+    if (use_merged && !opt.lora_path.empty()) {
+        std::string merged = !opt.merged_model_path.empty() ? opt.merged_model_path
+                                                            : default_merged_path(opt.model_path);
+        std::string merge_err;
+        if (merge_lora_cached(opt.model_path, opt.lora_path, merged, opt.lora_scale, &merge_err)) {
+            model_path = merged;
+            merged_active = true;
+            std::fprintf(stderr, "kev_model: merged-LoRA enabled, loading folded model %s\n",
+                         merged.c_str());
+        } else {
+            std::fprintf(stderr,
+                "kev_model: merged-LoRA unavailable (%s); falling back to separate LoRA\n",
+                merge_err.c_str());
+        }
+    }
+    if (err && err->size()) err->clear();
+
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
-    model_ = llama_model_load_from_file(opt.model_path.c_str(), mparams);
-    if (!model_) { if (err) *err = "failed to load model: " + opt.model_path; return false; }
+    model_ = llama_model_load_from_file(model_path.c_str(), mparams);
+    if (!model_) { if (err) *err = "failed to load model: " + model_path; return false; }
     vocab_ = llama_model_get_vocab(model_);
 
     const int cap = opt.lru_capacity > 0 ? opt.lru_capacity : 2;
@@ -76,8 +121,8 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     ctx_ = llama_init_from_model(model_, cparams);
     if (!ctx_) { if (err) *err = "failed to init context"; close(); return false; }
 
-    // M5: 可选 LoRA 适配器 (llama.cpp 原生)
-    if (!opt.lora_path.empty()) {
+    // M5: 可选 LoRA 适配器 (llama.cpp 原生)。merged 模式已把 LoRA 折进权重, 不再挂 adapter。
+    if (!merged_active && !opt.lora_path.empty()) {
         lora_ = llama_adapter_lora_init(model_, opt.lora_path.c_str());
         if (!lora_) { if (err) *err = "failed to load lora adapter: " + opt.lora_path; close(); return false; }
         float scale = opt.lora_scale;
