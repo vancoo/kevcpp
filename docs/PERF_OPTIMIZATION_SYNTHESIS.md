@@ -200,6 +200,7 @@
 | F.09 | `shared_prefix.py` 合并前向 | ❌ 不可移植 | 训练路径，非 serving；fp32 只对到 ~1e-5，非逐位 | — | 是 |
 | F.10 | Intel AMX | ❌ 不适用 | 本机 **AMD Zen5**，无 AMX | — | n/a |
 | F.21 | **A 路线：512-bit AVX-512 Q8_0 GEMV 内核** | ❌ 不做/存档 | 见 §6.1.1（0.8B 上每 token 读 506.12 MiB 但 **ALU 受限**；GEMV 非唯一 ALU 项；安全版+20-40% 内环、激进 VNNI 破逐位一致） | 预期 <5-10%（乐观 8-15%） | 激进 VNNI 版是 |
+| F.22 | **head.bin（PointerHead）「合并进模型」** | ❌ 无意义（非性能项） | 见 §6.1.2（head 是**独立于 llama.cpp 主干图的 fp32 模块**，单请求 ~0.83ms 占 transformer 前向 ~0.19–0.23%、远 <0.5%；无每 token 额外 matmul 可折 → 不能也不值像 merged-LoRA 那样合并） | ≈0（唯一可省 SIMD/fp16 ~0.2% 且破坏逐位一致，已被 F.07 否决） | 若去 fp32 优化则可能 |
 
 #### 6.1.1 ⚠️ F.21「512-bit AVX-512 Q8_0 GEMV 内核」评估定论 → ❿ 不做/存档
 
@@ -216,6 +217,17 @@
   - 激进 VNNI 版 `vdpbssd`：大概率破逐位一致（改积/累加路径），**违规**。
   - 叠加 ALU 受限（非带宽受限）→ 预期墙钟收益 **<5-10%（乐观 8-15%）**。
 - 🔎 **判定：❌ 不做/存档。** 在 0.8B Q8_0 上收益上限 ~8-15%，叠加破一致风险 → 不划算；**留待更大 / 更内存受限模型**（届时带宽占比回升、GEMV 权重占比更高才值得重探）。
+
+#### 6.1.2 ⚠️ F.22「head.bin (PointerHead) 合并进模型」评估定论 → ❌ 无意义（非性能项）
+
+> 回应"head.bin 能否像 merged-LoRA 那样合并进模型、是否影响性能"：**结论是否定的**。head 不是影响性能的部分，**不能也不值**像 merged-LoRA 那样"合并进模型"。
+
+- 📊 **结论：head 不是性能瓶颈。** head 探针实测单请求 **~0.83ms**，占 transformer 前向 **~0.19–0.23%**（远 **<0.5%** 阈值）。因此**不值得**为"省一次独立模块"做合并。
+- 🧩 **head 结构**：PointerHead = 2 个 Linear（q/k），各 `W[256][1024]+b[256]`，fp32 元素 **524,800** ≈ **2.0MB**（`head.bin` 2,099,216B 含 16B 头，T≈2.35）。
+- 🛠️ **为何不可合 / 无意义**：head 是**独立于 llama.cpp 主干图的 fp32 模块**（`kev_head.cpp` 手写标量循环；`hidden_at_output` 仅 `llama_get_embeddings_ith` 拷出 hidden，图上只有 GET_ROWS 读出、**无 MUL_MAT**）。它**不随每 token 读 trunk 权重** → **没有 merged-LoRA 那种"省掉每 token 额外 matmul"的收益空间**。（merged-LoRA 的收益在 LoRA 的 per-token GEMV；PointerHead 不在 graph 里，无从合并。）
+- 🔬 **唯一可省项**：SIMD / fp16 把 head **~0.9ms → ~0.1ms**（省 **~0.7ms ≈ 0.2%**），但**破坏逐位一致**，且已被既有 **F.07**「head 向量化 / 改 fp16 不必要（fp32 Linear、~2MB、<1ms、性价比≈0）」**否决** → 不值得。
+- 📏 **实测占比来源**：head 探针 **~0.83–0.90ms**；m7_bench transformer warm rows=**365.6ms** / cold=**440.2ms**（本机 32 线程）→ head 占比 **<0.5%** 成立；即使更大 branch / 更多选项，head 仍 **<1ms**。
+- 🎯 **给 owner 的一句**：head 不是瓶颈，**别为"合"而合**；性能大头仍在 trunk 的 **per-token GEMM**。
 
 ### 6.2 ✅ 本轮已落地并通过逐位一致验证（可直接复用）
 
