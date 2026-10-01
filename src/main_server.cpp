@@ -149,6 +149,19 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // 启动预热建图(P0a): 在监听前做一次最小 dummy decode, 把 llama.cpp 进程一次性的
+    // 图构建 + compute buffer 预留移到服务起跑线之前。state(38) 与 branch(readout) 两形状
+    // 都预建, 使冷启动首个请求的 state 与 branch 都不再付一次性建图(~290ms)。
+    // 不触碰 LRU / 缓存 state / 业务输出, 数值逐位一致。默认开启; KEV_NO_WARM=1 关闭。
+    if (std::getenv("KEV_NO_WARM") == nullptr) {
+        std::string werr;
+        if (model.warm_graph(/*warm_branch=*/true, /*state_tokens=*/38, /*branch_tokens=*/151, &werr)) {
+            if (!quiet) std::fprintf(stderr, "kevcpp warmed decode graph (state+branch) before listen\n");
+        } else {
+            std::fprintf(stderr, "kevcpp warning: warm_graph failed: %s\n", werr.empty() ? "unknown" : werr.c_str());
+        }
+    }
+
     const char * api_key = std::getenv("KEV_API_KEY");
 
     httplib::Server svr;

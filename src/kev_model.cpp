@@ -397,6 +397,36 @@ bool KevModel::prewarm_state(const std::vector<int32_t> & state_ids) {
     return slot >= 0;
 }
 
+bool KevModel::warm_graph(bool warm_branch, int state_tokens, int branch_tokens, std::string * err) {
+    if (!ctx_) { if (err && err->empty()) *err = "context not initialized"; return false; }
+    std::lock_guard<std::mutex> lock(compute_mutex_);
+    // 用确定性的通配 token(与 vocab 有界的合法 id) 构造 dummy 序列; token 值不影响图形状/耗时。
+    // -- state 形状: 纯 prefill(无 logits 输出), 对标 ensure_state 的 decode_seq(..., {})。
+    // -- branch 形状: 带输出位置(logits=1), 对标 rows_from_slot 的 readout decode。
+    // 两者都写在 scratch_seq_ 上: 真实 branch decode 前总会先 clear scratch, 故不污染任何
+    // 缓存 state / 后续数值; 也不触碰 1..cap 的 LRU slot => state_hit / 缓存行为完全不变。
+    llama_memory_t mem = llama_get_memory(ctx_);
+    const int S = state_tokens > 0 ? state_tokens : 38;
+    std::string warn_err;
+    llama_memory_seq_rm(mem, scratch_seq_, 0, -1);
+    {
+        std::vector<int32_t> stok((size_t) S, 1);
+        if (!decode_seq(stok, /*start_pos=*/0, scratch_seq_, err ? err : &warn_err, {})) return false;
+    }
+    llama_memory_seq_rm(mem, scratch_seq_, 0, -1);
+    if (warm_branch) {
+        const int B = branch_tokens > 0 ? branch_tokens : 151;
+        std::vector<int32_t> btok((size_t) B, 1);
+        // 带输出的 readout 形状: 在分支内 take decide/opt 位置(与真实 decode 相同的输出路径)。
+        std::vector<int32_t> out_pos;
+        if (B >= 2) { out_pos.push_back(B - 1); out_pos.push_back(B / 2); }  // 代表性 decide/opt
+        else out_pos.push_back(0);
+        if (!decode_seq(btok, /*start_pos=*/S, scratch_seq_, err ? err : &warn_err, out_pos)) return false;
+        llama_memory_seq_rm(mem, scratch_seq_, 0, -1);
+    }
+    return true;
+}
+
 int KevModel::count_tokens(const std::string & text) const {
     if (!vocab_) return 0;
     return (int) kev::tokenize(vocab_, text, /*add_special=*/false, /*parse_special=*/false).size();

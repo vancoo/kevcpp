@@ -73,6 +73,16 @@ public:
     // 预热: 把 state_ids 预填进状态缓存(未命中则 prefill)。启动预热专用, 默认不调用不影响行为。
     bool prewarm_state(const std::vector<int32_t> & state_ids);
 
+    // 启动预热建图(P0a): 用 scratch seq 做最小 dummy decode, 仅触发 llama.cpp 的
+    // 图构建 + ggml_backend_sched_reserve(compute buffer 保留), 不触碰任何 LRU slot /
+    // 缓存 state / 业务输出, 数值逐位一致。它只把"进程一次性的建图+245MB buffer 分配"
+    // 移到服务监听之前, 使冷启动首个请求不再付这笔(~290ms)。
+    // warm_branch: 是否额外把 branch(readout, 带 logits 输出) 形状也预建(保守, 两形状常驻)。
+    // state_tokens / branch_tokens: 代表性 token 数(默认 38 / 151), 用于预留 buffer 宽度;
+    //   因 n_ubatch=256 封顶, 任意 <=256 的形状都会沿用同一已预留 buffer。
+    bool warm_graph(bool warm_branch = true, int state_tokens = 38, int branch_tokens = 151,
+                    std::string * err = nullptr);
+
     // 诊断
     const PrefixLRU & lru() const { return lru_; }
     int n_seq_max() const { return n_seq_max_; }
