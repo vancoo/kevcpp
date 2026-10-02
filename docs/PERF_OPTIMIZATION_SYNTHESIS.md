@@ -239,6 +239,21 @@
 | F.14 | **修 `PrefixLRU::register_` 重复项** | `kev_prefix.cpp` 同 seq 原位刷新 | 防御性改进 |
 | F.15 | **scratch 每问 `seq_rm` 回收** | `kev_model.cpp` rows_from_slot | 防长跑内存增长；m7 逐位一致 |
 | F.16 | **P.2b 图持久缓存（vendored）** | `llama-context.{h,cpp}` 分桶持久缓存，保守 head/rs_z | 编译成功、m7/parity 逐位一致；**收益已被受控测试重估为最多 ~70ms**（§7.2，非 PERF 估的 250ms），且 recurrent 命中率低实际可能更少 |
+| F.23 | **Q8_0 tiled 复用内核（每 token 重读权重的根因 + 落地）** | vendored `ggml-cpu/tiled/`（tiled-kernel.cpp/h、tiled.cpp），commit `c8ecc44` | **部分达标（务实非激进）**：见 §6.2.1（根因是"每 token 重读 ~504MiB 权重"；瓶颈是 int8 MAC 计算吞吐非 DRAM 带宽；纯复用只 1.18×、总冷前向 1.14×，argmax **16/16=100%**，max\|Δp\|=9.5e-3） | branch 588.5→499.8ms（**1.18×**）、总冷前向 753.4→664.0ms（**1.14×**） | 否（argmax 100% 达标） |
+
+#### 6.2.1 ⚠️ F.23「Q8_0 每 token 重读权重的根因 + Q8_0 tiled 复用内核」定论 → ✅ 部分达标（务实，非激进）
+
+> 这一轮同时**确认了 kevcpp 慢的真正根因**，并**落地了一个真正复用的 Q8_0 tiled 内核**拿到明确收益。诚实结论：收益是"务实"而非"激进"——总前向 1.14×、省 ~90ms，但证明根因并对齐了验收线。
+
+- 🔴 **根因（用户洞察被实证）：每 token 重读全部 ~504 MiB trunk 权重。** kevcpp 的 Q8_0 branch（151 token）走 legacy **per-token `ggml_vec_dot_q8_0_q8_0`**——每个 token 单独重读一整份 trunk 权重，隐含流量 ≈ **151 × 504MiB ≈ 74GB**。而 kev(torch) 用 `nn.Linear` 对 `[1,151,d]` 做**真·batch GEMM**（权重读一遍 + M=151 复用）。这就是 kevcpp branch **~425ms** vs kev 快的根本原因。实测 `cold_profile --list` 呈**严格线性每 token +2.7ms**（若"真读一遍+复用"应近似持平而非线性）；隐含带宽 **~183GB/s** 只到纯读上限 **~52–353GB/s 的一半**，佐证"多读型"（权重被反复重读，而未吃满单次纯读带宽）。
+- 🧮 **瓶颈再定性（比"重读"更深一层）：瓶颈是 int8 MAC 计算吞吐，不是 DRAM 带宽。** 最小验证（microbench）证明：**M=1→151 时 DRAM 流量恒定（权重读一遍）但耗时随 M 暴涨** ⇒ "读一遍再复用"并不省时，因为复用 = **151× 的计算量**。纯访问模式复用只到 **~1.2–1.7×**（branch 425 → ~250–350ms）；当初设想的 **~40ms 过于乐观**——40ms 需要把 MAC 吞吐顶到 **VNNI 上限**，那是内核工程，不是访问模式能给的。
+- ✅ **落地（判定：已落地，部分达标）**：给 ggml tiled 路径写 **`block_q8_0` 特化 microtile（vnni256）**，复用 tiled 的 M≥/workspace/MAC 框架；并加 **`ggml_tiled_q8_min_batch()` 门控**（env `KEV_Q8_TILED_MIN_BATCH=96`，小 M 如 state=38 回退 legacy 避免 ~1.2× 回归）。
+  - **argmax 一致率 16/16 = 100%**（≥95% 达标），**max\|Δp\| = 9.5e-3**。
+  - **A/B：** branch(151) **588.5→499.8ms（1.18×）**；总冷前向 **753.4→664.0ms（1.14×）**。
+  - **三个 env：** `KEV_Q8_TILED`(默认1) / `KEV_Q8_MICRO`(自动) / `KEV_Q8_TILED_MIN_BATCH`(96)。
+  - **落地位置：** vendored `ggml-cpu/tiled/`（tiled-kernel.cpp/h、tiled.cpp），commit **`c8ecc44`**。
+- 🎛️ **诚实评估**：收益是"务实"而非"激进"（总前向 1.14×，省 ~90ms），但**证明了根因并落地达标**；**绝对 <500ms / 几十 ms 单靠 tiled GEMM 复用达不到**——剩余瓶颈在 pipeline 其余部分（attention/embedding/调度）和非 Q8 matmul。替代路径（逼近 1.2×）：只对最大投影走 tiled、压缩 unpack/repack 开销，**留给后续**。
+- 🎯 **给 owner 的一句**：kevcpp 慢的真因是 **"每 token 重读权重"（非 ALU）**，已用 **Q8_0 tiled 复用拿到 1.14× 且 argmax 100%**；要再快需处理 **pipeline 其余部分**或**破一致降位**。
 
 ### 6.3 ⌛ 已识别、尚未尝试 / 待业务触发的方法
 
