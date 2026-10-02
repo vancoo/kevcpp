@@ -4,10 +4,14 @@
 
 #include "ggml.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #if defined(__AVX512VNNI__) || defined(__AVX2__) || defined(__AVX__)
 #include <immintrin.h>
+#endif
+#if defined(_MSC_VER)
+#include <intrin.h>
 #endif
 
 
@@ -76,6 +80,59 @@ static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled
     for (int i = 0; i < TILED_MICRO; i++) {
         for (int j = 0; j < TILED_MICRO; j++) {
             buf[(i0 + i) * buf_stride + (j0 + j)] += src1.d[seff * TILED_MICRO + j0 + j] * acc[i][j];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q8_0 batched microtile
+// ---------------------------------------------------------------------------
+// block_q8_0 = { fp16 d; int8 qs[32] }; both src0 (weight) and src1 (activation) are Q8_0 for a
+// Q8_0 matmul (vec_dot_type == Q8_0). Unlike the K-quant types there is no single fp32 d per
+// 256-K slab and no int32 per-subblock scale chain: Q8_0 has 8 independent fp16 d per slab (one
+// per 32-subblock). We therefore use a dedicated float-accumulating microtile.
+//
+// The int8 dot is evaluated with src0.q holding the weight bytes biased +128 to unsigned 0..255
+// (so the 256-bit AVX-VNNI dpbusd path can consume them without the i16 overflow that plain
+// maddubs has). Exact scalar dot for one 32-subblock:
+//   raw     = sum_{e=0..31} (w[e]+128) * a[e]     (biased weight x signed activation)
+//   intacc  = raw - 128 * bsum_a                  (bsum_a = sum of the signed activation codes)
+//   contrib = dq8_w[s] * dq8_a[s] * intacc        (per-subblock fp32 scales)
+// Both per-subblock scales are subblock-major, dq8[s * TILED_TILE_ROWS + r].
+//
+// Reference (scalar) kernel used off AVX2 and for exactness checks.
+static void tiled_run_microtile_q8_scalar(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                          int i0, int j0, int num_k, int slab, float * buf, int buf_stride) {
+    constexpr int SCAP = tiled_tile_src0::Q8_SUB; // 8
+    const int qk_stride = num_k * TILED_TILE_K;   // Q8_0 driver forces num_k == 1; kept general
+    const int qk_off = slab * TILED_TILE_K;
+    const int bs_stride = (num_k == 1) ? TILED_TILE_ROWS : TILED_MICRO;
+    const int bs_off = slab * TILED_MICRO;
+
+    float acc[TILED_MICRO][TILED_MICRO];
+    memset(acc, 0, sizeof(acc));
+    for (int s = 0; s < SCAP; s++) {
+        const int32_t * bp = &src1.bsums[(bs_off + 2 * s) * bs_stride + j0];
+        for (int j = 0; j < TILED_MICRO; j++) {
+            const int br = j0 + j;
+            const int32_t bsum = bp[j] + bp[j + bs_stride]; // two per-16 sums of the 32-elem subblock
+            const int8_t * q1 = &src1.q[br * qk_stride + qk_off + s * 32];
+            const float da = src1.dq8[s * TILED_TILE_ROWS + br];
+            for (int i = 0; i < TILED_MICRO; i++) {
+                const int ar = i0 + i;
+                const uint8_t * q0 = &src0.q[ar * qk_stride + qk_off + s * 32];
+                int32_t raw = 0;
+                for (int e = 0; e < 32; e++) {
+                    raw += (int32_t) q0[e] * (int32_t) q1[e];
+                }
+                const int32_t intacc = raw - 128 * bsum;
+                acc[i][j] += src0.dq8[s * TILED_TILE_ROWS + ar] * da * (float) intacc;
+            }
+        }
+    }
+    for (int i = 0; i < TILED_MICRO; i++) {
+        for (int j = 0; j < TILED_MICRO; j++) {
+            buf[(i0 + i) * buf_stride + (j0 + j)] += acc[i][j];
         }
     }
 }
@@ -404,6 +461,130 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
     }
 }
 
+// Q8_0 AVX2 microtile (16x16), maddubs fallback for non-VNNI AVX2 CPUs. src0.q holds weight
+// biased +128 (unsigned debiased here to signed int8), src1.q signed activation in natural
+// [row][k] layout. Dot via the sign trick, which stays i16-safe after the -128 debias
+// (|w|,|a|<=127). Per-subblock fp32 scales fold into a per-column float accumulator; the weight
+// subblock (ax) is computed once and reused across all TILED_MICRO columns.
+static void tiled_run_microtile_q8_maddubs(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                           int i0, int j0, float * buf, int buf_stride) {
+    constexpr int SCAP = tiled_tile_src0::Q8_SUB; // 8
+    constexpr int SR = TILED_TILE_ROWS;
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i b128 = _mm256_set1_epi8((int8_t) 128);
+
+    auto hsum256_i32 = [](const __m256i v) -> int32_t {
+        __m128i lo = _mm256_castsi256_si128(v);
+        __m128i hi = _mm256_extracti128_si256(v, 1);
+        lo = _mm_add_epi32(lo, hi);
+        lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+        lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+        return _mm_cvtsi128_si32(lo);
+    };
+
+    for (int i = 0; i < TILED_MICRO; i++) {
+        const int ar = i0 + i;
+        const uint8_t * wbase = &src0.q[ar * TILED_TILE_K];
+        float facc[TILED_MICRO];
+        for (int c = 0; c < TILED_MICRO; c++) { facc[c] = 0.0f; }
+        for (int s = 0; s < SCAP; s++) {
+            const __m256i w32 = _mm256_load_si256((const __m256i *) &wbase[s * 32]);
+            const __m256i w = _mm256_sub_epi8(w32, b128); // debiased signed weight
+            const __m256i ax = _mm256_sign_epi8(w, w);    // |w|
+            const float dw = src0.dq8[s * SR + ar];
+            for (int c = 0; c < TILED_MICRO; c++) {
+                const int br = j0 + c;
+                const __m256i a32 = _mm256_load_si256((const __m256i *) &src1.q[br * TILED_TILE_K + s * 32]);
+                const __m256i sy = _mm256_sign_epi8(a32, w); // a * sign(w)
+                const __m256i p32 = _mm256_madd_epi16(ones, _mm256_maddubs_epi16(ax, sy));
+                const float raw = (float) hsum256_i32(p32);
+                facc[c] += dw * src1.dq8[s * SR + br] * raw;
+            }
+        }
+        float * out = &buf[ar * buf_stride + j0];
+        for (int c = 0; c < TILED_MICRO; c++) { out[c] += facc[c]; }
+    }
+}
+
+// Q8_0 AVX-VNNI 256-bit microtile (16x16) using vpdpbusd (_mm256_dpbusd_avx_epi32, runtime
+// gated on CPU AVX-VNNI). Lane-per-column layout: each of the 8 ymm lanes is one activation
+// column, so a single dpbusd performs a 4-element dot for 8 columns at once. src0.q biased
+// (+128, unsigned 0..255) is the unsigned operand; src1.q signed activation (natural layout)
+// gathered lane-per-column; the exact dot then subtracts 128*bsum of the activation subblock.
+// Weight (set1) reused across the 8 column lanes; codes (gather) reused across 8 weight rows.
+static void tiled_run_microtile_q8_vnni256(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                           int i0, int j0, float * buf, int buf_stride) {
+    constexpr int SR = TILED_TILE_ROWS;
+    constexpr int qk_stride = TILED_TILE_K;
+    const int32_t * q1i = (const int32_t *) src1.q;
+
+    for (int rb = 0; rb < TILED_MICRO; rb += 8) {     // 2 weight-row bands
+        for (int cg = 0; cg < TILED_MICRO; cg += 8) { // 2 column groups of 8
+            __m256 f[8];
+            for (int t = 0; t < 8; t++) { f[t] = _mm256_setzero_ps(); }
+            // lane c -> int32 index of column (j0+cg+c) in src1.q = (j0+cg+c)*256/4 = 64 per col
+            const __m256i base_idx = _mm256_setr_epi32(
+                (j0 + cg + 0) * 64, (j0 + cg + 1) * 64, (j0 + cg + 2) * 64, (j0 + cg + 3) * 64,
+                (j0 + cg + 4) * 64, (j0 + cg + 5) * 64, (j0 + cg + 6) * 64, (j0 + cg + 7) * 64);
+            for (int s = 0; s < 8; s++) {              // subblock (32 elements)
+                __m256i acc[8];
+                for (int t = 0; t < 8; t++) { acc[t] = _mm256_setzero_si256(); }
+                // 8 groups of 4 within subblock s; kg = s*8+g is the global 4-group index
+                for (int g = 0; g < 8; g++) {
+                    const int kg = s * 8 + g;
+                    const __m256i idx = _mm256_add_epi32(base_idx, _mm256_set1_epi32(kg));
+                    const __m256i codes = _mm256_i32gather_epi32(q1i, idx, 4); // lane = col, 4 signed i8
+                    for (int t = 0; t < 8; t++) {        // weight rows in the band
+                        const uint32_t u4 = *(const uint32_t *) &src0.q[(i0 + rb + t) * qk_stride + kg * 4];
+                        acc[t] = _mm256_dpbusd_avx_epi32(acc[t], _mm256_set1_epi32((int32_t) u4), codes);
+                    }
+                }
+                // per-column activation sum over the 32-elem subblock (two per-16 groups)
+                // bsums are [g16*SR + col], so lane c (column j0+cg+c) index = (g16)*SR + (j0+cg+c)
+                const __m256i bsum0_idx = _mm256_setr_epi32(
+                    (j0 + cg + 0) + (2 * s) * SR, (j0 + cg + 1) + (2 * s) * SR,
+                    (j0 + cg + 2) + (2 * s) * SR, (j0 + cg + 3) + (2 * s) * SR,
+                    (j0 + cg + 4) + (2 * s) * SR, (j0 + cg + 5) + (2 * s) * SR,
+                    (j0 + cg + 6) + (2 * s) * SR, (j0 + cg + 7) + (2 * s) * SR);
+                const __m256i bsum1_idx = _mm256_add_epi32(bsum0_idx, _mm256_set1_epi32(SR)); // (2s+1)
+                const __m256i bs0 = _mm256_i32gather_epi32((const int32_t *) src1.bsums, bsum0_idx, 4);
+                const __m256i bs1 = _mm256_i32gather_epi32((const int32_t *) src1.bsums, bsum1_idx, 4);
+                const __m256i bsum = _mm256_add_epi32(bs0, bs1);
+                const __m256 da = _mm256_loadu_ps(&src1.dq8[s * SR + (j0 + cg)]); // 8 col scales
+                for (int t = 0; t < 8; t++) {
+                    const __m256i raw = _mm256_sub_epi32(acc[t], _mm256_mullo_epi32(bsum, _mm256_set1_epi32(128)));
+                    const float dw = src0.dq8[s * SR + (i0 + rb + t)];
+                    f[t] = _mm256_fmadd_ps(_mm256_set1_ps(dw), _mm256_mul_ps(da, _mm256_cvtepi32_ps(raw)), f[t]);
+                }
+            }
+            for (int t = 0; t < 8; t++) {
+                float * p = &buf[(i0 + rb + t) * buf_stride + j0 + cg];
+                _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), f[t]));
+            }
+        }
+    }
+}
+
+// runtime AVX-VNNI availability (CPUID.7.1.EAX bit 4). vpdpbusd is only safe to emit on CPUs
+// that advertise it, so the Q8 dpbusd microtile is gated here.
+static bool tiled_have_avxvnni(void) {
+    static int have = -1;
+    if (have < 0) {
+        int ok = 0;
+#if defined(_MSC_VER)
+        int regs[4] = { 0, 0, 0, 0 };
+        __cpuidex(regs, 7, 1);   // CPUID.7.1.EAX bit4 = AVX-VNNI
+        ok = (regs[0] >> 4) & 1;
+#elif defined(__GNUC__) || defined(__clang__)
+        unsigned int eax, ebx, ecx, edx;
+        __cpuid_count(7, 1, eax, ebx, ecx, edx);
+        ok = (eax >> 4) & 1;
+#endif
+        have = ok;
+    }
+    return have != 0;
+}
+
 #endif // __AVX2__
 
 #if defined(__AVX__) && !defined(__AVX2__)
@@ -535,6 +716,37 @@ void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & s
     } else {
         tiled_run_microtile_scalar<SUBBLK, HAS_MIN, BIAS, 0>(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
     }
+#endif
+}
+
+// Q8_0 batched microtile entry point (standard per-slab path only: num_k == 1, slab == 0).
+// AVX-VNNI 256-bit dpbusd when the CPU has AVX-VNNI (lane-per-column), AVX2 maddubs sign-trick
+// otherwise, scalar reference elsewhere. See the two kernels for the src0.q bias contract.
+void tiled_run_microtile_q8(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                            int i0, int j0, int num_k, int slab, float * buf, int buf_stride) {
+#if defined(__AVX2__)
+    // Q8_0 micro mode, selected once (env-gated for debugging/A-B; default: VNNI if the CPU has it).
+    static const int q8_micro = []() -> int {
+        int micro = -1;
+        if (const char * mev = getenv("KEV_Q8_MICRO")) { micro = atoi(mev); }
+        if (micro == 0) { return 0; }  // scalar
+        if (micro == 1) { return 1; }  // maddubs
+        if (micro == 2) { return 2; }  // vnni256
+        if (tiled_have_avxvnni()) { return 2; } // vnni256
+        return 1;                       // maddubs
+    }();
+    GGML_UNUSED(num_k); GGML_UNUSED(slab);
+    if (num_k != 1) {
+        // not expected (Q8_0 driver forces the standard path), but keep correctness
+        tiled_run_microtile_q8_scalar(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
+        return;
+    }
+    if (q8_micro == 0) { tiled_run_microtile_q8_scalar(src0, src1, i0, j0, num_k, slab, buf, buf_stride); }
+    else if (q8_micro == 1) { tiled_run_microtile_q8_maddubs(src0, src1, i0, j0, buf, buf_stride); }
+    else { tiled_run_microtile_q8_vnni256(src0, src1, i0, j0, buf, buf_stride); }
+#else
+    GGML_UNUSED(num_k); GGML_UNUSED(slab);
+    tiled_run_microtile_q8_scalar(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
 #endif
 }
 

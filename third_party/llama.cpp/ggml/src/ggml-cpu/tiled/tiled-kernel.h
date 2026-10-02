@@ -29,12 +29,18 @@
 // SUBBLK=32 formats index at stride 8 and leave the slack unused.
 struct tiled_tile_src0 {
     static constexpr int NB_MAX = TILED_TILE_K / 16; // max subblocks per 256-elem block
+    // Q8_0 geometry: 8 32-elem subblocks per 256-K slab, each with its own fp16 d.
+    // Q8_0 tiled forces the standard per-slab path (num_k==1), the scale grid is
+    // subblock-major over TILED_TILE_ROWS: dq8[s * TILED_TILE_ROWS + r].
+    static constexpr int Q8_SUB = TILED_TILE_K / 32; // 8
 
     alignas(64) uint8_t q[TILED_TILE_ROWS * TILED_TILE_K]; // unsigned quants, widened to uint8
     float    d[TILED_TILE_ROWS];  // One d from each input block, widened to f32
     float    dmin[TILED_TILE_ROWS]; // dmin from each input block (if applicable), widened to F32
     int32_t   scales[TILED_TILE_ROWS * NB_MAX];  // per-subblock scale, stored as int32_t
     int32_t   mins[TILED_TILE_ROWS * NB_MAX];    // per-subblock min, used when HAS_MIN
+    // Q8_0: per-32-subblock fp32 scale (weight side). Layout dq8[s * TILED_TILE_ROWS + r].
+    alignas(64) float dq8[Q8_SUB * TILED_TILE_ROWS];
 };
 
 // src1 tile: built from q8_K (wdata)
@@ -45,6 +51,8 @@ struct tiled_tile_src1 {
     alignas(64) int32_t bsums[(TILED_TILE_K / 16) * TILED_TILE_ROWS];
     // f32 (not f16): q8_k stores fp16, the unpack converts once
     float       d[TILED_TILE_ROWS];
+    // Q8_0: per-32-subblock fp32 scale (activation side). Layout dq8[s * TILED_TILE_ROWS + r].
+    alignas(64) float dq8[tiled_tile_src0::Q8_SUB * TILED_TILE_ROWS];
 };
 
 // per-thread workspace: all tiled state lives here, allocated in wdata (one slot per thread)
@@ -176,5 +184,11 @@ void tiled_repack_src1(tiled_tile_src1 * src1, int row0, int num_k, bool bias);
 // Repack the entire src0 panel in place, called by the driver immediately after dequant
 template <int SUBBLK>
 void tiled_repack_src0(tiled_tile_src0 * tile, int n_rows, int num_k, int BIAS, bool corr);
+
+// Q8_0 batched microtile. Signatures mirror tiled_run_microtile exactly (16x16 tile over
+// one 256-K slab), but Q8_0 uses a per-32-subblock fp32 scale on BOTH sides, so it needs
+// its own float-accumulating kernel instead of the int scale-chain path.
+void tiled_run_microtile_q8(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                            int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
 
 
