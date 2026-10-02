@@ -187,13 +187,18 @@ int main(int argc, char ** argv) {
                 std::chrono::steady_clock::now() - t0).count() / 1e3;
         };
         if (!maybe_auth(req, res)) { if (!quiet) log_req("POST", "/v1/systemone", 401, elapsed_ms(), 0, 0); return; }
+        const bool TR = (std::getenv("KEV_TRACE") != nullptr && std::string(std::getenv("KEV_TRACE")) == "1");
+        double tw = 0.0, t_parse = 0.0, t_sys = 0.0, t_dump = 0.0, t_http = 0.0;
+        if (TR) tw = elapsed_ms();
         std::string err;
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content(R"({"detail":"invalid JSON body"})", "application/json");
                       if (!quiet) log_req("POST", "/v1/systemone", 400, elapsed_ms(), 0, 0); return; }
+        if (TR) { t_parse = elapsed_ms() - tw; tw = elapsed_ms(); }
         double model_ms = 0.0;
         json out = kev::systemone_json(model, body, &model_ms, &err);
+        if (TR) { t_sys = elapsed_ms() - tw; tw = elapsed_ms(); }
         if (out.is_null()) {
             res.status = 422;
             json e = {{"detail", err.empty() ? std::string("could not answer request") : err}};
@@ -202,6 +207,7 @@ int main(int argc, char ** argv) {
             return;
         }
         res.set_content(out.dump(), "application/json");
+        if (TR) { t_dump = elapsed_ms() - tw; tw = elapsed_ms(); }
         char tb[64];
         std::snprintf(tb, sizeof tb, "app;dur=%.1f", elapsed_ms());
         res.set_header("server-timing", tb);
@@ -210,6 +216,9 @@ int main(int argc, char ** argv) {
             in_tok  = out["usage"].value("input_tokens", 0);
             out_tok = out["usage"].value("output_tokens", 0);
         }
+        if (TR) t_http = elapsed_ms() - tw;
+        if (TR) std::fprintf(stderr, "[TRACE] handler json_parse=%.2fms systemone_json=%.2fms out_dump=%.2fms "
+                             "httphead+log_req=%.2fms TOTAL=%.2fms\n", t_parse, t_sys, t_dump, t_http, elapsed_ms());
         if (!quiet) log_req("POST", "/v1/systemone", 200, elapsed_ms(), in_tok, out_tok);
     });
 

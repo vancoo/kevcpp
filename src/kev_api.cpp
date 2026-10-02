@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -12,6 +14,16 @@ using nlohmann::json;
 namespace kev {
 
 static constexpr int MAX_OPTIONS = 255;
+
+// TRACE: 仅当环境变量 KEV_TRACE=1 时打印逐环节耗时(性能拆解临时探针, 默认关闭, 不影响任何逻辑)。
+static bool env_trace_enabled() {
+    static const bool v = std::getenv("KEV_TRACE") != nullptr && std::string(std::getenv("KEV_TRACE")) == "1";
+    return v;
+}
+static double now_us() {
+    return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() / 1e3;
+}
 
 // ---------- render / option_text (api.py) ----------
 static std::string scalar_str(const json & v) {
@@ -183,18 +195,24 @@ json to_answers(const std::vector<std::vector<float>> & probs,
 }
 
 json systemone_json(KevModel & model, const json & body, double * t_model_ms, std::string * err) {
+    const bool TR = env_trace_enabled();
+    double w = 0.0, t_parse_c = 0.0, t_enc_c = 0.0, t_probs_c = 0.0, t_ans_c = 0.0, t_ct_c = 0.0;
+    if (TR) w = now_us();
     ParsedSystemOne ps;
     if (!parse_systemone(body, ps, err)) return json(nullptr);
+    if (TR) { t_parse_c = now_us() - w; w = now_us(); }
 
     std::string enc_err;
     KevEnc enc = model.encode(ps.rec, &enc_err);
     int input_tokens = (int) enc.ids.size();
+    if (TR) { t_enc_c = now_us() - w; w = now_us(); }
 
     auto t0 = std::chrono::steady_clock::now();
     // P.1: 复用已算好的 enc, 避免 probs(req) 内部再 encode+rows_of 一遍(消除原两次重复 encode + 正则重写)。
     auto res = model.probs(enc, &enc_err);
     double model_ms = (double) std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count() / 1e3;
+    if (TR) t_probs_c = now_us() - w;
     if (t_model_ms) *t_model_ms = model_ms;
     if (res.probs.empty()) {
         // 失败时把内部错误上抛给调用方(维持原 422 detail 语义)。
@@ -203,9 +221,19 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
     }
 
     std::string model_name = body.value("model", std::string("kev-latest"));
+    if (TR) w = now_us();
     auto answers = to_answers(res.probs, ps.meta);
     std::string answers_str = answers.dump();
+    if (TR) { t_ans_c = now_us() - w; w = now_us(); }
     int output_tokens = model.count_tokens(answers_str);
+    if (TR) t_ct_c = now_us() - w;
+
+    if (TR) {
+        std::fprintf(stderr, "[TRACE] sysone parse_systemone=%.2fms encode=%.2fms probs(model_ms)=%.2fms "
+                             "to_answers+dump=%.2fms count_tokens=%.2fms answers_str_len=%zu Q=%zu out_tok=%d\n",
+                     t_parse_c, t_enc_c, t_probs_c, t_ans_c, t_ct_c, answers_str.size(),
+                     ps.meta.size(), output_tokens);
+    }
 
     json resp;
     resp["model"] = model_name;
