@@ -252,6 +252,16 @@
   - **A/B：** branch(151) **588.5→499.8ms（1.18×）**；总冷前向 **753.4→664.0ms（1.14×）**。
   - **三个 env：** `KEV_Q8_TILED`(默认1) / `KEV_Q8_MICRO`(自动) / `KEV_Q8_TILED_MIN_BATCH`(96)。
   - **落地位置：** vendored `ggml-cpu/tiled/`（tiled-kernel.cpp/h、tiled.cpp），commit **`c8ecc44`**。
+- ⚠️ **端到端实测补充（诚实：收益 ~27ms 而非 ~50ms，未破 500）**：
+  - **端到端实测（main_server，稳态 N=15，latency_ms=probs 模型前向）**：
+    - `KEV_Q8_TILED=1`：min **497.5** / 中位 **533.5** / 均 **533.4**
+    - `KEV_Q8_TILED=0`：min **500.9** / 中位 **561.0** / 均 **556.1**
+    - **tiled 稳定领先 ~25–27ms**（不是零）。独立 3 轮中位 **tiled 544/533/541** vs **legacy 563/561**。
+  - **端到端构成**：probs 占请求 ~99.7%；handler 非前向（encode+parse+to_answers+count_tokens）≈1.3–1.5ms；socket≈2.3ms。→ **排除"被 HTTP/序列化吃回"**（全程仅 2–4ms）。
+  - **为何仅 ~25ms 而非隔离 bench 的 ~50ms**：服务端 branch 在 pos38..188、KV 已填、含 attention/norm/head 与续帧下 decode，tiled 只加速其中 Q8_0 matmul 片（比隔离纯 Q8 前向小）→ 服务端可见 ~27ms < 隔离 cold_profile branch best 的差（445.7 vs 494.7 ≈ 49ms）。即**服务端全链路 probs 与隔离 bench 不等价**。
+  - **为何逐请求"看不出差别"**：两配置 best/min 打平（497 vs 501），tiled 省的是"稳态分布整段平移 ~25ms"，而样本跨度本身 ±50ms（tiled 498–570 / legacy 501–589）→ 单请求（520–650）被噪声盖住，只有取中位/best-of-N 显形。**验收口径应改为中位数/best-of-N**。
+  - **为何没破 <500ms**：稳态 probs ≈ branch decode ≈ 530ms 底座，tiled 省 ~27ms → ~500–525，停在 500 上方。缺口在 branch 里 tiled 够不到的非 Q8 部分（attention/续帧/KV/norm/head）。state（M=38）稳态被 LRU 缓存不重算（min-batch=96 门只挡首次外解，对稳态零影响；设 `KEV_Q8_TILED_MIN_BATCH=0` 对稳态零收益且小 M ~1.2× 慢，死胡同）。
+  - **一句给 owner**：tiled 是真实但温和（~25ms / ~5%）的收益，端到端要破 500 需动 branch 里非 Q8 的 attention/续帧/norm/head。
 - 🎛️ **诚实评估**：收益是"务实"而非"激进"（总前向 1.14×，省 ~90ms），但**证明了根因并落地达标**；**绝对 <500ms / 几十 ms 单靠 tiled GEMM 复用达不到**——剩余瓶颈在 pipeline 其余部分（attention/embedding/调度）和非 Q8 matmul。替代路径（逼近 1.2×）：只对最大投影走 tiled、压缩 unpack/repack 开销，**留给后续**。
 - 🎯 **给 owner 的一句**：kevcpp 慢的真因是 **"每 token 重读权重"（非 ALU）**，已用 **Q8_0 tiled 复用拿到 1.14× 且 argmax 100%**；要再快需处理 **pipeline 其余部分**或**破一致降位**。
 
