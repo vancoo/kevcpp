@@ -1322,20 +1322,81 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     int ib = 0;
     float sumf = 0;
 
-#if defined(__AVX2__)
-    // Initialize accumulator with zeros
+#if defined(__AVX2__) && defined(GGML_AVX512)
+    // ---- KEV perf-gemv: 给 ggml_vec_dot_q8_0_q8_0 增加 AVX-VNNI 宽展开快路径 (前向 Q8_0 GEMV 热路径) ----
+    // 门: __AVX2__ 由 ggml-cpu 全局 /arch:AVX512 提供; GGML_AVX512 由 CMake 全局定义。
+    // 本 CPU (Zen5) 支持 AVX-VNNI (_mm256_dpbusd_avx_epi32 = vpdpbusd, 256-bit), 但 avxvnniint8=0,
+    // 即 _mm256_dpbssd_epi32 会 illegal-instruction; 且 MSVC 不暴露 512-bit (zmm) VNNI 内建函数。
+    // 故用 AVX-VNNI vpdpbusd + sign-trick (ax=sign(qx,qx), sy=sign(qy,qx)) 实现 signed int8 dot,
+    // 2 block / 64B / iter 展开。默认开启 (new)；设 KEV_Q8_AVX512=0 回退到旧 maddubs-AVX2 路径 (A/B)。
+    {
+        static int use_avxvnni = -1;
+        if (use_avxvnni < 0) {
+            int ok = 0;
+#if defined(_MSC_VER)
+            int regs[4] = { 0, 0, 0, 0 };
+            __cpuidex(regs, 7, 1);   // CPUID.7.1.EAX bit4 = AVX-VNNI
+            ok = (regs[0] >> 4) & 1;
+#elif defined(__GNUC__) || defined(__clang__)
+            unsigned int eax, ebx, ecx, edx;
+            __cpuid_count(7, 1, eax, ebx, ecx, edx);
+            ok = (eax >> 4) & 1;
+#endif
+            const char * ev = getenv("KEV_Q8_AVX512");
+            int want = (ev != NULL) ? (atoi(ev) != 0) : 1;   // 默认开(前提 CPU 支持)
+            use_avxvnni = (ok && want) ? 1 : 0;
+        }
+        if (use_avxvnni) {
+            const __m256i zero = _mm256_setzero_si256();
+            __m256 acc = _mm256_setzero_ps();
+            int ib2 = ib;
+            for (; ib2 + 1 < nb; ib2 += 2) {
+                const float d0 = GGML_CPU_FP16_TO_FP32(x[ib2].d)     * GGML_CPU_FP16_TO_FP32(y[ib2].d);
+                const float d1 = GGML_CPU_FP16_TO_FP32(x[ib2 + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib2 + 1].d);
+
+                __m256i qx0 = _mm256_loadu_si256((const __m256i *)x[ib2].qs);
+                __m256i qy0 = _mm256_loadu_si256((const __m256i *)y[ib2].qs);
+                __m256i qx1 = _mm256_loadu_si256((const __m256i *)x[ib2 + 1].qs);
+                __m256i qy1 = _mm256_loadu_si256((const __m256i *)y[ib2 + 1].qs);
+
+                // sign-trick: signed int8 x,y -> unsigned(vpdpbusd) x signed
+                __m256i ax0 = _mm256_sign_epi8(qx0, qx0);
+                __m256i sy0 = _mm256_sign_epi8(qy0, qx0);
+                __m256i ax1 = _mm256_sign_epi8(qx1, qx1);
+                __m256i sy1 = _mm256_sign_epi8(qy1, qx1);
+
+                __m256i p0 = _mm256_dpbusd_avx_epi32(zero, ax0, sy0);
+                __m256i p1 = _mm256_dpbusd_avx_epi32(zero, ax1, sy1);
+
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm256_cvtepi32_ps(p0), acc);
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(p1), acc);
+            }
+            sumf = hsum_float_8(acc);
+            ib = ib2;   // 消费成对；剩余单块走下方标量尾
+        } else {
+            // 回退: 旧 maddubs-AVX2 路径 (与无 AVX512 时的 __AVX2__ 分支一致, 作 A/B 对照)。
+            __m256 acc = _mm256_setzero_ps();
+            for (; ib < nb; ++ib) {
+                const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
+                __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+                __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+                const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+                acc = _mm256_fmadd_ps( d, q, acc );
+            }
+            sumf = hsum_float_8(acc);
+        }
+    }
+#elif defined(__AVX2__)
+    // (无 AVX512 全局配置时的原始 AVX2 路径)
     __m256 acc = _mm256_setzero_ps();
 
-    // Main loop
     for (; ib < nb; ++ib) {
-        // Compute combined scale for the block
         const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
         __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
 
         const __m256 q = mul_sum_i8_pairs_float(qx, qy);
 
-        // Multiply q with scale and accumulate
         acc = _mm256_fmadd_ps( d, q, acc );
     }
 

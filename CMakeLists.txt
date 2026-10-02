@@ -153,6 +153,24 @@ if (MSVC)
     target_compile_options(cold_profile PRIVATE /utf-8)
 endif()
 
+# ---- KEV perf-gemv: argmax A/B 对拍工具 (临时 target; 不改 build.ps1 清单, 单独 msbuild) ----
+add_executable(kab_bench
+    src/kab_bench.cpp
+    src/kev_api.cpp
+    src/kev_head.cpp
+    src/kev_encode.cpp
+    src/kev_prefix.cpp
+    src/kev_model.cpp
+    src/kev_merge.cpp
+)
+target_link_libraries(kab_bench PRIVATE llama)
+target_include_directories(kab_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_compile_features(kab_bench PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(kab_bench PRIVATE /utf-8)
+endif()
+
 # ---- merged-LoRA: 生成把 LoRA fold 进基础权重的 merged GGUF (只写 src/, 不动 vendored) ----
 add_executable(merge_lora
     src/merge_lora_tool.cpp
