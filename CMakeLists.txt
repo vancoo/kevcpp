@@ -22,6 +22,21 @@ set(LLAMA_OPENSSL OFF CACHE BOOL "llama: use openssl" FORCE)
 # a simpler reproducible build).
 set(GGML_CPU_REPACK OFF CACHE BOOL "ggml: runtime weight conversion Q4_0->Q4_X_X" FORCE)
 set(GGML_LLAMAFILE OFF CACHE BOOL "ggml: use LLAMAFILE sgemm" FORCE)
+# ===========================================================================
+# Pluggable backend (ARCHIVE) — doc'd reconciliation, NOT forced here.
+#
+# The final portable design flips llama.cpp to a SHARED build with the full
+# portable SIMD dll set:  GGML_NATIVE OFF FORCE, BUILD_SHARED_LIBS ON,
+# GGML_BACKEND_DL ON, GGML_CPU_ALL_VARIANTS ON. BUT that would make the shared
+# `ggml`/`llama` libs the single source of truth and would interact with every
+# bench target below (which today link the static `llama`). Per the archival
+# task (Condition 4), we keep THIS tree in the safe, compilable, single-module
+# static state (GGML_NATIVE ON, static llama) and instead give KevModel a
+# kev::Backend* abstraction routed to an in-process CPU backend (kev_backend_cpu).
+# Reconcile to the full shared+variants build on a STABLE host — see
+# docs/portable_backend_deployment.md. Do NOT flip BUILD_SHARED_LIBS here until
+# the "single-llama" rule is satisfied (only ONE module links llama).
+# ===========================================================================
 
 add_subdirectory(third_party/llama.cpp)
 
@@ -56,8 +71,11 @@ add_executable(m3_bench
     src/kev_prefix.cpp
     src/kev_model.cpp
     src/kev_merge.cpp
+    src/kev_backend_factory.cpp
+    src/kev_backend_cpu.cpp
 )
 target_link_libraries(m3_bench PRIVATE llama)
+target_compile_definitions(m3_bench PRIVATE KEV_BACKEND_BUILD)
 target_include_directories(m3_bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(m3_bench PRIVATE cxx_std_17)
@@ -70,8 +88,11 @@ add_executable(m5_bench
     src/kev_prefix.cpp
     src/kev_model.cpp
     src/kev_merge.cpp
+    src/kev_backend_factory.cpp
+    src/kev_backend_cpu.cpp
 )
 target_link_libraries(m5_bench PRIVATE llama)
+target_compile_definitions(m5_bench PRIVATE KEV_BACKEND_BUILD)
 target_include_directories(m5_bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(m5_bench PRIVATE cxx_std_17)
@@ -85,8 +106,11 @@ add_executable(m7_bench
     src/kev_prefix.cpp
     src/kev_model.cpp
     src/kev_merge.cpp
+    src/kev_backend_factory.cpp
+    src/kev_backend_cpu.cpp
 )
 target_link_libraries(m7_bench PRIVATE llama)
+target_compile_definitions(m7_bench PRIVATE KEV_BACKEND_BUILD)
 target_include_directories(m7_bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(m7_bench PRIVATE cxx_std_17)
@@ -100,9 +124,12 @@ add_executable(main_server
     src/kev_encode.cpp
     src/kev_head.cpp
     src/kev_merge.cpp
+    src/kev_backend_factory.cpp
+    src/kev_backend_cpu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib/httplib.cpp
 )
 target_link_libraries(main_server PRIVATE llama)
+target_compile_definitions(main_server PRIVATE KEV_BACKEND_BUILD)
 target_include_directories(main_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(main_server PRIVATE cxx_std_17)
@@ -130,8 +157,11 @@ add_executable(m8_bench
     src/kev_prefix.cpp
     src/kev_model.cpp
     src/kev_merge.cpp
+    src/kev_backend_factory.cpp
+    src/kev_backend_cpu.cpp
 )
 target_link_libraries(m8_bench PRIVATE llama)
+target_compile_definitions(m8_bench PRIVATE KEV_BACKEND_BUILD)
 target_include_directories(m8_bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(m8_bench PRIVATE cxx_std_17)
@@ -162,8 +192,11 @@ add_executable(kab_bench
     src/kev_prefix.cpp
     src/kev_model.cpp
     src/kev_merge.cpp
+    src/kev_backend_factory.cpp
+    src/kev_backend_cpu.cpp
 )
 target_link_libraries(kab_bench PRIVATE llama)
+target_compile_definitions(kab_bench PRIVATE KEV_BACKEND_BUILD)
 target_include_directories(kab_bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(kab_bench PRIVATE cxx_std_17)
@@ -191,11 +224,40 @@ add_executable(lora_ab
     src/kev_encode.cpp
     src/kev_head.cpp
     src/kev_merge.cpp
+    src/kev_backend_factory.cpp
+    src/kev_backend_cpu.cpp
 )
 target_link_libraries(lora_ab PRIVATE llama)
+target_compile_definitions(lora_ab PRIVATE KEV_BACKEND_BUILD)
 target_include_directories(lora_ab PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(lora_ab PRIVATE cxx_std_17)
 if (MSVC)
     target_compile_options(lora_ab PRIVATE /utf-8)
+endif()
+
+# ---- Pluggable backend: kev-backend-cpu shared library (dll) ----
+# The production / portable path builds this as a plugin dll that is the ONLY
+# module linking llama ("single-llama rule"). OFF by default: enabling it requires
+# the shared-lib llama build (BUILD_SHARED_LIBS + GGML_BACKEND_DL + ALL_VARIANTS),
+# which must be reconciled on a STABLE host first (see
+# docs/portable_backend_deployment.md and the top-of-file note). This target is
+# provided so the dll shape is pinned; flip KEV_BUILD_BACKEND_DLL=ON only on a
+# stable box and make sure main_server does NOT also link llama.
+option(KEV_BUILD_BACKEND_DLL "Build the kev-backend-cpu plugin dll (requires shared llama; reconcile on stable host)" OFF)
+if (KEV_BUILD_BACKEND_DLL)
+    add_library(kev-backend-cpu SHARED
+        src/kev_backend_cpu.cpp
+    )
+    target_link_libraries(kev-backend-cpu PRIVATE llama)
+    target_compile_definitions(kev-backend-cpu PRIVATE KEV_BACKEND_BUILD KEV_BACKEND_BUILD_SHARED)
+    target_include_directories(kev-backend-cpu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+    target_compile_features(kev-backend-cpu PRIVATE cxx_std_17)
+    if (MSVC)
+        target_compile_options(kev-backend-cpu PRIVATE /utf-8)
+    endif()
+    set_target_properties(kev-backend-cpu PROPERTIES
+        OUTPUT_NAME "kev-backend-cpu"
+        PREFIX "")
 endif()
