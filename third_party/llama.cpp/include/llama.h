@@ -403,6 +403,10 @@ extern "C" {
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
+        bool lm_head;     // if false, skip the lm_head projection (token logits over the full vocab).
+                          // Safe only when the caller never reads llama_get_logits_ith(); the embeddings /
+                          // hidden-state extraction is unaffected (it happens upstream of the lm_head).
+                          // Default true. (Rank-1 kevcpp)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device

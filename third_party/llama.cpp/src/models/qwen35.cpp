@@ -215,12 +215,18 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // LM head (optional). Skipped when the app only consumes embeddings / hidden states:
+    // the lm_head is an M x n_vocab matmul (~34% of steady-state GEMM here) whose logits are
+    // never read, while res->t_embd (above) is set from the norm output upstream of it, so the
+    // embeddings/hidden extraction is unaffected. (Rank-1 kevcpp)
+    if (cparams.lm_head) {
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 
+    // expands the final node: the lm_head output when present, else the result_norm (embeddings)
     ggml_build_forward_expand(gf, cur);
 }
 

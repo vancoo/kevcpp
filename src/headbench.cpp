@@ -113,6 +113,7 @@ int run_readout(const std::string & model_path, const std::string & reqfile,
     cparams.n_ubatch    = 512;
     cparams.n_outputs_max_per_seq = (uint32_t) ids.size();
     cparams.embeddings  = true;
+    cparams.lm_head     = false;   // Rank-1: readout only reads embeddings (llama_get_embeddings_ith), never logits
     cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
     cparams.n_threads   = 0; cparams.n_threads_batch = 0;
     llama_context * ctx = llama_init_from_model(model, cparams);

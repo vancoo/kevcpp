@@ -35,6 +35,11 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    bool lm_head;                 // compute the lm_head projection (token logits over the full vocab).
+                                  // Set false when the app only consumes embeddings/hidden and never reads
+                                  // llama_get_logits_ith(): skipping the lm_head node removes the M x n_vocab
+                                  // matmul (a large fraction of steady-state GEMM) without touching the
+                                  // embeddings extraction, which is upstream of the lm_head. (Rank-1 kevcpp)
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

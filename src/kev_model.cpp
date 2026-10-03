@@ -115,6 +115,8 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     cparams.n_seq_max         = (uint32_t) n_seq_max_;
     cparams.n_outputs_max_per_seq = 128;   // A2(M7): 每问仅 1 decide + n_opts 个输出,512->128 省输出缓冲
     cparams.embeddings        = true;
+    cparams.lm_head           = false;   // Rank-1: app only reads hidden via llama_get_embeddings_ith,
+                                         // never logits -> skip the 151x248320 lm_head projection entirely.
     cparams.pooling_type      = LLAMA_POOLING_TYPE_NONE;
     cparams.n_threads         = (int32_t) n_threads_;
     cparams.n_threads_batch   = (int32_t) n_threads_;

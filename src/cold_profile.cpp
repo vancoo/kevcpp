@@ -131,6 +131,7 @@ static bool make_ctx(llama_model * model, llama_adapter_lora * lora, const Optio
     cparams.n_seq_max              = 4;
     cparams.n_outputs_max_per_seq  = 128;    // A2(M7) 同款, 省输出缓冲
     cparams.embeddings             = true;
+    cparams.lm_head                = false;  // Rank-1: this profiler only reads embeddings, never logits
     cparams.pooling_type           = LLAMA_POOLING_TYPE_NONE;
     cparams.n_threads              = (int32_t) opt.threads;
     cparams.n_threads_batch        = (int32_t) opt.threads;

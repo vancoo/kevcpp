@@ -116,6 +116,7 @@ llama_context::llama_context(
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings              = params.embeddings;
+    cparams.lm_head                 = params.lm_head;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
@@ -2521,6 +2522,7 @@ llama_context::graph_shape_key llama_context::make_gf_shape_key(const llama_ubat
 
     key.nextn_layer_offset     = cparams.nextn_layer_offset;
     key.embeddings              = cparams.embeddings;
+    key.lm_head                 = cparams.lm_head;
     key.embeddings_nextn        = cparams.embeddings_nextn;
     key.embeddings_nextn_masked = cparams.embeddings_nextn_masked;
     key.causal_attn             = cparams.causal_attn;
@@ -3901,6 +3903,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
+        /*.lm_head                     =*/ true,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,

@@ -420,6 +420,7 @@ private:
 
         bool nextn_layer_offset     = false;
         bool embeddings              = false;
+        bool lm_head                 = true;
         bool embeddings_nextn        = false;
         bool embeddings_nextn_masked = false;
         bool causal_attn             = false;
@@ -442,6 +443,7 @@ private:
             if (seq_id_unq.size() != o.seq_id_unq.size()) return seq_id_unq.size() < o.seq_id_unq.size();
             if (nextn_layer_offset != o.nextn_layer_offset) return nextn_layer_offset < o.nextn_layer_offset;
             if (embeddings != o.embeddings) return embeddings < o.embeddings;
+            if (lm_head != o.lm_head) return lm_head < o.lm_head;
             if (embeddings_nextn != o.embeddings_nextn) return embeddings_nextn < o.embeddings_nextn;
             if (embeddings_nextn_masked != o.embeddings_nextn_masked) return embeddings_nextn_masked < o.embeddings_nextn_masked;
             if (causal_attn != o.causal_attn) return causal_attn < o.causal_attn;
@@ -456,7 +458,7 @@ private:
                    has_embd == o.has_embd && n_outputs == o.n_outputs &&
                    seq_id_unq == o.seq_id_unq &&
                    nextn_layer_offset == o.nextn_layer_offset &&
-                   embeddings == o.embeddings && embeddings_nextn == o.embeddings_nextn &&
+                   embeddings == o.embeddings && lm_head == o.lm_head && embeddings_nextn == o.embeddings_nextn &&
                    embeddings_nextn_masked == o.embeddings_nextn_masked && causal_attn == o.causal_attn;
         }
     };
