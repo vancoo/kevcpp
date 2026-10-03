@@ -71,7 +71,7 @@ static json model_card(const kev::KevModel & m, const std::string & base) {
 int main(int argc, char ** argv) {
     std::string model_path, head, lora_path, host = "127.0.0.1";
     std::string prewarm_file;   // 可选: 启动预热 state 文本文件(--prewarm <file>)
-    int port = 8008, lru = 2, threads = 0, ctx = 2048; float lora_scale = 1.0f;
+    int port = 8008, lru = 2, threads = 0, ctx = -1; float lora_scale = 1.0f;
     bool quiet = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];

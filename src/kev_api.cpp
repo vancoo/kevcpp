@@ -207,6 +207,23 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
     int input_tokens = (int) enc.ids.size();
     if (TR) { t_enc_c = now_us() - w; w = now_us(); }
 
+    // 防御性预检: 一个 sequence(branch) 需在单注意力流内放下完整 state 前缀(Ls)
+    // + 自身 branch tokens(B), 即 input_tokens 格; 若超过每流容量 n_ctx_seq,
+    // decode 必然 find_slot 失败。在真正 decode 前给出清晰错误, 取代原先
+    // cryptic 的 {"detail":"could not answer request"}(由 "init_batch: failed to
+    // prepare attention ubatches" 触发)。纯预检, 不触碰成功路径的 probs/数值。
+    const int n_ctx_seq = model.n_ctx_seq_capacity();
+    if (n_ctx_seq > 0 && (int) enc.ids.size() > n_ctx_seq) {
+        if (t_model_ms) *t_model_ms = 0.0;
+        if (err && err->empty())
+            *err = "state too long for context: " + std::to_string(input_tokens)
+                 + " tokens exceed per-stream capacity " + std::to_string(n_ctx_seq)
+                 + " (raise --ctx N, e.g. --ctx 8192, or split the input)";
+        if (TR) std::fprintf(stderr, "[TRACE] sysone rejected input=%d > n_ctx_seq=%d (pre-decode capacity guard)\n",
+                             input_tokens, n_ctx_seq);
+        return json(nullptr);
+    }
+
     auto t0 = std::chrono::steady_clock::now();
     // P.1: 复用已算好的 enc, 避免 probs(req) 内部再 encode+rows_of 一遍(消除原两次重复 encode + 正则重写)。
     auto res = model.probs(enc, &enc_err);

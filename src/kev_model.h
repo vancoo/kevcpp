@@ -96,6 +96,12 @@ public:
     int threads_actual() const { return ctx_ ? llama_n_threads(ctx_) : 0; }
     int threads_batch_actual() const { return ctx_ ? llama_n_threads_batch(ctx_) : 0; }
 
+    // 每流注意力 KV 容量(n_ctx_seq)。一个 sequence(branch) 需在单流内放下
+    // 完整 state 前缀(Ls 格) + 自身 tokens(B 格) = input_tokens 格, 故
+    // Ls+B > n_ctx_seq 时会 decode 失败(find_slot 无空闲 cells)。供 API 层
+    // 提前判定 request 是否超容量, 给出清晰错误而非 cryptic "could not answer request"。
+    int n_ctx_seq_capacity() const { return ctx_ ? (int) llama_n_ctx_seq(ctx_) : 0; }
+
     // 用 GGUF 分词器统计文本 token 数(output_tokens 计费用: api.output_tokens)
     int count_tokens(const std::string & text) const;
 
