@@ -1,0 +1,44 @@
+# ---- build / intermediate artifacts ----
+/build/
+/build-debug/
+*.log
+*.dmp
+*.pdb
+*.obj
+*.ilk
+*.exp
+*.dll
+*.exe
+CMakeCache.txt
+CMakeFiles/
+Testing/
+*.vcxproj*
+*.sln
+*.user
+*.suo
+.vs/
+
+# ---- model weights / data (never commit) ----
+/models/
+
+# ---- local ACL recovery backup (not source) ----
+/.acl-recovery/
+
+# ---- python caches ----
+__pycache__/
+*.pyc
+.cache/
+
+# ---- tests/golden: derived / large parity artifacts (keep only req_*.json) ----
+/tests/golden/head.bin
+/tests/golden/head_weights.npz
+/tests/golden/hidden.json
+/tests/golden/cases.json
+/tests/golden/probs.json
+/tests/golden/*.hidden
+
+# ---- research / benchmark / test dirs: never commit (live in original kevcpp repo) ----
+/docs/
+/logs/
+/microbench/
+/tests/
