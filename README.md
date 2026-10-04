@@ -1,17 +1,23 @@
 # kevcpp
 
 > kev 的 C++17 原生实现（基于 llama.cpp），用 C++ 重新实现 kev（Python）的推理/服务行为。
+>
+> 🌐 **English version: [README.en.md](./README.en.md)**
 
-kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` 的 kev 推理服务。它以 kev（`E:\van\projects\kev`）的 Python
-参考实现为行为基准，把 `DecisionModel` / 状态前缀缓存 / `/v1/systemone` 服务语义用 C++/llama.cpp 重写，
-目标是：**证明 kevcpp 的稳态延迟不低于 Python kev，并持续压缩稳态延迟**（项目章程）。
+kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` （https://github.com/ggml-org/llama.cpp）的 kev 推理服务。它以 kev（`https://github.com/jaredpalmer/kev`）的 Python
+参考实现为行为基准，把 `DecisionModel` / 状态前缀缓存  `/v1/systemone` 服务语义用 C++/llama.cpp 重写，
+目标是：**提供一个下载即可运行的决策推理引擎**，避免kev带来的发展环境配置，并一定程度改造提高推理性能。
 
-> 当前语言说明：本文以中文撰写，标题辅以英文，读者可对照 kev 与 llama.cpp 的术语。
+> 由于条件有限，目前仅在开发机器（amd ai max 395 pro+)运行过，期望更多人加入进行完善和测试。
+> 后续计划：
+> 1. 增加GPU后端支持：将后端拆为独立dll，按命令参数加载
+> 2. 增加模型支持：将不同的模型支持定位到具体dll当中，按需加载
 
 ---
 
 ## 目录（Table of Contents）
 
+0. [快速上手（Quick Start）](#0-快速上手quick-start)
 1. [当前状态（Current Status）](#1-当前状态current-status)
 2. [基于 llama.cpp 与 kev（What We Reference）](#2-基于-llamacpp-与-kevwhat-we-reference)
 3. [开发环境与验证（Environment & Validation）](#3-开发环境与验证environment--validation)
@@ -20,6 +26,140 @@ kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` 的 kev 推理服务。
 6. [场景 / 依赖 / 环境要求（Usage, Dependencies, Requirements）](#6-场景--依赖--环境要求usage-dependencies-requirements)
 7. [架构说明（Architecture）](#7-架构说明architecture)
 8. [模型 / HF Hub（Model & HuggingFace）](#8-模型--hf-hubmodel--huggingface)
+
+---
+
+## 0. 快速上手（Quick Start）
+
+> 本小节面向「只想跑起来」的用户：如何拿到二进制与模型、如何启动 `main_server`、如何构建一条请求报文快速验证。
+> 如果你需要自己从源码构建，请跳到 [§6 场景 / 依赖 / 环境要求](#6-场景--依赖--环境要求usage-dependencies-requirements)。
+
+### 0.1 从哪里下载二进制文件与模型文件
+
+**二进制文件（Release 可执行程序）**
+
+目前仓库尚未提供预编译的 CI 发布包（`main_server` 仍以源码方式分发，见 §6）。可用的获取方式：
+
+| 来源 | 说明 |
+| --- | --- |
+| **本地构建** | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release`，产物在 `build/bin/main_server.exe`（Windows）/ `build/bin/main_server`（Linux）。推荐方式。 |
+| **GitHub Releases** | Windows 0.1.0 版本已经发布Releases，适用于AMD CPU，Intel CPU未测试，Linux版本缺少环境未编译，期待更多人参与。 |
+
+**模型文件**
+
+本项目使用的 0.8B 模型**不是现成的 Qwen-0.8B**，而是本项目定制的变体（结构见 §8）。需要两个文件：
+
+| 文件 | 约大小 | 说明 |
+| --- | --- | --- |
+| `kev-merged-q8.gguf` | ~774 MiB | 主模型权重（Q8_0 量化），对应 `--model` 参数 |
+| `head.bin` | ~2 MiB | PointerHead 读出头权重，对应 `--head` 参数 |
+
+下载地址：
+
+- **Hugging Face Hub**：`https://huggingface.co/vanncoo/kevcpp-qwen3.5-0.8b`（仓库 ID 为
+  `vanncoo/kevcpp-qwen3.5-0.8b`）。上传时会同时包含 GGUF 权重与 PointerHead。**若尚未上传成功，请以仓库内
+  `models/` 目录为准。**
+- **本地 `models/` 目录**：仓库自带的 `models/kev-merged-q8.gguf` 与 `models/head.bin`（如有则直接使用）。
+
+> 💡 模型的完整规格与 HF Hub 说明见 [§8 模型 / HF Hub](#8-模型--hf-hubmodel--huggingface)。
+
+### 0.2 如何启动服务
+
+把模型文件放到 `models/` 目录后，运行（示例假设模型在 `models/` 下）：
+
+```bash
+# Windows / Linux（等价）
+./build/bin/main_server \
+    --model models/kev-merged-q8.gguf \
+    --head  models/head.bin \
+    --port  8008 \
+    --threads 16
+```
+
+- 看到如下日志说明启动成功、已开始监听：
+
+```
+kevcpp server model ready (...)
+kevcpp using 16 threads ...
+kevcpp warmed decode graph (state+branch) before listen
+```
+
+- 默认监听 `127.0.0.1:8008`。健康检查（或模型信息）：
+
+```bash
+curl http://127.0.0.1:8008/v1/models
+```
+
+- 若设置了环境变量 `KEV_API_KEY`，所有请求需带
+  `Authorization: Bearer <KEV_API_KEY>` 头（否则返回 `401`）。
+
+### 0.3 如何快速构建请求报文测试
+
+接口为 **`POST /v1/systemone`**，请求体是 JSON，含两个字段：
+
+- `state`：业务上下文/原始状态文本（字符串，可直接传任意文本）。
+- `questions`：对象，key 为问题 id，value 为 `{ "type": <type>, "criteria": <criteria> }`。
+  - `type` 支持 `noul`（二选一）、`choice`（多选一）、`score`（评分档）。
+  - `criteria`：`noul`/`choice` 传 `{ "选项key": "选项描述" }` 对象；`score` 传评分档描述数组。
+
+一个最小示例 `request.json`：
+
+```json
+{
+  "state": "你是一家小型制造公司的 CEO。公司产能接近上限，手持现金充裕。",
+  "questions": {
+    "q_expand": {
+      "type": "choice",
+      "criteria": {
+        "认_产线产能": "投资扩产以提升产量",
+        "认_投资": "加大研发或市场投入",
+        "认_其他": "维持现状"
+      }
+    }
+  }
+}
+```
+
+然后发起请求（Windows 与 Linux 均可用 `curl`）：
+
+```bash
+curl.exe -s -X POST http://127.0.0.1:8008/v1/systemone \
+    -H "Content-Type: application/json" \
+    --data-binary @request.json
+```
+
+返回示例（概要：`answers` 给出各问题的结论，`conf` 为置信度，`usage` 含 token 统计）：
+
+```json
+{
+  "answers": { "q_expand": "认_产线产能" },
+  "conf": 0.5,
+  "probs": { "q_expand": { "认_产线产能": 0.6, "认_投资": 0.3, "认_其他": 0.1 } },
+  "usage": { "input_tokens": 100, "output_tokens": 10 }
+}
+```
+
+> 仅在兼容性上提示：把全量的 `state` 原样传入可获得与参考实现一致的位级一致结果。
+
+### 0.4 启动命令参数说明
+
+| 选项 | 说明 |
+| --- | --- |
+| `--model <gguf>` | 模型文件路径（**必填**，`kev-merged-q8.gguf`） |
+| `--head <bin>` | PointerHead `.bin` 路径 |
+| `--host <ip>` | 监听地址（默认 `127.0.0.1`） |
+| `--port <p>` | 监听端口（默认 `8008`） |
+| `--threads <n>` / `-t <n>` | 计算线程数（`0` / 不设 = 自动探测，上限 32） |
+| `--ctx <n>` | 上下文大小（默认 `8192`；短 state 可用 `2048`） |
+| `--lru <n>` | 状态缓存 slot 数（默认 `2`） |
+| `--prewarm <file>` | 启动时预热一个 state（读取原始 state 文本，prefill 进 LRU，可选） |
+| `--lora <gguf>` | 额外加载 LoRA 权重（可选） |
+| `--lora-scale <f>` | LoRA 缩放系数（与 `--lora` 搭配，可选） |
+| `--quiet` | 关闭每次请求的日志行 |
+| `--help` / `-h` | 打印用法并退出 |
+
+> `--backend`（CPU/GPU 可插拔后端）仅存在于已归档分支 `build-portable-backends`，当前主构建未启用，
+> GPU 后端（`gpu`/`cuda`/`vulkan`）尚未实现。详见 §5.6。
 
 ---
 
@@ -290,18 +430,11 @@ parse（/v1/systemone JSON）
 
 ### 8.2 HF Hub（待上传）
 
-本项目计划将模型上传到 **Hugging Face Hub**（huggingface.co）。
+本项目模型上传在 **Hugging Face Hub**（huggingface.co）。
 
-- **TODO（占位，待你填写）**：仓库 ID / 链接为
-  `https://huggingface.co/<your-hf-id>/<repo>`，**当前未上传，具体 ID/链接待定**。
+- 仓库 ID / 链接为
+  `https://huggingface.co/vanncoo/kevcpp-qwen3.5-0.8b`。
 - 上传时会包含：**GGUF 权重**（`kev-merged-q8.gguf`）、**PointerHead**（`head.bin`）以及必要的模型卡片说明。
-
----
-
-## 相关文档（Docs）
-
-> 研究日志、性能实验与部署计划文档见**原仓库 kevcpp**（`docs/` 与 `logs/` 目录），例如 `docs/F.24_…`（权威性能/实验日志）与
-> `docs/portable_backend_deployment.md`（可插拔后端 / 便携构建计划，ARCHIVED）。本仓库仅托管可分发源码，不含研究日志。
 
 ---
 
@@ -309,5 +442,5 @@ parse（/v1/systemone JSON）
 
 本项目采用 **MIT License**（见 `LICENSE`），为 kevcpp 的**当前生效许可证**。
 
-> kevcpp 引用并复用 vendored 的 llama.cpp（`third_party/llama.cpp`）与参考实现 kev（`E:\van\projects\kev`）
+> kevcpp 引用并复用 vendored 的 llama.cpp（`third_party/llama.cpp`）与参考实现 kev（`https://github.com/jaredpalmer/kev`）
 > 的行为语义；llama.cpp 与 kev 各自的许可以它们各自的上游为准，MIT 许可覆盖的是本项目自身的源码组织。
