@@ -7,6 +7,26 @@ endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# ===========================================================================
+# Single-llama rule (see docs/portable_backend_deployment.md): only ONE module
+# may link llama/ggml in a process. The default state (KEV_BUILD_BACKEND_GPU=OFF)
+# statically links the one `llama` copy into main_server AND the in-process CPU
+# backend — the safe single-module state.
+#
+# Stage 2 (GPU backend): KEV_BUILD_BACKEND_GPU=ON enables the in-process HIP
+# (GGML_HIP) backend. This build MUST be configured with the ROCm hipcc/clang
+# toolchain + NMake generator (Ninja hangs on clang ABI-detect on this host)
+# and GGML_HIP flips ON below. It still compiles ggml-hip into the SAME static
+# `llama` module shared by main_server (single-llama SAFE). The default CPU/MSVC
+# build is untouched when this option is OFF.
+# ===========================================================================
+option(KEV_BUILD_BACKEND_GPU "Enable the in-process GGML_HIP GPU backend (needs hipcc/clang + NMake build)" OFF)
+if (KEV_BUILD_BACKEND_GPU)
+    set(GGML_HIP        ON  CACHE BOOL "ggml: use HIP backend" FORCE)
+    set(GGML_HIP_GRAPHS OFF CACHE BOOL "ggml: use HIP graph"  FORCE)  # deterministic, no graph capture
+    set(GGML_HIP_NO_VMM ON  CACHE BOOL "ggml: do not use HIP VMM" FORCE)
+endif()
+
 #
 # llama.cpp is vendored as a full copy under third_party/llama.cpp.
 # Using add_subdirectory() makes LLAMA_STANDALONE=OFF inside, so the copy's
@@ -39,6 +59,17 @@ set(GGML_LLAMAFILE OFF CACHE BOOL "ggml: use LLAMAFILE sgemm" FORCE)
 # ===========================================================================
 
 add_subdirectory(third_party/llama.cpp)
+
+# ---- NMake + clang/HIP portability (Stage 1): ----
+# llama.cpp/ggml defines GGML_CUDA_FA_QUANTS as a C string literal
+# ("GGML_CUDA_FA_QUANTS=\"q8_0-q8_0;...\""). Unix generators preserve the quotes,
+# but the Windows NMake generator + clang driver strip them, then
+# ggml-cuda.cu:5745 fails with "use of undeclared identifier 'q4_0'". The macro
+# only feeds a cosmetic runtime "features" diagnostic; undefining it (issued
+# AFTER llama's -D in the emitted command) makes the #ifdef false and skips it.
+if (KEV_BUILD_BACKEND_GPU AND TARGET ggml-hip)
+    target_compile_options(ggml-hip PRIVATE -UGGML_CUDA_FA_QUANTS)
+endif()
 
 #
 # kev executable: minimal loader/prefill/hidden-state verification (M0).
@@ -128,6 +159,11 @@ add_executable(main_server
     src/kev_backend_cpu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib/httplib.cpp
 )
+if (KEV_BUILD_BACKEND_GPU)
+    # In-process GPU (HIP) backend — compiled into the SAME static llama module.
+    target_sources(main_server PRIVATE src/kev_backend_gpu.cpp)
+    target_compile_definitions(main_server PRIVATE KEV_BACKEND_GPU_SINGLE_LLAMA)
+endif()
 target_link_libraries(main_server PRIVATE llama)
 target_compile_definitions(main_server PRIVATE KEV_BACKEND_BUILD)
 target_include_directories(main_server PRIVATE

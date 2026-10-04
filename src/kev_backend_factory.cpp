@@ -202,6 +202,22 @@ std::unique_ptr<Backend> load_cpu_inprocess(std::string * err) {
     return wrap_loaded(&kev_backend_get_meta, &kev_backend_get_ops, &kev_backend_create, err);
 }
 
+#ifdef KEV_BACKEND_GPU_SINGLE_LLAMA
+// In-process GPU (HIP) backend. Only compiled when the enclosing build enables
+// GGML_HIP and co-links kev_backend_gpu.cpp into the SAME static llama module as
+// main_server (single-llama rule). The GPU backend export symbols are prefixed
+// kev_backend_gpu_* so they do not collide with the CPU backend's
+// kev_backend_* (both live in one binary in the in-process GPU build).
+extern "C" {
+    kev_backend_meta kev_backend_gpu_get_meta(void);
+    kev_backend_ops  kev_backend_gpu_get_ops(void);
+    kev_backend_t  * kev_backend_gpu_create(void);
+}
+std::unique_ptr<Backend> load_gpu_inprocess(std::string * err) {
+    return wrap_loaded(&kev_backend_gpu_get_meta, &kev_backend_gpu_get_ops, &kev_backend_gpu_create, err);
+}
+#endif
+
 #ifdef KEV_BACKEND_USE_DLL
 // Load a backend plugin dll by file base name (e.g. "kev-backend-cpu").
 // Linked only when KEV_BACKEND_USE_DLL is defined (production portable path;
@@ -253,13 +269,20 @@ std::unique_ptr<Backend> BackendFactory_load(const std::string & name, std::stri
 #endif
     }
 
-    // GPU extension point. Not built yet — return the clear, actionable error.
+    // GPU / CUDA / Vulkan: in-process HIP backend when the build enables GGML_HIP
+    // (single-llama-safe, mirrors the CPU in-process path). Otherwise (default
+    // CPU-only build) return the clear "not built / use --backend cpu" error.
     if (name == "gpu" || name == "cuda" || name == "vulkan" || name == "cuda0" || name == "llamacpp-gpu") {
+#ifdef KEV_BACKEND_GPU_SINGLE_LLAMA
+        return load_gpu_inprocess(err);
+#else
         set_err(err,
             "backend '" + name + "' is NOT built in this kevcpp build; "
-            "the GPU backend is a planned extension point (kev-backend-gpu dll). "
+            "the GPU backend requires a GGML_HIP build (KEV_BUILD_BACKEND_GPU=ON "
+            "compiled with hipcc/clang + NMake). "
             "Use --backend cpu (the only backend compiled here).");
         return nullptr;
+#endif
     }
 
     set_err(err, "unknown backend: '" + name + "' (expected 'cpu', or 'gpu'/'cuda'/'vulkan' as extension point)");

@@ -1,0 +1,313 @@
+// kev_backend_gpu.cpp — GPU (HIP) backend plugin implementing the portable C ABI.
+//
+// This module implements the kev_backend C ABI from kev_backend.h over the
+// vendored llama.cpp / ggml built WITH GGML_HIP (ROCm). It is a drop-in mirror
+// of kev_backend_cpu.cpp whose only semantic difference is offloading all layers
+// to the HIP device (n_gpu_layers < 0) and reporting meta.device = "gpu".
+//
+// Single-llama rule: like the CPU backend, this module shares the SAME static
+// `llama`/`ggml` copy as main_server (in-process GGML_HIP build). It does NOT
+// create a second llama. When both the CPU and GPU backends are compiled into
+// the same binary (in-process GGML_HIP build), the exported factory symbols must
+// NOT collide with the CPU backend's `kev_backend_get_meta` etc. The
+// KEV_BACKEND_GPU_SINGLE_LLAMA macro (defined only when co-linking with the CPU
+// backend) renames the four factory entry points to `kev_backend_gpu_*`; the
+// factory then references those prefixed names. In an isolated GPU-only build
+// that macro is left undefined and the canonical names are used.
+//
+// Deterministic first: GGML_HIP_GRAPHS is left OFF in the enclosing build (no
+// graph capture) so decode semantics match CPU exactly (verified bit-identical
+// in Stage 1). This host is heap-fragile: run ONE device per clean process and
+// prefer flush + _exit(0) after a RESULT (the recurrent Gated-DeltaNet CPU
+// decode corrupts the heap and must not run before/after GPU decode in one proc).
+#include "kev_backend.h"
+
+#include "llama.h"
+
+#include <cstring>
+#include <cstdio>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef KEV_BACKEND_GPU_SINGLE_LLAMA
+#  define KEVGPU_GET_META   kev_backend_gpu_get_meta
+#  define KEVGPU_GET_OPS    kev_backend_gpu_get_ops
+#  define KEVGPU_CREATE     kev_backend_gpu_create
+#  define KEVGPU_DESTROY    kev_backend_gpu_destroy
+#else
+#  define KEVGPU_GET_META   kev_backend_get_meta
+#  define KEVGPU_GET_OPS    kev_backend_get_ops
+#  define KEVGPU_CREATE     kev_backend_create
+#  define KEVGPU_DESTROY    kev_backend_destroy
+#endif
+
+namespace {
+
+struct KevGpuBackend {
+    llama_model          * model = nullptr;
+    llama_context        * ctx   = nullptr;
+    llama_adapter_lora   * lora  = nullptr;
+    const llama_vocab    * vocab = nullptr;
+    int32_t               n_embd = 0;
+    int32_t               n_seq_max = 0;
+    bool                  ok = false;
+    bool                  offload_ok = false;
+};
+
+KevGpuBackend * as_gpu(kev_backend_t * b) {
+    return reinterpret_cast<KevGpuBackend *>(b);
+}
+
+void write_err(char * err, size_t cap, const std::string & msg) {
+    if (err && cap) std::snprintf(err, cap, "%s", msg.c_str());
+}
+
+// ---- lifecycle ----
+
+int op_create(kev_backend_t ** out) {
+    if (!out) return 1;
+    *out = reinterpret_cast<kev_backend_t *>(new KevGpuBackend());
+    return 0;
+}
+
+void op_destroy(kev_backend_t * b) {
+    KevGpuBackend * kb = as_gpu(b);
+    if (!kb) return;
+    if (kb->lora)  { llama_adapter_lora_free(kb->lora);  kb->lora  = nullptr; }
+    if (kb->ctx)   { llama_free(kb->ctx);                kb->ctx   = nullptr; }
+    if (kb->model) { llama_model_free(kb->model);        kb->model = nullptr; }
+    if (kb->ctx || kb->model) llama_backend_free();
+    kb->vocab = nullptr; kb->ok = false;
+    delete kb;
+}
+
+int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t err_cap) {
+    KevGpuBackend * kb = as_gpu(b);
+    if (!kb) { write_err(err, err_cap, "null backend"); return 1; }
+    if (kb->ctx || kb->model) { write_err(err, err_cap, "backend already initialized"); return 1; }
+    if (!p || !p->model_path) { write_err(err, err_cap, "model_path required"); return 1; }
+
+    llama_backend_init();
+
+    // GPU backend: offload ALL layers to the HIP device (like llama.cpp -ngl -1).
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = -1;   // negative = all layers to GPU
+    kb->model = llama_model_load_from_file(p->model_path, mparams);
+    if (!kb->model) { write_err(err, err_cap, "failed to load model: " + std::string(p->model_path)); return 1; }
+    kb->vocab = llama_model_get_vocab(kb->model);
+    kb->n_embd = llama_model_n_embd(kb->model);
+
+    const int n_ctx   = p->n_ctx > 0 ? p->n_ctx : 2048;
+    kb->n_seq_max     = p->n_seq_max > 0 ? p->n_seq_max : 4;
+    const int threads = p->n_threads > 0 ? p->n_threads : (int) std::thread::hardware_concurrency();
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx             = (uint32_t) n_ctx;
+    cparams.n_batch           = (uint32_t) (p->n_batch > 0 ? p->n_batch : 512);
+    cparams.n_ubatch          = (uint32_t) (p->n_ubatch > 0 ? p->n_ubatch : 256);
+    cparams.n_seq_max         = (uint32_t) kb->n_seq_max;
+    cparams.n_outputs_max_per_seq = (uint32_t) (p->n_outputs_max_per_seq > 0 ? p->n_outputs_max_per_seq : 128);
+    cparams.embeddings        = p->embeddings != 0;
+    cparams.lm_head           = p->lm_head != 0;
+    cparams.pooling_type      = LLAMA_POOLING_TYPE_NONE;
+    cparams.n_threads         = (int32_t) threads;
+    cparams.n_threads_batch   = (int32_t) threads;
+    kb->ctx = llama_init_from_model(kb->model, cparams);
+    if (!kb->ctx) { write_err(err, err_cap, "failed to init context"); return 1; }
+
+    // Optional LoRA adapter (only when not already folded into the weights).
+    if (p->lora_path && p->lora_path[0] != '\0' && !p->lora_premerged) {
+        kb->lora = llama_adapter_lora_init(kb->model, p->lora_path);
+        if (!kb->lora) { write_err(err, err_cap, "failed to load lora adapter: " + std::string(p->lora_path)); return 1; }
+        float scale = p->lora_scale;
+        if (llama_set_adapters_lora(kb->ctx, &kb->lora, 1, &scale) != 0) {
+            write_err(err, err_cap, "failed to set lora adapters"); return 1;
+        }
+    }
+
+    kb->ok = true;
+    return 0;
+}
+
+// ---- decode ----  (identical graphs to CPU; the difference is the offloaded weights)
+
+int op_decode_seq(kev_backend_t * b, const kev_backend_decode_seq * d, char * err, size_t err_cap) {
+    KevGpuBackend * kb = as_gpu(b);
+    if (!kb || !kb->ctx) { write_err(err, err_cap, "backend not initialized"); return 1; }
+    if (!d || d->n_tokens <= 0) { write_err(err, err_cap, "empty sequence to decode"); return 1; }
+    const int32_t n = d->n_tokens;
+
+    llama_batch batch = llama_batch_init(n, /*embd=*/0, kb->n_seq_max);
+    for (int32_t i = 0; i < n; ++i) {
+        batch.token[i]     = (llama_token) d->tokens[i];
+        batch.pos[i]       = (llama_pos)(d->start_pos + i);
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = d->seq;
+        batch.logits[i]    = 0;
+    }
+    for (int32_t k = 0; k < d->n_logits_pos; ++k) {
+        const int32_t pos = d->logits_pos[k];
+        if (pos >= 0 && pos < n) batch.logits[pos] = 1;
+    }
+    batch.n_tokens = n;
+
+    const int r = llama_decode(kb->ctx, batch);
+    llama_batch_free(batch);
+    if (r != 0) { write_err(err, err_cap, "decode failed ret=" + std::to_string(r)); return 1; }
+    return 0;
+}
+
+int op_decode_batch(kev_backend_t * b, const kev_backend_decode_branch * rows, int32_t n_rows,
+                    char * err, size_t err_cap) {
+    KevGpuBackend * kb = as_gpu(b);
+    if (!kb || !kb->ctx) { write_err(err, err_cap, "backend not initialized"); return 1; }
+    if (!rows || n_rows <= 0) { write_err(err, err_cap, "empty batch"); return 1; }
+    const int32_t L = rows[0].n_ids;
+    if (L <= 0) { write_err(err, err_cap, "empty branch in batch"); return 1; }
+    for (int32_t s = 0; s < n_rows; ++s) {
+        if (rows[s].n_ids != L) { write_err(err, err_cap, "batch requires equal branch lengths"); return 1; }
+    }
+
+    const int32_t n = L * n_rows;
+    llama_batch batch = llama_batch_init(n, /*embd=*/0, kb->n_seq_max);
+    for (int32_t s = 0; s < n_rows; ++s) {
+        const kev_backend_decode_branch & br = rows[s];
+        const int32_t base = s * L;
+        for (int32_t t = 0; t < L; ++t) {
+            const int32_t i = base + t;
+            batch.token[i]     = (llama_token) br.ids[t];
+            batch.pos[i]       = (llama_pos)(br.start_pos + t);
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = br.seq;
+            batch.logits[i]    = 0;
+        }
+        for (int32_t k = 0; k < br.n_opts; ++k) {
+            const int32_t o = br.opts[k];
+            if (o >= 0 && o < L) batch.logits[base + o] = 1;
+        }
+        if (br.decide >= 0 && br.decide < L) batch.logits[base + br.decide] = 1;
+    }
+    batch.n_tokens = n;
+
+    const int r = llama_decode(kb->ctx, batch);
+    llama_batch_free(batch);
+    if (r != 0) { write_err(err, err_cap, "batch decode failed ret=" + std::to_string(r)); return 1; }
+    return 0;
+}
+
+int op_read_hidden(kev_backend_t * b, int32_t out_idx, float * out, size_t out_cap,
+                   char * err, size_t err_cap) {
+    KevGpuBackend * kb = as_gpu(b);
+    if (!kb || !kb->ctx) { write_err(err, err_cap, "backend not initialized"); return 1; }
+    float * p = llama_get_embeddings_ith(kb->ctx, out_idx);
+    if (!p) { write_err(err, err_cap, "no embedding at output idx " + std::to_string(out_idx)); return 1; }
+    if (out_cap < (size_t) kb->n_embd) { write_err(err, err_cap, "output buffer too small"); return 1; }
+    std::memcpy(out, p, (size_t) kb->n_embd * sizeof(float));
+    return 0;
+}
+
+int op_seq_clear(kev_backend_t * b, int32_t seq) {
+    KevGpuBackend * kb = as_gpu(b);
+    if (!kb || !kb->ctx) return 1;
+    llama_memory_t mem = llama_get_memory(kb->ctx);
+    llama_memory_seq_rm(mem, seq, 0, -1);
+    return 0;
+}
+
+int op_seq_copy(kev_backend_t * b, int32_t src, int32_t dst) {
+    KevGpuBackend * kb = as_gpu(b);
+    if (!kb || !kb->ctx) return 1;
+    llama_memory_t mem = llama_get_memory(kb->ctx);
+    llama_memory_seq_cp(mem, src, dst, 0, -1);
+    return 0;
+}
+
+// ---- sizing ----
+
+int32_t op_n_ctx_seq_capacity(kev_backend_t * b) {
+    KevGpuBackend * kb = as_gpu(b);
+    return (kb && kb->ctx) ? (int32_t) llama_n_ctx_seq(kb->ctx) : 0;
+}
+
+int32_t op_count_tokens(kev_backend_t * b, const char * text) {
+    KevGpuBackend * kb = as_gpu(b);
+    if (!kb || !kb->vocab || !text) return 0;
+    std::vector<llama_token> tokens(4096);
+    const int32_t n = llama_tokenize(kb->vocab, text, (int32_t) std::strlen(text),
+                                     tokens.data(), (int32_t) tokens.size(),
+                                     /*add_special=*/false, /*parse_special=*/false);
+    return n < 0 ? 0 : n;
+}
+
+int32_t op_model_n_embd(kev_backend_t * b) {
+    KevGpuBackend * kb = as_gpu(b);
+    return kb ? kb->n_embd : 0;
+}
+
+int32_t op_threads(kev_backend_t * b) {
+    KevGpuBackend * kb = as_gpu(b);
+    return (kb && kb->ctx) ? llama_n_threads(kb->ctx) : 0;
+}
+
+int32_t op_threads_batch(kev_backend_t * b) {
+    KevGpuBackend * kb = as_gpu(b);
+    return (kb && kb->ctx) ? llama_n_threads_batch(kb->ctx) : 0;
+}
+
+kev_backend_vocab_t * op_vocab_opaque(kev_backend_t * b) {
+    KevGpuBackend * kb = as_gpu(b);
+    return kb ? reinterpret_cast<kev_backend_vocab_t *>(const_cast<llama_vocab *>(kb->vocab)) : nullptr;
+}
+
+kev_backend_ops g_ops = {};
+
+} // namespace
+
+// ---- exported factory ----
+
+extern "C" {
+
+KEV_BACKEND_API kev_backend_meta KEVGPU_GET_META(void) {
+    kev_backend_meta m{};
+    m.abi_version  = KEV_BACKEND_ABI_VERSION;
+    m.name         = "gpu";
+    m.device       = "gpu";
+    m.version      = "kev-backend-gpu-0.1-static-ggml-hip";
+    m.capabilities = KEV_BACKEND_CAP_BATCH_DECODE | KEV_BACKEND_CAP_SEQ_MEMORY | KEV_BACKEND_CAP_HIDDEN_READ;
+    m.struct_size  = sizeof(kev_backend_meta);
+    return m;
+}
+
+KEV_BACKEND_API kev_backend_ops KEVGPU_GET_OPS(void) {
+    if (g_ops.struct_size == 0) {
+        g_ops.struct_size     = sizeof(kev_backend_ops);
+        g_ops.create          = op_create;
+        g_ops.destroy         = op_destroy;
+        g_ops.init            = op_init;
+        g_ops.decode_seq      = op_decode_seq;
+        g_ops.decode_batch    = op_decode_batch;
+        g_ops.read_hidden     = op_read_hidden;
+        g_ops.seq_clear       = op_seq_clear;
+        g_ops.seq_copy        = op_seq_copy;
+        g_ops.n_ctx_seq_capacity = op_n_ctx_seq_capacity;
+        g_ops.count_tokens    = op_count_tokens;
+        g_ops.model_n_embd    = op_model_n_embd;
+        g_ops.threads         = op_threads;
+        g_ops.threads_batch   = op_threads_batch;
+        g_ops.vocab_opaque    = op_vocab_opaque;
+    }
+    return g_ops;
+}
+
+KEV_BACKEND_API kev_backend_t * KEVGPU_CREATE(void) {
+    kev_backend_t * out = nullptr;
+    (void) op_create(&out);
+    return out;
+}
+
+KEV_BACKEND_API void KEVGPU_DESTROY(kev_backend_t * b) {
+    op_destroy(b);
+}
+
+} // extern "C"
