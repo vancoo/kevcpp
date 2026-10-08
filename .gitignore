@@ -36,3 +36,15 @@ __pycache__/
 /tests/golden/cases.json
 /tests/golden/probs.json
 /tests/golden/*.hidden
+
+# ---- transient / experiment artifacts (never commit) ----
+/logs/
+/microbench/
+repro_*.json
+tests/tmp_*.json
+tests/*.out
+tests/*_err.txt
+tests/*_out.txt
+tests/kab_*
+*.docx
+*.doc

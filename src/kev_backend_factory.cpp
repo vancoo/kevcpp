@@ -144,6 +144,35 @@ void * Backend::vocab_opaque() const {
     return (handle_ && ops_.vocab_opaque) ? (void *) ops_.vocab_opaque(handle_) : nullptr;
 }
 
+namespace {
+// Non-capturing adapters that forward the llama-free kev::TokenFeeder contract to
+// the backend ops. `ud` points to a kev::BackendFeederState (a copy of ops + handle
+// owned by the enclosing kev::Backend), valid for that Backend's lifetime.
+int32_t feeder_tokenize(void * ud, const char * text, int32_t text_len,
+                        bool add_special, bool parse_special,
+                        int32_t * out_ids, int32_t cap) {
+    const auto * st = static_cast<const kev::BackendFeederState *>(ud);
+    if (!st || !st->handle || !st->ops.tokenize) return -1;
+    return st->ops.tokenize(st->handle, text, text_len, add_special, parse_special,
+                            out_ids, cap, nullptr, 0);
+}
+int32_t feeder_special_token_id(void * ud, const char * special) {
+    const auto * st = static_cast<const kev::BackendFeederState *>(ud);
+    if (!st || !st->handle || !st->ops.special_token_id) return -1;
+    return st->ops.special_token_id(st->handle, special);
+}
+} // namespace
+
+TokenFeeder Backend::token_feeder() const {
+    feeder_state_.ops = ops_;
+    feeder_state_.handle = handle_;
+    TokenFeeder tf;
+    tf.ud = &feeder_state_;
+    tf.tokenize         = &feeder_tokenize;
+    tf.special_token_id = &feeder_special_token_id;
+    return tf;
+}
+
 // Definition of the friend free function declared in kev_backend_factory.h.
 std::unique_ptr<Backend> Backend_wrap(kev_backend_ops ops, kev_backend_meta meta,
                                       kev_backend_t * handle) {
@@ -190,6 +219,15 @@ static std::unique_ptr<Backend> wrap_loaded(
         set_err(err, "backend ABI version mismatch");
         return nullptr;
     }
+    // Defensive ABI guard (B-1): the host expects at least sizeof(kev_backend_ops)
+    // (including the trailing delegated-tokenizer ops). If the loaded plugin was
+    // built from an OLDER kev_backend.h (smaller struct_size), reading the trailing
+    // function pointers would be out of bounds — reject up front.
+    if (ops.struct_size < sizeof(kev_backend_ops)) {
+        set_err(err, "backend ops table too small (plugin ABI older than host); "
+                     "rebuild the backend dll from the current kev_backend.h");
+        return nullptr;
+    }
     kev_backend_t * handle = create_fn();
     if (!handle) { set_err(err, "backend create failed"); return nullptr; }
     return Backend_wrap(ops, meta, handle);
@@ -198,9 +236,14 @@ static std::unique_ptr<Backend> wrap_loaded(
 // In-process CPU backend (single-module static build). Links the exported C
 // functions from kev_backend_cpu.cpp directly; main_server and this TU share
 // the SAME llama copy — the safe state for bit-identical validation here.
+// Compiled only in the static in-process build (KEV_BACKEND_USE_DLL off); when
+// the host uses plugin dlls, kev_backend_cpu.cpp is NOT linked into main_server,
+// so these symbols do not exist there.
+#ifndef KEV_BACKEND_USE_DLL
 std::unique_ptr<Backend> load_cpu_inprocess(std::string * err) {
     return wrap_loaded(&kev_backend_get_meta, &kev_backend_get_ops, &kev_backend_create, err);
 }
+#endif
 
 #ifdef KEV_BACKEND_GPU_SINGLE_LLAMA
 // In-process GPU (HIP) backend. Only compiled when the enclosing build enables
@@ -269,11 +312,25 @@ std::unique_ptr<Backend> BackendFactory_load(const std::string & name, std::stri
 #endif
     }
 
-    // GPU / CUDA / Vulkan: in-process HIP backend when the build enables GGML_HIP
-    // (single-llama-safe, mirrors the CPU in-process path). Otherwise (default
-    // CPU-only build) return the clear "not built / use --backend cpu" error.
-    if (name == "gpu" || name == "cuda" || name == "vulkan" || name == "cuda0" || name == "llamacpp-gpu") {
-#ifdef KEV_BACKEND_GPU_SINGLE_LLAMA
+    // GPU / CUDA / Vulkan: loaded as a plugin dll (when KEV_BACKEND_USE_DLL) or
+    // an in-process HIP backend when the build co-links GGML_HIP (single-llama
+    // in-process, mirrors the CPU in-process path).
+    if (name == "vulkan") {
+#ifdef KEV_BACKEND_USE_DLL
+        // Vulkan uses its OWN dll (kev-backend-vulkan.dll, GGML_VULKAN build),
+        // distinct from the HIP gpu dll, so a Vulkan runtime does not need ROCm.
+        return load_plugin_dll("kev-backend-vulkan", err);
+#else
+        set_err(err,
+            "backend 'vulkan' requires a plugin-dll host build (KEV_BACKEND_USE_DLL); "
+            "this build only supports 'cpu' (and in-process HIP when GGML_HIP is co-linked).");
+        return nullptr;
+#endif
+    }
+    if (name == "gpu" || name == "cuda" || name == "cuda0" || name == "llamacpp-gpu") {
+#ifdef KEV_BACKEND_USE_DLL
+        return load_plugin_dll("kev-backend-gpu", err);
+#elif defined(KEV_BACKEND_GPU_SINGLE_LLAMA)
         return load_gpu_inprocess(err);
 #else
         set_err(err,
@@ -285,7 +342,7 @@ std::unique_ptr<Backend> BackendFactory_load(const std::string & name, std::stri
 #endif
     }
 
-    set_err(err, "unknown backend: '" + name + "' (expected 'cpu', or 'gpu'/'cuda'/'vulkan' as extension point)");
+    set_err(err, "unknown backend: '" + name + "' (expected 'cpu', 'vulkan', or 'gpu'/'cuda' as extension point)");
     return nullptr;
 }
 

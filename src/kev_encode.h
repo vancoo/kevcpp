@@ -15,9 +15,28 @@
 #include <string>
 #include <vector>
 
-struct llama_vocab;
-
 namespace kev {
+
+// llama-free tokenizer accessor (B-3). kev_encode never touches llama types: the
+// caller supplies a TokenFeeder that performs tokenize / special-token lookup.
+//
+//  * cpu/gpu plugin path: built from a kev::Backend (kev_backend_factory.h),
+//    forwarding to the backend's tokenize / special_token_id ops (single-llama:
+//    the dll owns the llama_vocab).
+//  * legacy static bench tool path (headbench, etc., which link llama directly):
+//    built from a const llama_vocab* in a llama-linking TU (see kev_encode.h's
+//    llama-free contract — the adapter itself lives where llama is statically
+//    linked, not in kev_encode.cpp).
+//
+// tokenize returns count written (>=0), or -required-capacity (negative) when
+// `cap` is too small (writes nothing).
+struct TokenFeeder {
+    void * ud = nullptr;
+    int32_t (*tokenize)(void * ud, const char * text, int32_t text_len,
+                        bool add_special, bool parse_special,
+                        int32_t * out_ids, int32_t cap);
+    int32_t (*special_token_id)(void * ud, const char * special);
+};
 
 constexpr int32_t OPT_NONE  = -1;
 constexpr int32_t OPT_DECIDE = -2;
@@ -64,18 +83,18 @@ struct KevRows {
 
 // 分词器抽象: 返回 text (已按需改写) 的 token ids, 序列 = HF fast tokenizer(addr_special=False)
 //   parse_special 语义等同 HF split_special_tokens; 对 Qwen3.5 已对拍 == HF fast.
-std::vector<int32_t> tokenize(const llama_vocab * vocab, const std::string & text,
+std::vector<int32_t> tokenize(const TokenFeeder & tf, const std::string & text,
                               bool add_special, bool parse_special);
 
 // 查找特殊 token id: 对 "<|name|>" parse_special=true 分词取最后一个 id(前面的伪 token 忽略).
-int32_t special_token_id(const llama_vocab * vocab, const char * special);
+int32_t special_token_id(const TokenFeeder & tf, const char * special);
 
 // user_tokens: <|x|> -> <¦x¦> 再 add_special=False 分词
-std::vector<int32_t> user_tokens(const llama_vocab * vocab, const std::string & text);
+std::vector<int32_t> user_tokens(const TokenFeeder & tf, const std::string & text);
 
 // encode(): 完整打包, 与 kev.model.encode(option_isolation=False) 对齐.
 // max_state/max_branch 语义: 返回状态是否被截断; 超限置 state_truncated / throw_on_overflow.
-KevEnc encode(const llama_vocab * vocab, const KevRequest & rec,
+KevEnc encode(const TokenFeeder & tf, const KevRequest & rec,
               int max_state = 384, int max_branch = 1024,
               std::string * err = nullptr);
 

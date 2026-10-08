@@ -118,7 +118,18 @@ struct ggml_backend_registry {
 
     ggml_backend_registry() {
 #ifdef GGML_USE_CUDA
+    // Runtime, per-process gate for the CUDA/HIP backend. In a GGML_HIP static
+    // (single-llama) build GGML_USE_CUDA is defined here AND ggml_backend_cuda_reg()
+    // is actually the HIP backend, whose eager device enumeration (ggml_cuda_info()
+    // -> cudaGetDeviceProperties) first touches the HIP device and can crash on
+    // hosts where the HSA device-transfer (blit) context cannot be created.
+    // Setting GGML_BACKEND_DISABLE_GPU lets a CPU-only process avoid HIP entirely
+    // (the backend is simply not registered, so llama never offloads to it).
+    // Testing this at constructor time keeps HIP lazy: it is only touched from the
+    // first get_reg()/llama_backend_init(), which the application controls.
+    if (getenv("GGML_BACKEND_DISABLE_GPU") == nullptr) {
         register_backend(ggml_backend_cuda_reg());
+    }
 #endif
 #ifdef GGML_USE_METAL
         register_backend(ggml_backend_metal_reg());

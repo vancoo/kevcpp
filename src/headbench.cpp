@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -206,6 +207,35 @@ int run_tokens(const std::string & model_path, const std::string & textfile,
 }
 
 // ---------------- encode mode (full kev.model.encode parity dump) ----------------
+// llama-backed kev::TokenFeeder adapter: headbench links llama statically, so it
+// provides a const llama_vocab*-backed feeder for kev::encode (kev_encode itself
+// stays llama-free). ud = const llama_vocab* (valid for the model's lifetime).
+kev::TokenFeeder vocab_feeder(const llama_vocab * vocab) {
+    kev::TokenFeeder f;
+    f.ud = (void *) vocab;
+    f.tokenize = [](void * ud, const char * t, int32_t tl, bool add, bool parse,
+                    int32_t * out, int32_t cap) -> int32_t {
+        const llama_vocab * vc = (const llama_vocab *) ud;
+        if (!vc || !t || !out || cap <= 0) return -1;
+        std::vector<llama_token> buf((size_t) cap);
+        const int32_t n = llama_tokenize(vc, t, tl, buf.data(), cap, add, parse);
+        if (n < 0) return n;
+        for (int32_t i = 0; i < n; ++i) out[i] = (int32_t) buf[i];
+        return n;
+    };
+    f.special_token_id = [](void * ud, const char * s) -> int32_t {
+        const llama_vocab * vc = (const llama_vocab *) ud;
+        if (!vc || !s) return -1;
+        const int len = (int) std::strlen(s);
+        std::vector<llama_token> buf((size_t) len * 4 + 16);
+        int32_t n = llama_tokenize(vc, s, len, buf.data(), (int32_t) buf.size(),
+                                   /*add_special=*/false, /*parse_special=*/true);
+        if (n < 0) { buf.resize((size_t) -n); n = llama_tokenize(vc, s, len, buf.data(), (int32_t) buf.size(), false, true); }
+        return n > 0 ? (int32_t) buf[n - 1] : -1;
+    };
+    return f;
+}
+
 int run_encode(const std::string & model_path, const std::string & reqfile) {
     std::ifstream rf(reqfile);
     if (!rf) { std::fprintf(stderr, "encode: cannot open '%s'\n", reqfile.c_str()); return 1; }
@@ -229,7 +259,7 @@ int run_encode(const std::string & model_path, const std::string & reqfile) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     std::string err;
-    auto enc = kev::encode(vocab, kreq, /*max_state=*/384, /*max_branch=*/1024, &err);
+    auto enc = kev::encode(vocab_feeder(vocab), kreq, /*max_state=*/384, /*max_branch=*/1024, &err);
     auto rows = kev::rows_of(enc, &err);
 
     json out;

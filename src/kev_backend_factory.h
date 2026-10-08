@@ -14,6 +14,7 @@
 #pragma once
 
 #include "kev_backend.h"
+#include "kev_encode.h"   // kev::TokenFeeder (llama-free tokenizer accessor)
 
 #include <memory>
 #include <string>
@@ -45,6 +46,13 @@ struct BackendBranch {
     int32_t              seq       = 0;
     int32_t              decide    = 0;
     std::vector<int32_t> opts;
+};
+
+// Backing state for Backend::token_feeder(): holds a copy of the ops + handle so
+// the llama-free kev::TokenFeeder closures (non-capturing) can reach them via `ud`.
+struct BackendFeederState {
+    kev_backend_ops ops{};
+    kev_backend_t * handle = nullptr;
 };
 
 // RAII wrapper around a live backend instance. Non-copyable.
@@ -79,6 +87,12 @@ public:
     // consumer that itself links llama — single-llama rule).
     void * vocab_opaque() const;
 
+    // llama-free tokenizer accessor (B-3): returns a TokenFeeder bound to this
+    // Backend that forwards tokenize / special_token_id to the backend's ops.
+    // This is what a llama-free host (main_server / kev_model) uses for encode,
+    // instead of casting vocab_opaque() to const llama_vocab*.
+    TokenFeeder token_feeder() const;
+
     const char * name() const { return meta_.name; }
     const char * device() const { return meta_.device; }
     const char * version() const { return meta_.version; }
@@ -92,6 +106,9 @@ private:
     void adopt(kev_backend_ops ops, kev_backend_meta meta, kev_backend_t * handle) {
         ops_ = ops; meta_ = meta; handle_ = handle;
     }
+
+    // Backing state for token_feeder() (refreshed by the const method).
+    mutable BackendFeederState feeder_state_;
 
     kev_backend_ops ops_{};
     kev_backend_t  * handle_ = nullptr;

@@ -1,7 +1,9 @@
 // kev_model.cpp
 #include "kev_model.h"
 #include "kev_merge.h"
-#include "llama.h"   // only for the const llama_vocab* cast from backend vocab_opaque()
+// NOTE: llama-free host. No #include "llama.h" here — all llama coupling
+// (decode/encode/tokenize) goes through the kev::Backend abstraction
+// (single-llama rule, see docs/portable_backend_deployment.md).
 
 #include <algorithm>
 #include <chrono>
@@ -48,7 +50,6 @@ KevModel::~KevModel() { close(); }
 
 void KevModel::close() {
     backend_.reset();
-    vocab_ = nullptr;
     ok_ = false;
 }
 
@@ -111,9 +112,6 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     bopt.lm_head           = 0;               // Rank-1: hidden-only serving
     if (!backend_->init(bopt, err)) return false;
 
-    // Keep the vocab handle for encode/tokenize (cast to const llama_vocab* below).
-    vocab_ = backend_->vocab_opaque();
-
     if (!opt.head_path.empty()) {
         if (!head_.load_from_file(opt.head_path)) { if (err) *err = "failed to load head: " + opt.head_path; return false; }
     }
@@ -129,7 +127,8 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
 }
 
 KevEnc KevModel::encode(const KevRequest & req, std::string * err) const {
-    return kev::encode(reinterpret_cast<const llama_vocab *>(vocab_), req, 384, 1024, err);
+    if (!backend_) { if (err && err->empty()) *err = "backend not initialized"; return {}; }
+    return kev::encode(backend_->token_feeder(), req, 384, 1024, err);
 }
 
 KevRows KevModel::rows_of(const KevEnc & enc, std::string * err) const {
@@ -343,9 +342,9 @@ bool KevModel::warm_graph(bool warm_branch, int state_tokens, int branch_tokens,
 }
 
 int KevModel::count_tokens(const std::string & text) const {
-    const llama_vocab * v = reinterpret_cast<const llama_vocab *>(vocab_);
-    if (!v) return 0;
-    return (int) kev::tokenize(v, text, /*add_special=*/false, /*parse_special=*/false).size();
+    if (!backend_) return 0;
+    return (int) kev::tokenize(backend_->token_feeder(), text,
+                               /*add_special=*/false, /*parse_special=*/false).size();
 }
 
 } // namespace kev

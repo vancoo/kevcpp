@@ -51,6 +51,17 @@ void write_err(char * err, size_t cap, const std::string & msg) {
     if (err && cap) std::snprintf(err, cap, "%s", msg.c_str());
 }
 
+// llama.cpp/ggml log bridge: only ERROR passes through to stderr (filters the
+// INFO/WARN metadata/backend dumps that main_server used to suppress via
+// llama_log_set before — now handled inside the llama-linking backend dll, since
+// the host is llama-free).
+static void kev_cpu_log_filter(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) user_data;
+    if (level >= GGML_LOG_LEVEL_ERROR) {
+        std::fputs(text, stderr);
+    }
+}
+
 // ---- lifecycle ----
 
 int op_create(kev_backend_t ** out) {
@@ -77,6 +88,11 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     if (!p || !p->model_path) { write_err(err, err_cap, "model_path required"); return 1; }
 
     llama_backend_init();
+
+    // Host is llama-free; the log filter that used to live in main_server is now
+    // installed here inside the single-llama module (must be set before any model
+    // action, mirroring the old main_server llama_log_set placement).
+    llama_log_set(kev_cpu_log_filter, nullptr);
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
@@ -253,6 +269,45 @@ kev_backend_vocab_t * op_vocab_opaque(kev_backend_t * b) {
     return kb ? reinterpret_cast<kev_backend_vocab_t *>(const_cast<llama_vocab *>(kb->vocab)) : nullptr;
 }
 
+// ---- delegated tokenizer (B-1/B-2) ----
+// The host is llama-free (only this dll links llama), so tokenize / special-token
+// lookup must be served here. These reproduce the exact llama_tokenize semantics
+// kev_encode.cpp used to invoke in-process, so encode is bit-identical across the
+// in-process (bench/m3/m5/...) and dll-delegated (main_server) paths.
+
+int32_t op_tokenize(kev_backend_t * b, const char * text, int32_t text_len,
+                    bool add_special, bool parse_special,
+                    int32_t * out_ids, int32_t cap, char * err, size_t err_cap) {
+    KevCpuBackend * kb = as_cpu(b);
+    if (!kb || !kb->vocab || !text) { write_err(err, err_cap, "tokenize: no vocab"); return -1; }
+    if (text_len < 0) text_len = (int32_t) std::strlen(text);
+    if (!out_ids || cap <= 0) return -1;
+    std::vector<llama_token> buf((size_t) cap);
+    const int32_t n = llama_tokenize(kb->vocab, text, text_len,
+                                     buf.data(), (int32_t) buf.size(),
+                                     add_special, parse_special);
+    if (n < 0) return n;   // llama returns -required-capacity (negative)
+    for (int32_t i = 0; i < n; ++i) out_ids[i] = (int32_t) buf[i];
+    return n;
+}
+
+int32_t op_special_token_id(kev_backend_t * b, const char * special) {
+    KevCpuBackend * kb = as_cpu(b);
+    if (!kb || !kb->vocab || !special) return -1;
+    const int len = (int) std::strlen(special);
+    std::vector<llama_token> buf((size_t) len * 4 + 16);
+    int32_t n = llama_tokenize(kb->vocab, special, len,
+                               buf.data(), (int32_t) buf.size(),
+                               /*add_special=*/false, /*parse_special=*/true);
+    if (n < 0) {
+        buf.resize((size_t) -n);
+        n = llama_tokenize(kb->vocab, special, len, buf.data(), (int32_t) buf.size(),
+                           /*add_special=*/false, /*parse_special=*/true);
+    }
+    if (n <= 0) return -1;
+    return (int32_t) buf[n - 1];   // <|name|> special token is the last id
+}
+
 // Plain-token count helper used by kev_backend_get_ops-less code paths is not
 // needed; count goes through the vocab_opaque + kev::tokenize path in-process.
 
@@ -292,6 +347,8 @@ KEV_BACKEND_API kev_backend_ops kev_backend_get_ops(void) {
         g_ops.threads         = op_threads;
         g_ops.threads_batch   = op_threads_batch;
         g_ops.vocab_opaque    = op_vocab_opaque;
+        g_ops.tokenize        = op_tokenize;
+        g_ops.special_token_id = op_special_token_id;
     }
     return g_ops;
 }

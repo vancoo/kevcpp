@@ -27,6 +27,16 @@ if (KEV_BUILD_BACKEND_GPU)
     set(GGML_HIP_NO_VMM ON  CACHE BOOL "ggml: do not use HIP VMM" FORCE)
 endif()
 
+# Vulkan backend dll (kev-backend-vulkan.dll). Uses the SAME root CMakeLists but a
+# SEPARATE build directory (e.g. build\vulkan-exp\vulkan-build) so the default CPU
+# MSVC build dir stays Vulkan-free and green. Enabling this option flips the
+# vendored llama/ggml to build WITH GGML_VULKAN (native Windows Vulkan loader +
+# AMD driver; no ROCm/HIP). The gate MUST stay OFF in the default CPU build dir.
+option(KEV_BUILD_BACKEND_VULKAN "Build the standalone kev-backend-vulkan dll with a GGML_VULKAN llama" OFF)
+if (KEV_BUILD_BACKEND_VULKAN)
+    set(GGML_VULKAN ON CACHE BOOL "ggml: use Vulkan" FORCE)
+endif()
+
 #
 # llama.cpp is vendored as a full copy under third_party/llama.cpp.
 # Using add_subdirectory() makes LLAMA_STANDALONE=OFF inside, so the copy's
@@ -147,6 +157,12 @@ target_include_directories(m7_bench PRIVATE
 target_compile_features(m7_bench PRIVATE cxx_std_17)
 
 # M4 HTTP 服务 (TypeSafe /v1/systemone)
+# Path B (pluggable-backend dll): main_server is the llama-free host executable.
+# It does NOT link llama and does NOT compile any backend impl; it only includes
+# kev_backend_factory.h / kev_backend.h (llama-free C ABI) and loads the backend
+# plugin dll via load_plugin_dll() (KEV_BACKEND_USE_DLL). The backend (cpu today,
+# gpu later) is the ONLY module that links llama — "single-llama rule", see
+# docs/portable_backend_deployment.md. No clang/HIP ever touches this target.
 add_executable(main_server
     src/main_server.cpp
     src/kev_api.cpp
@@ -156,22 +172,20 @@ add_executable(main_server
     src/kev_head.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
-    src/kev_backend_cpu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib/httplib.cpp
 )
-if (KEV_BUILD_BACKEND_GPU)
-    # In-process GPU (HIP) backend — compiled into the SAME static llama module.
-    target_sources(main_server PRIVATE src/kev_backend_gpu.cpp)
-    target_compile_definitions(main_server PRIVATE KEV_BACKEND_GPU_SINGLE_LLAMA)
-endif()
-target_link_libraries(main_server PRIVATE llama)
-target_compile_definitions(main_server PRIVATE KEV_BACKEND_BUILD)
+# No target_link_libraries(main_server llama): llama is not linked here.
+target_compile_definitions(main_server PRIVATE KEV_BACKEND_USE_DLL)
 target_include_directories(main_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(main_server PRIVATE cxx_std_17)
 # cpp-httplib (vendored; 本版为 h + httplib.cpp 拆分, 需编译链接 httplib.cpp)
 target_include_directories(main_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib)
+# 产物命名: main_server 作为项目对外交付的 HTTP 服务端, 编译产物输出为 kevcpp.exe
+# (target 名保持 main_server 不变, 仅改 OUTPUT_NAME, 不破坏 build.ps1 / .vcxproj 引用)
+set_target_properties(main_server PROPERTIES
+    OUTPUT_NAME "kevcpp")
 
 if (MSVC)
     # source files contain non-ASCII (Chinese comments); keep them as UTF-8
@@ -272,28 +286,69 @@ if (MSVC)
     target_compile_options(lora_ab PRIVATE /utf-8)
 endif()
 
-# ---- Pluggable backend: kev-backend-cpu shared library (dll) ----
-# The production / portable path builds this as a plugin dll that is the ONLY
-# module linking llama ("single-llama rule"). OFF by default: enabling it requires
-# the shared-lib llama build (BUILD_SHARED_LIBS + GGML_BACKEND_DL + ALL_VARIANTS),
-# which must be reconciled on a STABLE host first (see
-# docs/portable_backend_deployment.md and the top-of-file note). This target is
-# provided so the dll shape is pinned; flip KEV_BUILD_BACKEND_DLL=ON only on a
-# stable box and make sure main_server does NOT also link llama.
-option(KEV_BUILD_BACKEND_DLL "Build the kev-backend-cpu plugin dll (requires shared llama; reconcile on stable host)" OFF)
-if (KEV_BUILD_BACKEND_DLL)
-    add_library(kev-backend-cpu SHARED
-        src/kev_backend_cpu.cpp
+# ---- Pluggable backend (Path B): backend plugin dlls ----
+# The production / portable path: each backend is a SHARED library that is the
+# ONLY module linking llama ("single-llama rule"). main_server (llama-free host)
+# loads the matching dll via load_plugin_dll() (KEV_BACKEND_USE_DLL). Each backend
+# dll exports kev_backend_get_meta/ops/create/destroy (KEV_BACKEND_BUILD = dllexport).
+
+# CPU backend dll: pure MSVC cl/link, statically links the ONE llama copy, never
+# touches HIP. This is the MVP module that makes `--backend cpu` avoid amdhip /
+# .hip_fat / clang entirely on user machines.
+add_library(kev-backend-cpu SHARED
+    src/kev_backend_cpu.cpp
+)
+target_link_libraries(kev-backend-cpu PRIVATE llama)
+target_compile_definitions(kev-backend-cpu PRIVATE KEV_BACKEND_BUILD KEV_BACKEND_BUILD_SHARED)
+target_include_directories(kev-backend-cpu PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_compile_features(kev-backend-cpu PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(kev-backend-cpu PRIVATE /utf-8)
+endif()
+set_target_properties(kev-backend-cpu PROPERTIES
+    OUTPUT_NAME "kev-backend-cpu"
+    PREFIX "")
+
+# GPU (HIP) backend dll: ONLY compiled when KEV_BUILD_BACKEND_GPU=ON (needs the
+# ROCm hipcc/clang + NMake toolchain). This is the sole module containing HIP /
+# amdhip / .hip_fat. Post-MVP; not built/tested in the default CPU MSVC session.
+if (KEV_BUILD_BACKEND_GPU)
+    add_library(kev-backend-gpu SHARED
+        src/kev_backend_gpu.cpp
     )
-    target_link_libraries(kev-backend-cpu PRIVATE llama)
-    target_compile_definitions(kev-backend-cpu PRIVATE KEV_BACKEND_BUILD KEV_BACKEND_BUILD_SHARED)
-    target_include_directories(kev-backend-cpu PRIVATE
+    target_link_libraries(kev-backend-gpu PRIVATE llama ggml-hip)
+    target_compile_definitions(kev-backend-gpu PRIVATE KEV_BACKEND_BUILD KEV_BACKEND_BUILD_SHARED)
+    target_include_directories(kev-backend-gpu PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
-    target_compile_features(kev-backend-cpu PRIVATE cxx_std_17)
+    target_compile_features(kev-backend-gpu PRIVATE cxx_std_17)
     if (MSVC)
-        target_compile_options(kev-backend-cpu PRIVATE /utf-8)
+        target_compile_options(kev-backend-gpu PRIVATE /utf-8)
     endif()
-    set_target_properties(kev-backend-cpu PROPERTIES
-        OUTPUT_NAME "kev-backend-cpu"
+    set_target_properties(kev-backend-gpu PROPERTIES
+        OUTPUT_NAME "kev-backend-gpu"
+        PREFIX "")
+endif()
+
+# Vulkan backend dll: statically links the SAME llama copy built WITH GGML_VULKAN.
+# ONLY compiled when KEV_BUILD_BACKEND_VULKAN=ON (a dedicated GGML_VULKAN build dir).
+# This is the sole module containing the Vulkan backend (ggml-vulkan). Pure MSVC
+# cl/link — ggml-vulkan builds fine under MSVC. Shader-gen uses the host compiler
+# (cl) so no clang/hipcc is involved anywhere here. Default build dir stays clean
+# (option OFF).
+if (KEV_BUILD_BACKEND_VULKAN)
+    add_library(kev-backend-vulkan SHARED
+        src/kev_backend_vulkan.cpp
+    )
+    target_link_libraries(kev-backend-vulkan PRIVATE llama ggml-vulkan)
+    target_compile_definitions(kev-backend-vulkan PRIVATE KEV_BACKEND_BUILD KEV_BACKEND_BUILD_SHARED)
+    target_include_directories(kev-backend-vulkan PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+    target_compile_features(kev-backend-vulkan PRIVATE cxx_std_17)
+    if (MSVC)
+        target_compile_options(kev-backend-vulkan PRIVATE /utf-8)
+    endif()
+    set_target_properties(kev-backend-vulkan PROPERTIES
+        OUTPUT_NAME "kev-backend-vulkan"
         PREFIX "")
 endif()

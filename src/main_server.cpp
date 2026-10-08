@@ -7,7 +7,8 @@
 #include "httplib.h"
 #include "kev_api.h"
 #include "kev_model.h"
-#include "llama.h"
+// NOTE: llama-free host. Log filtering that used to live here (llama_log_set)
+// is now installed inside the backend dll (the only module linking llama).
 
 #include <chrono>
 #include <cstdio>
@@ -17,16 +18,14 @@
 #include <fstream>
 #include <string>
 
-using nlohmann::json;
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
 
-// 接管 llama.cpp/ggml 的日志: 只透传 ERROR 级别, 过滤 INFO/WARN/DEBUG
-// (消灭 llama_graph_n_input_tensors / sched_reserve / metadata dump 等刷屏)。
-static void llm_log_filter(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) user_data;
-    if (level >= GGML_LOG_LEVEL_ERROR) {
-        std::fputs(text, stderr);
-    }
-}
+using nlohmann::json;
 
 // 每个请求一行核心日志
 static void log_req(const char * method, const char * path, int status, double ms,
@@ -114,8 +113,20 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    // 在任何模型动作之前就接管 llama.cpp 日志 -> 加载阶段的 metadata dump 也被过滤
-    llama_log_set(llm_log_filter, nullptr);
+    // Single-exe CPU non-HIP gate (fallback, dll portability not required): this
+    // binary is now llama-free, but the env var is harmless and kept as a belt-and-
+    // suspenders guard for any backend dll that registers ggml backends eagerly.
+    // It must be set BEFORE the backend dll is loaded / first llama/ggml call.
+    if (backend == "cpu") {
+#if defined(_WIN32)
+        SetEnvironmentVariableA("GGML_BACKEND_DISABLE_GPU", "1");
+#else
+        setenv("GGML_BACKEND_DISABLE_GPU", "1", 1);
+#endif
+    }
+
+    // (llama.cpp log filtering is installed inside the backend dll at init; the
+    //  host is llama-free and cannot call llama_log_set.)
 
     if (!quiet) std::fprintf(stderr, "kevcpp server loading model: %s\n", model_path.c_str());
     kev::KevModelOptions opt;

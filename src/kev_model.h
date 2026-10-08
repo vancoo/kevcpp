@@ -10,8 +10,8 @@
 // Pluggable-backend (ARCHIVE): KevModel 保留全部组装/编排(LRU、encode 组装、rows 规划、
 // PointerHead、compute_mutex_、n_seq 布局 —— 均不扰动), 但 llama/ggml 算子耦合全部改经
 // kev::Backend*(来自 kev_backend_factory/BACKEND C-ABI) 调用, 不再直接调 llama_*。见
-// docs/portable_backend_deployment.md。encode/tokenize 仍需 const llama_vocab*, 由
-// backend 的 vocab_opaque() 在进程内提供(single-llama: 见文档)。
+// docs/portable_backend_deployment.md。encode/tokenize 也经后端: 由 backend 的
+// token_feeder()(delegated tokenize/special_token_id, llama-free) 提供(single-llama: 见文档)。
 #pragma once
 
 #include "kev_encode.h"
@@ -116,7 +116,6 @@ private:
     std::vector<float> hidden_at_output(int out_idx, std::string * err);
 
     std::unique_ptr<Backend> backend_;
-    void * vocab_ = nullptr;   // opaque vocab handle from backend (kevcpp casts to const llama_vocab*)
     PointerHead  head_;
     PrefixLRU    lru_{2, 1};
     int n_seq_max_   = 0;

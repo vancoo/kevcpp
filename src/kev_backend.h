@@ -146,6 +146,26 @@ typedef struct kev_backend_ops {
 
     // the backend's tokenizer/vocab handle (opaque; cast by llama-linking consumer).
     kev_backend_vocab_t * (*vocab_opaque)(kev_backend_t * b);
+
+    // ---- delegated tokenizer (B-1) ----
+    // The backend OWNS the llama_vocab (single-llama rule), so a llama-free host
+    // must delegate tokenize/special-token lookup through ops instead of casting
+    // vocab_opaque() to const llama_vocab*.  These are appended at the END of the
+    // table (never reorder earlier fields); struct_size is sizeof() so consumers
+    // detect the bigger table and can still use the older prefix if they wish.
+    //
+    // tokenize: tokenizes `text[0..text_len)` with add_special/parse_special
+    // semantics matched to llama_tokenize.  Fills at most `cap` ids into out_ids.
+    // Returns the number of ids written (>=0); on buffer-too-small returns the
+    // required capacity as a NEGATIVE value (-needed) and writes nothing.
+    // text_len is byte length (use < 0 to mean "strlen").
+    int32_t     (*tokenize)(kev_backend_t * b, const char * text, int32_t text_len,
+                            bool add_special, bool parse_special,
+                            int32_t * out_ids, int32_t cap,
+                            char * err, size_t err_cap);
+    // special_token_id: id of the "<|name|>" special token (parse_special=true),
+    // or -1 if not found.
+    int32_t     (*special_token_id)(kev_backend_t * b, const char * special);
 } kev_backend_ops;
 
 // Factory entry points every backend dll must export.
