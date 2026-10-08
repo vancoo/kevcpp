@@ -7,7 +7,8 @@
 #include "httplib.h"
 #include "kev_api.h"
 #include "kev_model.h"
-#include "llama.h"
+// NOTE: llama-free host. Log filtering that used to live here (llama_log_set)
+// is now installed inside the backend dll (the only module linking llama).
 
 #include <chrono>
 #include <cstdio>
@@ -17,16 +18,14 @@
 #include <fstream>
 #include <string>
 
-using nlohmann::json;
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
 
-// 接管 llama.cpp/ggml 的日志: 只透传 ERROR 级别, 过滤 INFO/WARN/DEBUG
-// (消灭 llama_graph_n_input_tensors / sched_reserve / metadata dump 等刷屏)。
-static void llm_log_filter(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) user_data;
-    if (level >= GGML_LOG_LEVEL_ERROR) {
-        std::fputs(text, stderr);
-    }
-}
+using nlohmann::json;
 
 // 每个请求一行核心日志
 static void log_req(const char * method, const char * path, int status, double ms,
@@ -62,6 +61,9 @@ static json model_card(const kev::KevModel & m, const std::string & base) {
     card["run"] = "kevcpp";
     card["base"] = base;
     card["backend"] = "llama.cpp";
+    card["backend_name"] = m.backend_name();
+    card["backend_device"] = m.backend_device();
+    card["backend_version"] = m.backend_version();
     card["dtype"] = "fp32";
     card["temperature"] = m.temperature();
     card["prefix_cache"] = {{"size", m.lru().capacity()}, {"cached_states", (int) m.lru().contents().size()}};
@@ -71,6 +73,7 @@ static json model_card(const kev::KevModel & m, const std::string & base) {
 int main(int argc, char ** argv) {
     std::string model_path, head, lora_path, host = "127.0.0.1";
     std::string prewarm_file;   // 可选: 启动预热 state 文本文件(--prewarm <file>)
+    std::string backend = "cpu";  // pluggable backend (default "cpu")
     int port = 8008, lru = 2, threads = 0, ctx = -1; float lora_scale = 1.0f;
     bool quiet = false;
     for (int i = 1; i < argc; ++i) {
@@ -85,6 +88,7 @@ int main(int argc, char ** argv) {
         else if (a == "--lora-scale") lora_scale = (float) std::atof(next().c_str());
         else if (a == "--threads" || a == "-t") threads = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
+        else if (a == "--backend") backend = next();
         else if (a == "--prewarm") prewarm_file = next();
         else if (a == "--quiet") quiet = true;
         else if (a == "--help" || a == "-h") {
@@ -96,6 +100,8 @@ int main(int argc, char ** argv) {
               "  --threads N / -t N  compute threads (0 or unset = auto detect cores, cap 32)\n"
               "  --ctx N             context size (default 8192; 2048 typical for short states)\n"
               "  --lru N             state cache slots (default 2)\n"
+              "  --backend <name>    inference backend: 'cpu' (default). 'gpu'/'cuda'/'vulkan'\n"
+              "                      is a NOT-YET-BUILT extension point (see docs).\n"
               "  --prewarm <file>    startup-prewarm a state: read raw state text, prefill into LRU (optional)\n"
               "  --quiet             suppress per-request log lines\n");
             return 0;
@@ -107,13 +113,25 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    // 在任何模型动作之前就接管 llama.cpp 日志 -> 加载阶段的 metadata dump 也被过滤
-    llama_log_set(llm_log_filter, nullptr);
+    // Single-exe CPU non-HIP gate (fallback, dll portability not required): this
+    // binary is now llama-free, but the env var is harmless and kept as a belt-and-
+    // suspenders guard for any backend dll that registers ggml backends eagerly.
+    // It must be set BEFORE the backend dll is loaded / first llama/ggml call.
+    if (backend == "cpu") {
+#if defined(_WIN32)
+        SetEnvironmentVariableA("GGML_BACKEND_DISABLE_GPU", "1");
+#else
+        setenv("GGML_BACKEND_DISABLE_GPU", "1", 1);
+#endif
+    }
+
+    // (llama.cpp log filtering is installed inside the backend dll at init; the
+    //  host is llama-free and cannot call llama_log_set.)
 
     if (!quiet) std::fprintf(stderr, "kevcpp server loading model: %s\n", model_path.c_str());
     kev::KevModelOptions opt;
     opt.model_path = model_path; opt.head_path = head; opt.lru_capacity = lru;
-    opt.n_ctx = ctx > 0 ? ctx : 8192; opt.n_threads = threads;
+    opt.n_ctx = ctx > 0 ? ctx : 8192; opt.n_threads = threads; opt.backend = backend;
     if (!lora_path.empty()) { opt.lora_path = lora_path; opt.lora_scale = lora_scale; }
     kev::KevModel model;
     std::string err;
@@ -122,6 +140,8 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "kevcpp server model ready (n_embd=%d temp=%.3f head=%s lora=%s)\n",
                  model.n_seq_max() ? model.dim_in() : 0, model.temperature(),
                  head.empty() ? "-" : head.c_str(), lora_path.empty() ? "-" : lora_path.c_str());
+        std::fprintf(stderr, "kevcpp using backend '%s' (device=%s, ver=%s)\n",
+                 model.backend_name(), model.backend_device(), model.backend_version());
         std::fprintf(stderr, "kevcpp using %d threads %s (n_threads_batch=%d)\n",
                  model.threads_actual(), threads == 0 ? "(auto)" : "(set)", model.threads_batch_actual());
     }
@@ -237,6 +257,9 @@ int main(int argc, char ** argv) {
             c["release_date"] = "unknown";
             c["base"] = "qwen3.5-0.8b";
             c["backend"] = "llama.cpp";
+            c["backend_name"] = model.backend_name();
+            c["backend_device"] = model.backend_device();
+            c["backend_version"] = model.backend_version();
             c["dtype"] = "fp32";
             c["temperature"] = model.temperature();
             c["prefix_cache"] = {{"size", model.lru().capacity()}};

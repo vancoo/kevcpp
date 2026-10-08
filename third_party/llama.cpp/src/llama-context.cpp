@@ -375,6 +375,26 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // kevcpp: the persistent per-shape graph-cache reuse (process_ubatch -> can_reuse ->
+        // reuse a cached ggml graph) is only proven correct on the CPU backend. On a GPU
+        // (Vulkan etc.) backend, re-running a reused graph on a subsequent llama_decode
+        // reads STALE device buffers (recurrent/KV tensors that seq_copy/seq_clear mutate
+        // between calls are not refreshed on the reuse path), so the 2nd+ request returns
+        // garbage hidden embeddings (uniform/NaN probabilities). Force a full graph rebuild
+        // on any non-CPU context unless the operator explicitly re-enables reuse with
+        // LLAMA_GRAPH_REUSE_DISABLE=0.
+        if (!graph_reuse_disable) {
+            for (const auto & b : backends) {
+                auto * dev = ggml_backend_get_device(b.get());
+                if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    graph_reuse_disable = true;
+                    LLAMA_LOG_WARN("%s: non-CPU (GPU/ACCEL) backend present -> disabling unsafe graph reuse "
+                                   "(set LLAMA_GRAPH_REUSE_DISABLE=0 to override)\n", __func__);
+                    break;
+                }
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());

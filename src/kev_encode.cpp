@@ -1,6 +1,5 @@
 // kev_encode.cpp — 复刻 kev.model encode()/user_tokens()/rows_of()
 #include "kev_encode.h"
-#include "llama.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -9,50 +8,49 @@
 
 namespace kev {
 
-std::vector<int32_t> tokenize(const llama_vocab * vocab, const std::string & text,
+std::vector<int32_t> tokenize(const TokenFeeder & tf, const std::string & text,
                               bool add_special, bool parse_special) {
-    // size by a call, then fill: llama_tokenize returns actual count (or negative = overflow)
-    std::vector<llama_token> buf(text.size() * 4 + 16);
-    const int32_t n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(),
-                                     buf.data(), (int32_t) buf.size(),
-                                     add_special, parse_special);
-    if (n < 0) {
-        buf.resize((size_t) -n);
-        llama_tokenize(vocab, text.c_str(), (int32_t) text.size(),
-                       buf.data(), (int32_t) buf.size(), add_special, parse_special);
-        return std::vector<int32_t>(buf.begin(), buf.end());
+    if (!tf.tokenize) return {};
+    // size by a call, then fill: tokenize returns count, or -required on overflow.
+    int32_t cap = (int32_t) text.size() * 4 + 16;
+    for (;;) {
+        if (cap <= 0) return {};
+        std::vector<int32_t> buf((size_t) cap);
+        const int32_t n = tf.tokenize(tf.ud, text.c_str(), (int32_t) text.size(),
+                                      add_special, parse_special, buf.data(), cap);
+        if (n >= 0) { buf.resize((size_t) n); return buf; }
+        cap = -n;   // exact capacity required by the tokenizer
     }
-    return std::vector<int32_t>(buf.begin(), buf.begin() + n);
 }
 
-int32_t special_token_id(const llama_vocab * vocab, const char * special) {
-    auto v = tokenize(vocab, special, /*add_special=*/false, /*parse_special=*/true);
+int32_t special_token_id(const TokenFeeder & tf, const char * special) {
+    auto v = tokenize(tf, special, /*add_special=*/false, /*parse_special=*/true);
     if (v.empty()) return -1;
     return v.back();   // the <|name|> special token is the last token (preceded by a pre-token artifact)
 }
 
-std::vector<int32_t> user_tokens(const llama_vocab * vocab, const std::string & text) {
+std::vector<int32_t> user_tokens(const TokenFeeder & tf, const std::string & text) {
     // kev.user_tokens: <|x|> -> <¦x¦> then add_special_tokens=False
     static const std::regex re(R"(<\|([A-Za-z0-9_]+)\|>)");
     std::string rewritten = std::regex_replace(text, re, "<¦$1¦>");
-    return tokenize(vocab, rewritten, /*add_special=*/false, /*parse_special=*/true);
+    return tokenize(tf, rewritten, /*add_special=*/false, /*parse_special=*/true);
 }
 
-KevEnc encode(const llama_vocab * vocab, const KevRequest & rec,
+KevEnc encode(const TokenFeeder & tf, const KevRequest & rec,
               int max_state, int max_branch, std::string * err) {
     KevEnc e;
     // state
-    auto state_tokens = user_tokens(vocab, rec.state);
+    auto state_tokens = user_tokens(tf, rec.state);
     if ((int) state_tokens.size() + 1 > max_state) {
         if (err) *err = "state too long";
         state_tokens.resize((size_t) std::max(0, max_state - 1));
         e.labels.resize(rec.questions.size(), -1);
     }
-    const int32_t S0 = special_token_id(vocab, SPECIAL[0]);
-    const int32_t q_id = special_token_id(vocab, SPECIAL[1]);
-    const int32_t o_id = special_token_id(vocab, SPECIAL[2]);
-    const int32_t c_id = special_token_id(vocab, SPECIAL[3]);
-    const int32_t d_id = special_token_id(vocab, SPECIAL[4]);
+    const int32_t S0 = special_token_id(tf, SPECIAL[0]);
+    const int32_t q_id = special_token_id(tf, SPECIAL[1]);
+    const int32_t o_id = special_token_id(tf, SPECIAL[2]);
+    const int32_t c_id = special_token_id(tf, SPECIAL[3]);
+    const int32_t d_id = special_token_id(tf, SPECIAL[4]);
 
     e.ids.push_back(S0);
     e.seg.push_back(0);
@@ -68,11 +66,11 @@ KevEnc encode(const llama_vocab * vocab, const KevRequest & rec,
 
     for (size_t k = 0; k < rec.questions.size(); ++k) {
         const auto & q = rec.questions[k];
-        auto instr_t = user_tokens(vocab, q.instr);
+        auto instr_t = user_tokens(tf, q.instr);
         std::vector<std::vector<int32_t>> spans;
         spans.reserve(q.options.size());
         for (const auto & o : q.options) {
-            auto sp = user_tokens(vocab, o);
+            auto sp = user_tokens(tf, o);
             spans.push_back(sp);
         }
         std::vector<int32_t> br;
