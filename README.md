@@ -1,31 +1,31 @@
 # kevcpp
 
 > kev 的 C++17 原生实现（基于 llama.cpp），用 C++ 重新实现 kev（Python）的推理/服务行为。
->
-> 🌐 **English version: [README.en.md](./README.en.md)**
+> 
+> 🌐 **English version: **[**README.en.md**](./README.en.md)**\***[***README.en.md***](./README.en.md)**\***[**README.en.md**](./README.en.md)\**English version: *[***README.en.md***](./README.en.md)*\**[**README.en.md**](./README.en.md)
 
-kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` （https://github.com/ggml-org/llama.cpp）的 kev 推理服务。它以 kev（`https://github.com/jaredpalmer/kev`）的 Python
+kevcpp 是一个支持CPU/AMD GPU、基于 `llama.cpp` （https://github.com/ggml-org/llama.cpp）的 kev 推理服务。它以 kev（`https://github.com/jaredpalmer/kev`）的 Python
 参考实现为行为基准，把 `DecisionModel` / 状态前缀缓存  `/v1/systemone` 服务语义用 C++/llama.cpp 重写，
 目标是：**提供一个下载即可运行的决策推理引擎**，避免kev带来的发展环境配置，并一定程度改造提高推理性能。
 
 > 由于条件有限，目前仅在开发机器（amd ai max 395 pro+)运行过，期望更多人加入进行完善和测试。
 > 后续计划：
-> 1. 增加GPU后端支持：将后端拆为独立dll，按命令参数加载
+> 1. 增加GPU后端支持：将后端拆为独立dll，按命令参数加载 -- **已支持AMD GPU使用Vulkan加载**
 > 2. 增加模型支持：将不同的模型支持定位到具体dll当中，按需加载
 
 ---
 
 ## 目录（Table of Contents）
 
-0. [快速上手（Quick Start）](#0-快速上手quick-start)
-1. [当前状态（Current Status）](#1-当前状态current-status)
-2. [基于 llama.cpp 与 kev（What We Reference）](#2-基于-llamacpp-与-kevwhat-we-reference)
-3. [开发环境与验证（Environment & Validation）](#3-开发环境与验证environment--validation)
-4. [相对 kev 的优势（Advantages over kev）](#4-相对-kev-的优势advantages-over-kev)
-5. [不足与限制（Limitations，诚实说明）](#5-不足与限制limitations诚实说明)
-6. [场景 / 依赖 / 环境要求（Usage, Dependencies, Requirements）](#6-场景--依赖--环境要求usage-dependencies-requirements)
-7. [架构说明（Architecture）](#7-架构说明architecture)
-8. [模型 / HF Hub（Model & HuggingFace）](#8-模型--hf-hubmodel--huggingface)
+1. [快速上手（Quick Start）](#0-快速上手quick-start)
+2. [当前状态（Current Status）](#1-当前状态current-status)
+3. [基于 llama.cpp 与 kev（What We Reference）](#2-基于-llamacpp-与-kevwhat-we-reference)
+4. [开发环境与验证（Environment & Validation）](#3-开发环境与验证environment--validation)
+5. [相对 kev 的优势（Advantages over kev）](#4-相对-kev-的优势advantages-over-kev)
+6. [不足与限制（Limitations，诚实说明）](#5-不足与限制limitations诚实说明)
+7. [场景 / 依赖 / 环境要求（Usage, Dependencies, Requirements）](#6-场景--依赖--环境要求usage-dependencies-requirements)
+8. [架构说明（Architecture）](#7-架构说明architecture)
+9. [模型 / HF Hub（Model & HuggingFace）](#8-模型--hf-hubmodel--huggingface)
 
 ---
 
@@ -43,7 +43,7 @@ kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` （https://github.com/g
 | 来源 | 说明 |
 | --- | --- |
 | **本地构建** | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release`，产物在 `build/bin/main_server.exe`（Windows）/ `build/bin/main_server`（Linux）。推荐方式。 |
-| **GitHub Releases** | Windows 0.1.0 版本已经发布Releases，适用于AMD CPU，Intel CPU未测试，Linux版本缺少环境未编译，期待更多人参与。 |
+| **GitHub Releases** | Windows 0.2.0 版本已经发布Releases，适用于AMD CPU/GPU，Intel CPU未测试，Linux版本缺少环境未编译，期待更多人参与。 |
 
 **模型文件**
 
@@ -51,14 +51,14 @@ kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` （https://github.com/g
 
 | 文件 | 约大小 | 说明 |
 | --- | --- | --- |
-| `kev-merged-q8.gguf` | ~774 MiB | 主模型权重（Q8_0 量化），对应 `--model` 参数 |
-| `head.bin` | ~2 MiB | PointerHead 读出头权重，对应 `--head` 参数 |
+| `kev-merged-q8.gguf` | \\~774 MiB | 主模型权重（Q8\\_0 量化）,已将kev的adapter Lora文件合并，对应 `--model` 参数 |
+| `head.bin` | \\~2 MiB | PointerHead 读出头权重，对应 `--head` 参数 |
 
 下载地址：
 
 - **Hugging Face Hub**：`https://huggingface.co/vanncoo/kevcpp-qwen3.5-0.8b`（仓库 ID 为
-  `vanncoo/kevcpp-qwen3.5-0.8b`）。上传时会同时包含 GGUF 权重与 PointerHead。**若尚未上传成功，请以仓库内
-  `models/` 目录为准。**
+  `vanncoo/kevcpp-qwen3.5-0.8b`）。上传时会同时包含 GGUF 权重与 PointerHead。\*\*若尚未上传成功，请以仓库内
+  `models/` 目录为准。\*\*
 - **本地 `models/` 目录**：仓库自带的 `models/kev-merged-q8.gguf` 与 `models/head.bin`（如有则直接使用）。
 
 > 💡 模型的完整规格与 HF Hub 说明见 [§8 模型 / HF Hub](#8-模型--hf-hubmodel--huggingface)。
@@ -69,10 +69,11 @@ kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` （https://github.com/g
 
 ```bash
 # Windows / Linux（等价）
-./build/bin/main_server \
+./build/bin/kevcpp \
     --model models/kev-merged-q8.gguf \
     --head  models/head.bin \
     --port  8008 \
+    --backend vulkan \
     --threads 16
 ```
 
@@ -151,15 +152,10 @@ curl.exe -s -X POST http://127.0.0.1:8008/v1/systemone \
 | `--port <p>` | 监听端口（默认 `8008`） |
 | `--threads <n>` / `-t <n>` | 计算线程数（`0` / 不设 = 自动探测，上限 32） |
 | `--ctx <n>` | 上下文大小（默认 `8192`；短 state 可用 `2048`） |
-| `--lru <n>` | 状态缓存 slot 数（默认 `2`） |
-| `--prewarm <file>` | 启动时预热一个 state（读取原始 state 文本，prefill 进 LRU，可选） |
-| `--lora <gguf>` | 额外加载 LoRA 权重（可选） |
-| `--lora-scale <f>` | LoRA 缩放系数（与 `--lora` 搭配，可选） |
-| `--quiet` | 关闭每次请求的日志行 |
 | `--help` / `-h` | 打印用法并退出 |
+| `--backend` | cpu/vulkan 动态加载具体后端dll |
 
-> `--backend`（CPU/GPU 可插拔后端）仅存在于已归档分支 `build-portable-backends`，当前主构建未启用，
-> GPU 后端（`gpu`/`cuda`/`vulkan`）尚未实现。详见 §5.6。
+> ROMc GPU 后端（`gpu`/`cuda`/`vulkan`）尚未实现。详见 §5.6。
 
 ---
 

@@ -2,8 +2,9 @@
 
 > kev's native C++17 implementation (based on llama.cpp), re-implementing kev (Python) inference/serving behavior in C++.
 
-kevcpp is a pure-CPU (currently), llama.cpp (https://github.com/ggml-org/llama.cpp) based kev inference service.
-It uses the Python reference implementation kev (`https://github.com/jaredpalmer/kev`) as its behavioral baseline and
+kevcpp is a kev inference service supporting CPU/AMD GPU, based on llama.cpp
+(https://github.com/ggml-org/llama.cpp). It uses the Python reference implementation kev
+(`https://github.com/jaredpalmer/kev`) as its behavioral baseline and
 re-implements the `DecisionModel` / state-prefix cache `/v1/systemone` serving semantics in C++/llama.cpp.
 
 The goal is: **provide a download-and-run decision inference engine**, avoiding kev's development-environment setup,
@@ -12,7 +13,7 @@ and to some extent rework/improve inference performance.
 > Due to limited conditions, it has only been run on the development machine (AMD AI MAX 395 PRO+); more people are
 > welcome to help improve and test it.
 > Roadmap:
-> 1. Add GPU backend support: split the backend into a standalone DLL, loaded by command-line option.
+> 1. Add GPU backend support: split the backend into a standalone DLL, loaded by command-line option -- **AMD GPU loading via Vulkan is already supported**
 > 2. Add model support: pin different model support into concrete DLLs, loaded on demand.
 
 ---
@@ -46,8 +47,8 @@ Available ways to obtain it:
 
 | Source | Description |
 | --- | --- |
-| **Build locally** | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release`; the artifact lands at `build/bin/main_server.exe` (Windows) / `build/bin/main_server` (Linux). Recommended. |
-| **GitHub Releases** | Windows 0.1.0 has been released to the Releases page. It targets AMD CPUs; Intel CPUs are untested, and the Linux build has not been compiled due to a missing environment. More contributors are welcome. |
+| **Build locally** | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release`; the artifact lands at `build/bin/kevcpp.exe` (Windows) / `build/bin/kevcpp` (Linux). Recommended. |
+| **GitHub Releases** | Windows 0.2.0 is already available on the Releases page. It targets AMD CPU/GPU; Intel CPU is untested, and the Linux build was not compiled due to a missing environment. More contributors are welcome. |
 
 **Model files**
 
@@ -74,10 +75,11 @@ After placing the model files in `models/`, run (example assumes the model is un
 
 ```bash
 # Windows / Linux (equivalent)
-./build/bin/main_server \
+./build/bin/kevcpp \
     --model models/kev-merged-q8.gguf \
     --head  models/head.bin \
     --port  8008 \
+    --backend vulkan \
     --threads 16
 ```
 
@@ -162,9 +164,9 @@ Example response (summary: `answers` gives each question's conclusion, `conf` is
 | `--lora-scale <f>` | LoRA scale factor (paired with `--lora`; optional) |
 | `--quiet` | Suppress per-request log lines |
 | `--help` / `-h` | Print usage and exit |
+| `--backend` | `cpu`/`vulkan`: dynamically load the specific backend DLL |
 
-> `--backend` (pluggable CPU/GPU backend) exists only on the archived branch `build-portable-backends`; it is not
-> enabled in the current mainline build, and GPU backends (`gpu`/`cuda`/`vulkan`) are not implemented yet. See §5.6.
+> Other GPU backends (`gpu`/`cuda`/`vulkan`) are not implemented yet. See §5.6.
 
 ---
 
@@ -347,7 +349,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
 # Run the service
-./build/bin/main_server \
+./build/bin/main_server.exe \
     --model models/kev-merged-q8.gguf \
     --head  models/head.bin \
     --port 8008 \
