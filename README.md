@@ -18,15 +18,19 @@ kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` 的 kev 推理服务。
 4. [相对 kev 的优势（Advantages over kev）](#4-相对-kev-的优势advantages-over-kev)
 5. [不足与限制（Limitations，诚实说明）](#5-不足与限制limitations诚实说明)
 6. [场景 / 依赖 / 环境要求（Usage, Dependencies, Requirements）](#6-场景--依赖--环境要求usage-dependencies-requirements)
-7. [架构说明（Architecture）](#7-架构说明architecture)
-8. [模型 / HF Hub（Model & HuggingFace）](#8-模型--hf-hubmodel--huggingface)
+7. [Vulkan 快速使用（Vulkan Quick Start）](#7-vulkan-快速使用vulkan-quick-start)
+8. [架构说明（Architecture）](#8-架构说明architecture)
+9. [模型 / HF Hub（Model & HuggingFace）](#9-模型--hf-hubmodel--huggingface)
 
 ---
 
 ## 1. 当前状态（Current Status）
 
-- **稳定主线（stable mainline）：`master` @ `dd51ed7`**。稳态延迟约 **\~327 ms**（短请求），输出与参考逐位一致（bit-identical）。包含三项已落地的优化：砍掉未使用的 tied lm*head（Rank-1，`267300f`）、ctx 默认 8192+超长 state 清晰报错（`dd51ed7`）、threaded/vectorized `ggml concat_f32`（`2607590`）。*\_head（Rank-1，`267300f`）、ctx 默认 8192+超长 state 清晰报错（`dd51ed7`）、threaded/vectorized `ggml concat_f32`（`2607590`）。
-- **便携后端 / GPU 后端（portable backend）：已归档（ARCHIVED）于分支 `build-portable-backends` @ `71d2c64`**。可插拔后端设计（`kev::Backend` C-ABI + `--backend` + GGML*CPU*ALL\_VARIANTS 便携 SIMD 方案）源码已提交，但**尚未整合为最终共享库（shared-lib）构建**；分发时必须**剪除 VNNI dll**（见 §5）。
+- **稳定主线（stable mainline）：`master` @ `dd51ed7`**。稳态延迟约 **\~327 ms**（短请求），输出与参考逐位一致（bit-identical）。包含三项已落地的优化：砍掉未使用的 tied lm\_head（Rank-1，`267300f`）、ctx 默认 8192+超长 state 清晰报错（`dd51ed7`）、threaded/vectorized `ggml concat_f32`（`2607590`）。
+- **可插拔后端 / GPU（Vulkan）目标（分支 `build-portable-backends`，HEAD @ `d961b1c`）**：
+  - HTTP 服务端（原 `main_server`）产物已改名为 **`kevcpp.exe`**。
+  - 新增 **Vulkan 后端插件 `kev-backend-vulkan.dll`**（GGML\_VULKAN）——用 Windows 原生 Vulkan 加载器 + AMD 驱动即可把整个模型 offload 到 Vulkan 设备（AMD iGPU gfx1151），**不依赖 ROCm/HIP**。快速使用见 [§7](#7-vulkan-快速使用vulkan-quick-start)。
+  - CPU 后端（`kev-backend-cpu.dll` / 进程内 `cpu`）与可插拔 `kev::Backend` C-ABI 同时并存，通过 `--backend cpu|vulkan` 选择。
 - 当前 CPU 硬性要求 **AVX-512**（Zen4+/Sapphire Rapids 级别），因为主构建为 `GGML_NATIVE`（详见 §5、§6）。
 
 ---
@@ -162,12 +166,12 @@ Linux 亦为可接受目标（GCC/Clang 工具链，见 §6）。
 - 在开发机上，**持续请求负载下偶发堆损坏 / fast-fail**（疑为内存压力；无调试器可用以根因定位）。
 - 这**阻塞了对共享库 / 便携构建的完整负载验证**（见 `docs/portable_backend_deployment.md` §7）。
 
-### 5.6 便携 / GPU 后端尚未最终定稿
+### 5.6 便携后端 / GPU（Vulkan）现状与边界
 
-- 可插拔 `kev::Backend` + `--backend` + `GGML_CPU_ALL_VARIANTS` 的设计\*\*已归档于分支
-  `build-portable-backends` @ `71d2c64`**，但**尚未整合进稳定的共享库构建\*\*。
-- 当前 CPU 硬性要求 **AVX-512**（Zen4+/Sapphire Rapids 级别），因为主构建为 `GGML_NATIVE`。
-- GPU 后端仅为扩展点（`--backend gpu/cuda/vulkan` 当前返回「未构建」清晰报错）。
+- **CPU：稳定、逐位一致。** 进程内 `cpu` 后端与可插拔 `kev-backend-cpu.dll` 共用同一份 llama，位一致得以保持。
+- **Vulkan：已实现，但未做完整负载与数值终验。** `kev-backend-vulkan.dll`（GGML\_VULKAN）可在本机（AMD iGPU gfx1151 + Windows 驱动）启动并接管推理，快速使用见 [§7](#7-vulkan-快速使用vulkan-quick-start)。保留诚实边界：Vulkan 路径的**逐位一致性 / 长时间负载稳定性尚未在生产负载下终验**。
+- **HIP/ROCm GPU：扩展点**。`--backend gpu/cuda` 需要 GGML\_HIP 专用构建（`KEV_BUILD_BACKEND_GPU=ON` + hipcc/clang）；在本机 ROCm 会话因 HIP/HSA blit 初始化崩溃（`0xC0000005`）而不默认启用，故以 Vulkan 作为本机 GPU 路径。
+- 便携 CPU 分发仍需**剪除 VNNI dll**（见 §5.2）。
 
 ---
 
@@ -180,8 +184,8 @@ Linux 亦为可接受目标（GCC/Clang 工具链，见 §6）。
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
-# 运行服务
-./build/bin/main_server.exe \
+# 运行服务（默认 CPU 后端）
+./build/bin/Release/kevcpp.exe \
     --model models/kev-merged-q8.gguf \
     --head  models/head.bin \
     --port 8008 \
@@ -205,9 +209,9 @@ cmake --build build --config Release
 | `--ctx N` | 上下文大小（默认 **8192**；短 state 可用 2048） |
 | `--lru N` | 状态缓存 slot 数（默认 2） |
 | `--prewarm <file>` | 启动预热一个 state（读原文、prefill 进 LRU，可选） |
-| `--backend <name>` | 推理后端：`cpu`（默认）；`gpu`/`cuda`/`vulkan` 为「未构建」报错（portable 分支） |
+| `--backend <name>` | 推理后端：`cpu`（默认）；`vulkan`（需 `kev-backend-vulkan.dll`，见 [§7](#7-vulkan-快速使用vulkan-quick-start)）；`gpu`/`cuda` 为 HIP/ROCm 扩展点（需专用构建） |
 
-> `--backend` 仅在已归档分支 `build-portable-backends` 上可用（当前主构建为 `GGML_NATIVE` 静态单 llama）。
+> `--backend vulkan` 需要单独的 `GGML_VULKAN` 构建目录生成的 `kev-backend-vulkan.dll`（默认 CPU 构建目录不含 GPU/Vulkan 库），见 [§7](#7-vulkan-快速使用vulkan-quick-start)。
 
 ### 6.4 依赖
 
@@ -225,28 +229,118 @@ cmake --build build --config Release
 
 ---
 
-## 7. 架构说明（Architecture）
+## 7. Vulkan 快速使用（Vulkan Quick Start）
 
-### 7.1 分层
+> Vulkan 后端把**整个模型 offload 到 Vulkan 设备**（`n_gpu_layers=-1`，等价于 llama.cpp `-ngl -1`），走 Windows
+> 原生 Vulkan 加载器 + GPU 驱动，**不需要 ROCm/HIP**。本机验证平台：AMD Ryzen AI MAX+ PRO 395（iGPU gfx1151，
+> 统一内存）+ Vulkan SDK `D:\SDK\Vulkan\1.4.363.0` + AMD Windows 驱动。
+
+Vulkan 需要**两份产物**：`kevcpp.exe`（llama-free 宿主）与 `kev-backend-vulkan.dll`（GGML\_VULKAN 后端插件）。
+
+### 7.1 构建 Vulkan 后端 dll
+
+CPU 主构建目录默认不含 GPU/Vulkan 库（`KEV_BUILD_BACKEND_VULKAN` 保持 OFF，见 `scripts/build.ps1` 注释）。
+Vulkan 后端在一个**独立的 GGML\_VULKAN 构建目录**中用纯 MSVC 编译：
+
+```powershell
+# 前置：VULKAN_SDK 指向已安装的 Vulkan SDK（含 Bin\glslc.exe）
+#   $env:VULKAN_SDK = "D:\SDK\Vulkan\1.4.363.0"
+powershell -ExecutionPolicy Bypass -File build\vulkan-exp\build_vulkan.ps1 [-Clean] [-Config Release]
+```
+
+脚本内部等价于（如需手动复现）：
+
+```powershell
+# 配置独立 build 目录（GGML_VULKAN 由 -DKEV_BUILD_BACKEND_VULKAN=ON 打开）
+cmake -S . -B build\vulkan-exp\vulkan-build `
+  -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release `
+  -DKEV_BUILD_BACKEND_VULKAN=ON -DGGML_NATIVE=ON `
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DBUILD_SHARED_LIBS=OFF
+
+# 只构建 Vulkan 后端插件（single-node msbuild）
+msbuild build\vulkan-exp\vulkan-build\kev-backend-vulkan.vcxproj /p:Configuration=Release
+```
+
+产物落盘于 `build\vulkan-exp\vulkan-build\bin\Release\kev-backend-vulkan.dll`。
+
+### 7.2 构建宿主 kevcpp.exe
+
+`kevcpp.exe` 是不链接 llama 的宿主（`KEV_BACKEND_USE_DLL`），在**默认 CPU 构建目录**构建即可：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1 [-Config Release]
+# 产物: build\bin\Release\kevcpp.exe（main_server 目标，OUTPUT_NAME=kevcpp）
+```
+
+> 依赖链：因为插件通过 C ABI（`kev_backend.h`）加载，宿主与后端 dll 不必在同一构建目录编译，但两者的
+> `kev_backend.h` ABI 必须来自同一版本（工厂会校验 `abi_version` 与 `ops.struct_size`）。
+
+### 7.3 运行（Vulkan 后端）
+
+把 `kev-backend-vulkan.dll` 放到宿主 exe 同目录（或 PATH 可搜索的位置），用 `--backend vulkan` 启动：
+
+```powershell
+# 例：把 dll 拷到 exe 旁
+Copy-Item build\vulkan-exp\vulkan-build\bin\Release\kev-backend-vulkan.dll build\bin\Release\
+
+# 以 Vulkan 后端启动（overload 整个模型到 GPU）
+build\bin\Release\kevcpp.exe `
+    --model   models\kev-merged-q8.gguf `
+    --head    models\head.bin `
+    --port    8008 `
+    --backend vulkan
+
+# CPU 后端对比（默认，无需 dll）
+build\bin\Release\kevcpp.exe --model models\kev-merged-q8.gguf --head models\head.bin --port 8008 --backend cpu
+```
+
+启动日志会打印后端身份，例如：
+`kevcpp using backend 'vulkan' (device=vulkan, ver=kev-backend-vulkan-0.1-static-ggml-vulkan)`。
+`GET /v1/models` 的 `backend_name/device/version` 亦会同步返回。
+
+验证请求：
+```powershell
+curl.exe --data-binary "@tests/tmp_a_company.json" http://127.0.0.1:8008/v1/systemone
+```
+
+### 7.4 Vulkan 后端说明与边界
+
+- 后端实现见 `src/kev_backend_vulkan.cpp`，是对 CPU 后端（`kev_backend_cpu.cpp`）的镜像，差别仅在
+  `n_gpu_layers=-1`（整模型 offload）与 `meta.device = "vulkan"`。
+- 仅选项里勾了 `--backend vulkan` 时才会加载 `kev-backend-vulkan.dll`；否则宿主只加载 CPU 后端，Vulkan 库不参与。
+- **诚实边界**：Vulkan 路径的逐位一致性与长负载稳定性尚未生产终验；端口/线程/ctx 参数与 CPU 后端一致。
+- 本机为何选 Vulkan 而非 ROCm/HIP：AMD iGPU gfx1151 在普通 ROCm 会话中 HIP/HSA blit 初始化崩溃
+  （`Creating the executable from ISA assembly text failed / Couldn't create blit kernels!`），Vulkan 经
+  Windows 图形驱动原生栈可正常枚举设备（见 `build\vulkan-exp\hip_linkage_verify.md` 根因）。
+
+---
+
+## 8. 架构说明（Architecture）
+
+### 8.1 分层（两栈：CPU 进程内 + 可插拔 dll）
 
 ```
-┌────────────────────────────── kevcpp（编排层）──────────────────────────────┐
-│ (a) main_server.cpp   HTTP 层（cpp-httplib），服务 systemone schema          │
+┌────────────────────────────── kevcpp（编排层，宿主 = kevcpp.exe）──────────────┐
+│ (a) main_server.cpp   HTTP 层（cpp-httplib），服务 systemone schema；（产物名 kevcpp.exe）│
 │ (b) KevModel          kev_model.cpp/h —— 编排：LLM ctx 拥有、encode、        │
 │      kev_prefix.cpp   状态 LRU 前缀缓存、kev_head.cpp PointerHead 读出头、   │
 │      kev_encode.cpp   每问分叉 decode/批量、compute_mutex_ 串行共享 ctx      │
-│      kev_backend_factory.cpp  可插拔后端工厂（ARCHIVED）                     │
-├────────────────────────────── vendored llama.cpp / GGML ───────────────────┤
-│ (c) 混合 GDN+attention graph、Q8_0 内核、KV/recurrent 缓存                    │
-│     编解码、qwen35.cpp 构建器（24 层混合）                                    │
-│ (d) kev_backend* C-ABI 抽象（ARCHIVED，分支 build-portable-backends）         │
-│     —— CPU 与未来 GPU 后端经 --backend 可 dll 加载                            │
-└────────────────────────────────────────────────────────────────────────────┘
+│      kev_backend_factory.cpp  可插拔后端工厂：--backend cpu|vulkan 选择        │
+├────────────── 边界：kev_backend.h C-ABI（meta/params/ops，无 llama 类型）──────┤
+│     宿主 KEV_BACKEND_USE_DLL（llama-free）只经 kev::Backend* 调用算子；        │
+│     后端是进程内唯一的 llama/ggml 链接方（single-llama rule）                  │
+├────────────── vendored llama.cpp / GGML（只在后端模块内链接）────────────────┤
+│ (c) 混合 GDN+attention graph、Q8_0 内核、KV/recurrent 缓存、qwen35.cpp（24 层）│
+│ (d) kev_backend{_cpu,_vulkan}.cpp  —— C-ABI 实现：                             │
+│     cpu 后端    := 进程内（默认）或 kev-backend-cpu.dll                        │
+│     vulkan 后端 := kev-backend-vulkan.dll（GGML_VULKAN，n_gpu_layers=-1）      │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 模块职责
+### 8.2 模块职责
 
-- **(a) `main_server.cpp`**：`/v1/systemone` 的 HTTP 层（cpp-httplib），参数解析，串/并。
+- **(a) `main_server.cpp`**：`/v1/systemone` 的 HTTP 层（cpp-httplib），参数解析，串/并；**llama-free**，
+  经 `kev::Backend*` 调用后端算子；产物为 `kevcpp.exe`。
 - **(b) `KevModel`（`kev_model.cpp/h`）**：编排核心。
   - LLM 上下文（ctx）拥有与生命周期；
   - `kev_encode.cpp` 组装请求（`encode` → `KevEnc` → `KevRows`）；
@@ -254,29 +348,38 @@ cmake --build build --config Release
   - `kev_head.cpp` `PointerHead` 读出头（`d=1024 → dp=256`，`k(h_opts)·q(h_decide)*scale`）；
   - 每问分叉（branch）decode / 批量（`rows_from_slot` / `decode_batch`）；
   - `compute_mutex_` 串行化所有共享 ctx 的计算段（多流安全）。
-- **(c) vendored llama.cpp / GGML 后端**：混合 GDN+attention graph、Q8\_0 内核、KV/recurrent 缓存。
-- **(d) 可插拔 `kev_backend*` C-ABI 抽象**（ARCHIVED，分支 `build-portable-backends` @ `71d2c64`）：
-  CPU 与未来 GPU 后端通过 `--backend` dll 加载；`KevModel` 只经 `kev::Backend*` 调用 llama/ggml 算子。
+- **`kev_backend.h` / `kev_backend_factory.cpp`（C-ABI 与工厂）**：定义 `meta/params/ops`（无 llama 类型、
+  ABI 版本化、ops 表只追加不重排）；`BackendFactory_load(name)` 负责选后端——CPU（进程内或 `kev-backend-cpu.dll`）
+  与 Vulkan（`kev-backend-vulkan.dll`）经 dll/符号动态加载。
+- **(c) vendored llama.cpp / GGML 后端**：混合 GDN+attention graph、Q8\_0 内核、KV/recurrent 缓存；仅在后端 dll
+  （或进程内 CPU 后端）中链接，宿主不链接 llama。
+- **(d) 后端实现（`kev_backend_cpu.cpp` / `kev_backend_vulkan.cpp`）**：实现 C-ABI 的算子面
+  （init / decode_seq / decode_batch / read_hidden / seq_clear / seq_copy / 尺寸 / tokenizer 委托）。
+  Vulkan 后端用 `n_gpu_layers=-1` 把整模型 offload 到 Vulkan 设备；CPU 后端与静态单 llama 一致 → 位一致保留。
 
-### 7.3 数据流
+### 8.3 数据流
 
 ```
 parse（/v1/systemone JSON）
-   → encode（state + branch 组装为 token 序列）
+   → encode（state + branch 组装为 token 序列；经后端 tokenizer 委托）
    → ensure_state（LRU：命中跳过 state prefill / 未命中 prefill 到 slot）
    → rows_from_slot（branch decode，在 decide / option 位置读取 hidden）
    → PointerHead（kev_head.cpp）
    → probabilities（softmax z/T）
 ```
 
+> 构建形态差异：默认 `scripts/build.ps1` 产**单个静态** `kevcpp.exe`（CPU 后端进程内链接）；
+> Vulkan（以及生产便携）态则让宿主 `KEV_BACKEND_USE_DLL` 只加载后端 dll、自身不链接 llama
+> （single-llama rule，见 `docs/portable_backend_deployment.md`）。
+
 ---
 
-## 8. 模型 / HF Hub（Model & HuggingFace）
+## 9. 模型 / HF Hub（Model & HuggingFace）
 
 > **重要**：本项目使用的 0.8B 模型**不是现成的 Qwen-0.8B**，而是本项目**自有的、经改造/定制（modified / customized）
 > 的 0.8B 变体**。
 
-### 8.1 模型规格（已核实）
+### 9.1 模型规格（已核实）
 
 - **结构**：24 混合层 = **18 层 Gated-DeltaNet（循环）+ 6 层全注意力（第 3、7、11、15、19、23 层）**。
 - `n_embd = 1024`
@@ -287,7 +390,7 @@ parse（/v1/systemone JSON）
 - 权重导出为 **GGUF（Q8\_0，约 774 MiB）**：`models/kev-merged-q8.gguf`
 - 外加独立的 **PointerHead**：`models/head.bin`（约 2 MiB）
 
-### 8.2 HF Hub（待上传）
+### 9.2 HF Hub（待上传）
 
 本项目计划将模型上传到 **Hugging Face Hub**（huggingface.co）。
 
@@ -300,7 +403,8 @@ parse（/v1/systemone JSON）
 ## 相关文档（Docs）
 
 - `docs/F.24_Q8_DOTBUS_FAIL_AND_F16_PIVOT.md` — 权威性能/实验日志：稳态数值、优化结果、证伪方向、VNNI/dpbusd 发现、compute-bound 结论。
-- `docs/portable_backend_deployment.md` — 可插拔后端 / 便携构建计划 + VNNI 剪除规则（ARCHIVED）。
+- `docs/portable_backend_deployment.md` — 可插拔后端 C-ABI / 便携构建计划 + VNNI 剪除规则 + single-llama rule。
+- `CHANGELOG.md` — 版本变化记录（含本次：kevcpp.exe 改名、Vulkan 后端新增、架构演进）。
 - `logs/perf_authoritative_baseline.md` — 逐 op 权威预算基线。
 
 ---
