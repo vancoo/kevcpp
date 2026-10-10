@@ -124,7 +124,13 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     bopt.n_batch           = 512;             // legacy value
     bopt.n_ubatch          = 256;             // legacy value
     bopt.n_outputs_max_per_seq = 128;         // legacy value
-    bopt.embeddings        = 1;
+    // embeddings: 生成式 logits 判别主通道(read_logits 经 llama_get_logits_ith 读 token logits)
+    // 只需要 lm_head 投影的 logits 缓冲, **不需要** hidden 输出(embeddings=true 会多付一次
+    // hidden 计算, 实测 ~84ms/+28%)。故 enable_logits=true(主通道) 时关掉 embeddings;
+    // 仅当 enable_logits=false(KEV 回退, 经 read_hidden 读 hidden 打分) 时才保留 embeddings。
+    // 安全性: 生产服务(/v1/systemone)在 logits 通道只走 read_logits, 无任何 read_hidden /
+    // embeddings 消费者; 独立的 main_cli/headbench/m*_bench 各自建自己的 context, 不受影响。
+    bopt.embeddings        = decision_.enable_logits ? 0 : 1;
     // lm_head: 生成式 logits 判别主通道需要 lm_head 投影(read_logits 依赖 logits 缓冲);
     // enable_logits=false 时保持原 hidden-only 配置(KEV 回退逐位一致)。get_embeddings 不受影响。
     bopt.lm_head           = decision_.enable_logits ? 1 : 0;
@@ -189,6 +195,23 @@ bool KevModel::decode_seq_chunked(const std::vector<int32_t> & ids, int start_po
     // 预检: 若输出位置不在 ids 范围内, 属于调用方错误。
     for (int g : out_global) {
         if (g < 0 || g >= L) { if (err && err->empty()) *err = "decode_seq_chunked: out_global out of range"; return false; }
+    }
+
+    // ---- 单段快路径(P0): 整段长度 <= 后端 n_batch 时一次 llama_decode 完成 ----
+    // 旧实现无条件把序列切成"头部[无输出] + 尾部[带输出]"两段分别 llama_decode: 长序列
+    // (如 6-候选中文 prompt, Lp=189 n_batch=512)会被切成 188+1 两段, 破坏 llama.cpp 的
+    // 图/批复用(实测 ~58ms)。当 L <= chunk(后端 n_batch) 时单次 decode 即可容纳整段,
+    // 且所有输出位置直接落在该段内(末位置输出 logits), 不触发 llama n_tokens_all<=n_batch
+    // 断言。语义: 与"末尾+输出"分块逐位一致(causal 注意力下同一批位置一次性解码只改变
+    // 并行/图复用, 不改变 logits 数值, 容许极小浮点差)。
+    if (L <= chunk) {
+        out_local.clear();
+        std::vector<int32_t> local_pos(out_global.size());
+        for (size_t i = 0; i < out_global.size(); ++i)
+            local_pos[i] = out_global[i];   // 输出位置已在 ids 内的局部位次
+        if (!backend_->decode_seq(ids, start_pos, seq, err, local_pos)) return false;
+        out_local = std::move(local_pos);
+        return true;
     }
 
     // 输出必须全部落在最后一段。取首个输出位置作为"尾部起始": 头部(其前)可任意切块,
