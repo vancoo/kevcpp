@@ -171,7 +171,7 @@ static double round_prob(double x) {
 }
 
 json to_answers(const std::vector<std::vector<float>> & probs,
-                const std::vector<SystemOneMeta> & meta, float drop_low_conf) {
+                const std::vector<SystemOneMeta> & meta) {
     json answers = json::object();
     for (size_t q = 0; q < meta.size(); ++q) {
         const auto & M = meta[q];
@@ -181,15 +181,8 @@ json to_answers(const std::vector<std::vector<float>> & probs,
         } else if (M.type == "choice") {
             int argmax = (int) (std::max_element(p.begin(), p.end()) - p.begin());
             json dist; for (size_t i = 0; i < M.keys.size(); ++i) dist[M.keys[i]] = round_prob(p[i]);
-            double conf = choice_confidence(p);
-            // 方案3: 低置信拒绝(默认关闭)。置信不足时不 hard choice, 标记 low_confidence。
-            if (drop_low_conf > 0.0f && conf < drop_low_conf) {
-                answers[M.id] = {{"type", "choice"}, {"choice", ""}, {"low_confidence", true},
-                                 {"confidence", round_prob(conf)}, {"probabilities", std::move(dist)}};
-                continue;
-            }
             answers[M.id] = {{"type", "choice"}, {"choice", M.keys[argmax]},
-                             {"confidence", round_prob(conf)}, {"probabilities", std::move(dist)}};
+                             {"confidence", round_prob(choice_confidence(p))}, {"probabilities", std::move(dist)}};
         } else {
             double score = 0; for (size_t i = 0; i < p.size(); ++i) score += i * p[i];
             json legend; for (size_t i = 0; i < M.legend.size(); ++i) legend[std::to_string(i)] = M.legend[i];
@@ -249,8 +242,7 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
 
     std::string model_name = body.value("model", std::string("kev-latest"));
     if (TR) w = now_us();
-    // 方案3: 低置信拒绝阈值(默认 0 = 关闭, 保持原行为)。从决策配置读。
-    auto answers = to_answers(res.probs, ps.meta, model.decision_config().calib.drop_low_conf);
+    auto answers = to_answers(res.probs, ps.meta);
     std::string answers_str = answers.dump();
     if (TR) { t_ans_c = now_us() - w; w = now_us(); }
     int output_tokens = model.count_tokens(answers_str);

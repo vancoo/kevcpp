@@ -7,32 +7,8 @@
 #pragma once
 
 #include <string>
-#include <vector>
 
 namespace kev {
-
-// ---- 方案3: logits 决策映射层校准 (无训练, 只调映射层, 默认关闭 = 原始行为) ----
-// 校准对象是"候选 logits -> 概率"的决策映射, 不触碰模型权重 / 不改 llama 前向。
-//   enabled        总开关; false = 完全保持当前行为 softmax(z / decision.temperature)
-//   temperature_mode "single" = 全局一档温度(锚用 decision.temperature 或 calib.temperature);
-//                  "by_n"    = 按候选数 n_options 分桶, 取 params_file / 默认表里的 T[n];
-//   temperature    single 模式下的校准温度(>0)。0 表示沿用 decision.temperature。
-//   position_debias 去"位置/顺序偏置": 对每条候选 z[j] 减去 position_bias[j](经验偏置)。
-//                  弱模型下候选在前/在后的 logits 可能脏, 此项可矫正(默认 false, 需先校准拟合)。
-//   position_bias  [P] 每位置经验偏置(从校准集学得), 仅 position_debias=true 时使用。
-//   drop_low_conf  低置信拒绝阈值: 该问 argmax 归一化置信 < drop_low_conf 时, 决策标记为
-//                  low-confidence(不改概率表, 只拒绝硬选)。默认 0 = 关闭。
-//   params_file    可选校准参数文件(by_n 温度桶 + position_bias)，模型无关(与配置解耦)。
-// 所有字段默认值 = 关闭/原始行为, 用户显式开启才生效(可回退)。
-struct LogitsCalibration {
-    bool enabled = false;
-    std::string temperature_mode = "single";   // "single" | "by_n"
-    float temperature = 0.0f;                  // single: >0 生效; 0 = 沿用 decision.temperature
-    bool position_debias = false;
-    std::vector<float> position_bias;          // [P] 每位置偏置(索引=候选顺序位置)
-    float drop_low_conf = 0.0f;                // 0 = 关闭低置信拒绝
-    std::string params_file;                   // 可选校准参数文件
-};
 
 // 5 个决策 marker 的默认值(原版 Qwen3.5), 仅供默认; 必须可被配置覆盖, 不得在编码路径写死。
 // 语义(与 llama.cpp decision 模型一致):
@@ -74,9 +50,6 @@ struct KevDecisionConfig {
     // 的 KV 缓存进前缀 slot, 每个请求从此前缀续接 state+Answer, 跳过重算稳定前段; false = 回到
     // "从 pos 0 全新解码整条 prompt"(A/B 对照, 逐位一致)。默认 true。
     bool cache_prefix = true;
-
-    // ---- 方案3: logits 决策映射层校准 (无训练, 默认关闭 = 原始行为)。见 LogitsCalibration ----
-    LogitsCalibration calib;
 };
 
 // 默认决策配置(原版 Qwen3.5)。

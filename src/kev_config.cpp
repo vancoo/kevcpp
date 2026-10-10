@@ -152,8 +152,6 @@ bool load_decision_config(const std::string & file, KevDecisionConfig & cfg, std
                 else if (path == "logits.prompt_template") c->prompt_template = raw;
                 else if (path == "logits.aggregation")    c->aggregation     = raw;
                 else if (path == "logits.logits_type")    c->logits_type     = raw;
-                else if (path == "calib.temperature_mode") c->calib.temperature_mode = raw;
-                else if (path == "calib.params_file")     c->calib.params_file = raw;
             } else {
                 if (path == "temperature") {
                     float v = (float) std::atof(raw.c_str());
@@ -164,18 +162,6 @@ bool load_decision_config(const std::string & file, KevDecisionConfig & cfg, std
                 } else if (path == "logits.cache_prefix") {
                     bool v = raw == "true" || raw == "1";
                     c->cache_prefix = v;
-                } else if (path == "calib.enable") {
-                    bool v = raw == "true" || raw == "1";
-                    c->calib.enabled = v;
-                } else if (path == "calib.temperature") {
-                    float v = (float) std::atof(raw.c_str());
-                    if (v > 0.0f) c->calib.temperature = v;
-                } else if (path == "calib.position_debias") {
-                    bool v = raw == "true" || raw == "1";
-                    c->calib.position_debias = v;
-                } else if (path == "calib.drop_low_conf") {
-                    float v = (float) std::atof(raw.c_str());
-                    if (v >= 0.0f) c->calib.drop_low_conf = v;
                 }
             }
             return 1;

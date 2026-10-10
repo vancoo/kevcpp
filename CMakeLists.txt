@@ -113,7 +113,6 @@ add_executable(m3_bench
     src/kev_model.cpp
     src/kev_kevhead.cpp
     src/kev_config.cpp
-    src/kev_calibrate.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -133,7 +132,6 @@ add_executable(m5_bench
     src/kev_model.cpp
     src/kev_kevhead.cpp
     src/kev_config.cpp
-    src/kev_calibrate.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -154,7 +152,6 @@ add_executable(m7_bench
     src/kev_model.cpp
     src/kev_kevhead.cpp
     src/kev_config.cpp
-    src/kev_calibrate.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -178,7 +175,6 @@ add_executable(main_server
     src/kev_model.cpp
     src/kev_kevhead.cpp
     src/kev_config.cpp
-    src/kev_calibrate.cpp
     src/kev_prefix.cpp
     src/kev_encode.cpp
     src/kev_head.cpp
@@ -220,7 +216,6 @@ add_executable(m8_bench
     src/kev_model.cpp
     src/kev_kevhead.cpp
     src/kev_config.cpp
-    src/kev_calibrate.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -258,7 +253,6 @@ add_executable(kab_bench
     src/kev_model.cpp
     src/kev_kevhead.cpp
     src/kev_config.cpp
-    src/kev_calibrate.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -290,7 +284,6 @@ add_executable(lora_ab
     src/kev_model.cpp
     src/kev_kevhead.cpp
     src/kev_config.cpp
-    src/kev_calibrate.cpp
     src/kev_prefix.cpp
     src/kev_encode.cpp
     src/kev_head.cpp
@@ -385,29 +378,4 @@ target_link_libraries(kev_kevhead_selftest PRIVATE)
 target_compile_features(kev_kevhead_selftest PRIVATE cxx_std_17)
 if (MSVC)
     target_compile_options(kev_kevhead_selftest PRIVATE /utf-8)
-endif()
-
-# ---- 方案3: logits 决策映射层校准/评测 harness (离线, 不产生服务影响) ----
-# 收集候选 key 原始 logits 并离线统计/搜索校准参数; 模型无关, 不训练权重。
-add_executable(calib_harness
-    src/calib_harness.cpp
-    src/kev_api.cpp
-    src/kev_model.cpp
-    src/kev_kevhead.cpp
-    src/kev_config.cpp
-    src/kev_calibrate.cpp
-    src/kev_prefix.cpp
-    src/kev_encode.cpp
-    src/kev_head.cpp
-    src/kev_merge.cpp
-    src/kev_backend_factory.cpp
-    src/kev_backend_cpu.cpp
-)
-target_link_libraries(calib_harness PRIVATE llama)
-target_compile_definitions(calib_harness PRIVATE KEV_BACKEND_BUILD)
-target_include_directories(calib_harness PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
-target_compile_features(calib_harness PRIVATE cxx_std_17)
-if (MSVC)
-    target_compile_options(calib_harness PRIVATE /utf-8)
 endif()
