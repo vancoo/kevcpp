@@ -1,8 +1,8 @@
 // kev_api.h — TypeSafe 兼容的 /v1/systemone 请求/响应映射层 (M4)
 //
 // 复刻 kev/api.py 的 render/option_text/question_keys/to_record/to_answers/confidence 语义,
-// 并用 kev_model 组装: 解析 SystemOneRequest JSON -> KevRequest(进 kev_encode) -> model.probs
-// -> to_answers -> 响应 JSON {model, answers, usage, latency_ms}.
+// 并用 kev_model 组装: 解析 SystemOneRequest JSON -> KevRequest(logits 主通道的结构化请求)
+// -> model.probs -> to_answers -> 响应 JSON {model, answers, usage, latency_ms}.
 #pragma once
 
 #include "kev_model.h"

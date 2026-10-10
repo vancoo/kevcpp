@@ -202,21 +202,19 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
     if (!parse_systemone(body, ps, err)) return json(nullptr);
     if (TR) { t_parse_c = now_us() - w; w = now_us(); }
 
-    std::string enc_err;
-    KevEnc enc = model.encode(ps.rec, &enc_err);
-    int input_tokens = (int) enc.ids.size();
+    // 生成式 logits 判别主通道(主线): 输入 token 数 = 各问中最长填空式 prompt 的 token 数。
+    int input_tokens = model.logits_input_tokens(ps.rec);
     if (TR) { t_enc_c = now_us() - w; w = now_us(); }
 
-    // 防御性预检: 一个 sequence(branch) 需在单注意力流内放下完整 state 前缀(Ls)
-    // + 自身 branch tokens(B), 即 input_tokens 格; 若超过每流容量 n_ctx_seq,
-    // decode 必然 find_slot 失败。在真正 decode 前给出清晰错误, 取代原先
-    // cryptic 的 {"detail":"could not answer request"}(由 "init_batch: failed to
+    // 防御性预检: logits 通道的 padding 序列需在单注意力流内放下整条填空式 prompt;
+    // 若超过每流容量 n_ctx_seq, decode 必然 find_slot 失败。在真正 decode 前给出清晰错误,
+    // 取代原先 cryptic 的 {"detail":"could not answer request"}(由 "init_batch: failed to
     // prepare attention ubatches" 触发)。纯预检, 不触碰成功路径的 probs/数值。
     const int n_ctx_seq = model.n_ctx_seq_capacity();
-    if (n_ctx_seq > 0 && (int) enc.ids.size() > n_ctx_seq) {
+    if (n_ctx_seq > 0 && input_tokens > n_ctx_seq) {
         if (t_model_ms) *t_model_ms = 0.0;
         if (err && err->empty())
-            *err = "state too long for context: " + std::to_string(input_tokens)
+            *err = "request too long for context: " + std::to_string(input_tokens)
                  + " tokens exceed per-stream capacity " + std::to_string(n_ctx_seq)
                  + " (raise --ctx N, e.g. --ctx 8192, or split the input)";
         if (TR) std::fprintf(stderr, "[TRACE] sysone rejected input=%d > n_ctx_seq=%d (pre-decode capacity guard)\n",
@@ -225,11 +223,9 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
     }
 
     auto t0 = std::chrono::steady_clock::now();
-    // 生成式 logits 判别主通道(enable_logits)时, 打分走结构化 req(含各问候选 keys);
-    // 否则走旧 KEV 路径, 复用已算好的 enc(避免重复 encode)。响应/概率结构语义不变。
-    auto res = model.logits_channel_active()
-        ? model.probs(ps.rec, &enc_err)
-        : model.probs(enc, &enc_err);
+    // 打分恒走生成式 logits 判别主通道(structured req, 含各问候选 keys; 无 KEV 回退)。
+    std::string enc_err;
+    auto res = model.probs(ps.rec, &enc_err);
     double model_ms = (double) std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count() / 1e3;
     if (TR) t_probs_c = now_us() - w;
@@ -249,7 +245,7 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
     if (TR) t_ct_c = now_us() - w;
 
     if (TR) {
-        std::fprintf(stderr, "[TRACE] sysone parse_systemone=%.2fms encode=%.2fms probs(model_ms)=%.2fms "
+        std::fprintf(stderr, "[TRACE] sysone parse_systemone=%.2fms token_count=%.2fms probs(model_ms)=%.2fms "
                              "to_answers+dump=%.2fms count_tokens=%.2fms answers_str_len=%zu Q=%zu out_tok=%d\n",
                      t_parse_c, t_enc_c, t_probs_c, t_ans_c, t_ct_c, answers_str.size(),
                      ps.meta.size(), output_tokens);

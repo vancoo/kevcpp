@@ -1,16 +1,12 @@
-// kev_encode.h — 复刻 kev.model.encode() 编码层 (M2)
+// kev_encode.h — logits 判别主通道的共享类型 + llama-free 分词器访问 (模型无关)
 //
-// 目标: 与 E:\van\projects\kev\kev\model.py 的 encode()/user_tokens()/rows_of() 逐 token/逐索引
-// 对齐。分词用 GGUF 自带 llama_tokenize(等价于 HF fast tokenizer, 已对拍确认)。
-//
-//   DEFAULT_SPECIAL = ["<|fim_prefix|>","<|fim_middle|>","<|box_start|>","<|box_end|>","<|fim_suffix|>"]
-//       [0]=state 开头; q/o/c/d = [1..3]; d(decide)=[4]. 这些只是"默认值"(原版 Qwen3.5):
-//       路线 A 要求模型无关, marker 一律从注入的 KevDecisionConfig 读取(见 kev_config.h),
-//       不再在编码路径写死某个模型的 marker。encode() 传入 cfg==nullptr 时使用默认值。
-//   user_tokens(tok,text): <|x|> -> <¦x¦> 后 add_special_tokens=False 分词.
-//   encode(): [<state>...] 每个 question [<q> instr <o> opt </o>... <decide>].
-//       ids/seg/pos/opt/decide_idx/opt_idx 与 Python 一致. opt: OPT_NONE=-1(指令), j(选项span), OPT_DECIDE=-2(decide).
-//   rows_of(enc): 拆成 state_ids/state_pos + 每问 branch row(ids/pos/decide/opts 相对偏移).
+// 在「以 logits 判别通道为主线」的重构后, 不再保留原 kev 的 KEV 指针头/KEV marker 布局
+// encode(KevEnc/rows_of/SPECIAL/OPT_* 等)。这里只保留 logits 主通道(Model + API layer)
+// 需要的基础:
+//   - TokenFeeder:   llama-free 分词器访问器(单一 llama 模块负责真实分词, 见
+//                    docs/portable_backend_deployment.md; host 经 backend ops 转发)。
+//   - KevRequest / KevQuestion: 一次判别请求的模型无关结构化表示(state + 每问指令/候选/keys)。
+//   - tokenize / special_token_id: llama-free 分词接口(logits 主通道用)。
 #pragma once
 
 #include "kev_config.h"
@@ -21,16 +17,8 @@
 
 namespace kev {
 
-// llama-free tokenizer accessor (B-3). kev_encode never touches llama types: the
-// caller supplies a TokenFeeder that performs tokenize / special-token lookup.
-//
-//  * cpu/gpu plugin path: built from a kev::Backend (kev_backend_factory.h),
-//    forwarding to the backend's tokenize / special_token_id ops (single-llama:
-//    the dll owns the llama_vocab).
-//  * legacy static bench tool path (headbench, etc., which link llama directly):
-//    built from a const llama_vocab* in a llama-linking TU (see kev_encode.h's
-//    llama-free contract — the adapter itself lives where llama is statically
-//    linked, not in kev_encode.cpp).
+// llama-free tokenizer accessor (B-3). host 不触碰 llama 类型: 调用方提供 TokenFeeder,
+// 由其转发到 backend 的 tokenize / special_token_id ops(单一 llama 规则, dll 拥有 llama_vocab)。
 //
 // tokenize returns count written (>=0), or -required-capacity (negative) when
 // `cap` is too small (writes nothing).
@@ -42,75 +30,26 @@ struct TokenFeeder {
     int32_t (*special_token_id)(void * ud, const char * special);
 };
 
-constexpr int32_t OPT_NONE  = -1;
-constexpr int32_t OPT_DECIDE = -2;
-
-// 默认 marker 数组(原版 Qwen3.5), 与 KevDecisionConfig 默认完全一致。仅供默认; 编码路径
-// 实际上读取传入的 KevDecisionConfig(encode 的 cfg 参数) 中的 marker, 而不是直接索引本常量。
-const char * const SPECIAL[5] = {
-    "<|fim_prefix|>", "<|fim_middle|>", "<|box_start|>", "<|box_end|>", "<|fim_suffix|>"};
-
-struct KevOption { std::string text; };
-
 struct KevQuestion {
     std::string instr;
     std::vector<std::string> options;
     // 每题判别的候选 key(choice: criteria keys; noul: ["false","true"]; score: ["0".."L-1"])。
     // 由 API 层(parse_systemone)填充, 供「生成式 logits 判别」通道用作候选答案 token 来源;
-    // encode() 本身不依赖它, 空时 logits 通道会按 options 推导。
+    // 空时 logits 通道会按 options 推导。
     std::vector<std::string> keys;
 };
 
 struct KevRequest {
     std::string state;
     std::vector<KevQuestion> questions;
-    std::vector<int32_t> labels;   // 每问的 label(仅透传, encode 不用于算术)
+    std::vector<int32_t> labels;   // 每问的 label(仅透传, 判别逻辑不用于算术)
 };
 
-struct KevEnc {
-    std::vector<int32_t> ids;         // full packed ids
-    std::vector<int32_t> seg;         // 0=state, k=question k
-    std::vector<int32_t> pos;
-    std::vector<int32_t> opt;
-    std::vector<int32_t> decide_idx;  // [Q] 每个 </decision>/<decide> 在 ids 中的绝对索引
-    std::vector<std::vector<int32_t>> opt_idx; // [Q][K] 每个 </opt> 在 ids 中的绝对索引
-    std::vector<int32_t> labels;
-};
-
-// 一个 branch row: question k 的 branch tokens 及其相对 decide/opts 偏移
-struct KevRow {
-    std::vector<int32_t> ids;
-    std::vector<int32_t> pos;
-    int32_t decide = 0;                 // decide 在本 row 内的偏移
-    std::vector<int32_t> opts;          // 各 </opt> 在本 row 内的偏移
-};
-
-struct KevRows {
-    std::vector<int32_t> state_ids;
-    std::vector<int32_t> state_pos;
-    std::vector<KevRow>  rows;          // 每个 question 一个
-};
-
-// 分词器抽象: 返回 text (已按需改写) 的 token ids, 序列 = HF fast tokenizer(addr_special=False)
-//   parse_special 语义等同 HF split_special_tokens; 对 Qwen3.5 已对拍 == HF fast.
+// 分词器抽象: 返回 text 的 token ids。
 std::vector<int32_t> tokenize(const TokenFeeder & tf, const std::string & text,
                               bool add_special, bool parse_special);
 
-// 查找特殊 token id: 对 "<|name|>" parse_special=true 分词取最后一个 id(前面的伪 token 忽略).
+// 查找特殊 token id: 对 "<|name|>" parse_special=true 分词取最后一个 id(前面的伪 token 忽略)。
 int32_t special_token_id(const TokenFeeder & tf, const char * special);
-
-// user_tokens: <|x|> -> <¦x¦> 再 add_special=False 分词
-std::vector<int32_t> user_tokens(const TokenFeeder & tf, const std::string & text);
-
-// encode(): 完整打包, 与 kev.model.encode(option_isolation=False) 对齐.
-// 模型无关: 决策 marker 取自 cfg (nullptr => 默认 Qwen3.5 marker)。若某 marker 在词表缺失
-// (special_token_id == -1), 返回空 KevEnc 且 *err 说明是哪个 marker 缺失/如何配置覆盖。
-// max_state/max_branch 语义: 返回状态是否被截断; 超限置 state_truncated / throw_on_overflow.
-KevEnc encode(const TokenFeeder & tf, const KevRequest & rec,
-              int max_state = 384, int max_branch = 1024,
-              std::string * err = nullptr, const KevDecisionConfig * cfg = nullptr);
-
-// rows_of(enc): 拆成 state + per-question rows.
-KevRows rows_of(const KevEnc & enc, std::string * err = nullptr);
 
 } // namespace kev

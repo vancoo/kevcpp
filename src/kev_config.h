@@ -18,7 +18,9 @@ namespace kev {
 //   option_end      "收尾/结束" marker: option 结束位置即 KEV 打分的 marker 位置 (SPECIAL[3] <|box_end|>)
 //   decide_marker   decide 收尾 marker: question 的 <decide> 位置隐层即为 KEV 的 pointer (SPECIAL[4] <|fim_suffix|>)
 struct KevDecisionConfig {
-    // ---- 旧 marker / 温度 (KEV 回退通道) ----
+    // ---- marker / 温度 (logits 主通道为主线; 这些 marker 字段被保留仅为向后兼容读入
+    //      旧版 --decide-config 的 "markers" 段, 不再参与 logits 判别(其按 prompt_template 拼装)。
+    //      供 model_card / 日志展示。可安全忽略。) ----
     std::string state_marker       = "<|fim_prefix|>";
     std::string question_marker    = "<|fim_middle|>";
     std::string option_start       = "<|box_start|>";
@@ -26,9 +28,10 @@ struct KevDecisionConfig {
     std::string decide_marker      = "<|fim_suffix|>";
     float       temperature        = 1.0f;
 
-    // ---- 生成式 logits 判别主通道 (路线 D / 已实测验证) ----
-    // enable_logits: true = 主决策通道用「填空式 prompt + 候选答案 token 的 logits + softmax」;
-    //                false = 回退到旧 KEV 半边点积打分(兼容旧行为)。
+    // ---- 生成式 logits 判别主通道 (模型无关) ----
+    // 注意: 「剔除 kev 兼容」后, kevcpp 的判别恒走 logits 主通道(不再有 KEV 半边点积回退)。
+    // enable_logits 字段被保留仅供旧配置文件的 "logits.enable" 键能正常解析(读入后被忽略);
+    // 实际是否走 logits 通道只取决于后端是否支持 read_logits(logits_channel_active)。
     bool enable_logits = true;
     // 填空式 prompt 模板(模型无关, 每问拼装)。可选占位符:
     //   {state}        用户 state 文本(原始上下文)
