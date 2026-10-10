@@ -84,10 +84,15 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     const int base = 1;
     const int branch_base = base + cap;
     const int scratch     = branch_base + kMaxBatch;
-    n_seq_max_ = scratch + 1;
+    const int n_prefix    = opt.prefix_capacity > 0 ? opt.prefix_capacity : 4;
+    const int prefix_base = scratch + 1;            // P2: 前缀 slot 池(在 scratch/branch 之后)
+    n_seq_max_ = prefix_base + n_prefix;
     scratch_seq_ = scratch;
     branch_seq_base_ = branch_base;
+    prefix_seq_base_ = prefix_base;                 // P2
+    prefix_capacity_ = n_prefix;                    // P2
     lru_ = PrefixLRU(cap, base);
+    prefix_lru_ = PrefixLRU(n_prefix, prefix_base); // P2: 稳定公共前缀的独立 LRU(按前缀 token ids 索引)
     n_threads_ = opt.n_threads > 0 ? opt.n_threads : (int) std::thread::hardware_concurrency();
     if (n_threads_ <= 0) n_threads_ = 1;
     if (n_threads_ > 32) n_threads_ = 32;
@@ -421,6 +426,20 @@ void softmax_scaled(const std::vector<float> & z, float temperature, std::vector
 
 } // namespace
 
+// P2: 稳定公共前缀 slot 查找/分配(logits 通道)。
+// 命中 -> 返回已缓存该前缀 token ids 的 seq(>= prefix_seq_base_); 未命中 -> 返回 -1 并经
+// *evict_seq 给出"需先 seq_clear 再 prefill"的旧槽, 由调用方 decode P[0..Dp) 后调 prefix_lru_.register_。
+// 无后端 / 前缀空 / 无空闲槽 -> 返回 -1(调用方回退"从 pos 0 全文解码")。
+int KevModel::prefix_slot(const std::vector<int32_t> & prefix_ids, int * evict_seq) {
+    if (evict_seq) *evict_seq = -1;
+    if (!backend_ || !backend_->ok() || prefix_ids.empty() || prefix_capacity_ <= 0) return -1;
+    int ev = -1;
+    auto [hit, seq] = prefix_lru_.lookup(prefix_ids, &ev);
+    if (hit) return seq;                 // 命中: 前缀 KV 已在 seq 中
+    if (evict_seq) *evict_seq = ev;      // 未命中: 待 prefill 的旧槽(可能为全新未用槽)
+    return -1;
+}
+
 // 生成式 logits 判别主通道(模型无关, 实测验证路线)。
 // 对每问: 用决策配置的 prompt_template 组装填空式 prompt, 把该问每个候选 key 作为"续写
 // 答案 token"(aggregation=first 取首个 token), 逐个作为支路 decode; 读该位置模型给该 token
@@ -483,50 +502,112 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         std::string err2;
 
         // ---- n_batch 安全解码 ----
-        // 根因修复(2026-10): llama.cpp 对单次 llama_decode 强断言 n_tokens_all <=
-        // cparams.n_batch(n_batch 默认 512)。旧路径把 K 个候选分支(K*(Lp+1) token)
-        // 一次塞进 decode_batch, 长 prompt + 多候选时总 token 远超 n_batch -> 崩溃。
-        // 做法: 依据后端实际 n_batch 限制每次 batch 的支路数; 单候选塞不下(Lp+1>n_batch)
-        // 或 batch 失败时, 退化为逐候选 decode, 且用 decode_seq_chunked 按 n_batch 分块,
-        // 确保任意单次 llama_decode 不超过 n_batch。
         const int32_t chunk = (backend_->n_batch() > 0) ? backend_->n_batch() : 512;
 
+        // ===================== P2: 稳定公共前缀缓存 =====================
+        // 结构: {instructions}\n[ {options} ]\n{state}\nAnswer:
+        //   [D0..Dp) = tpl 中 {state} 之前的部分(渲染 instructions/options) = 同任务不变的稳定前缀
+        //   [Dp..)   = state + "\nAnswer:"(每次请求变化)
+        // 仅当 P[0..Dp) 与单独 tokenize(前缀文本) 逐位相等(BPE merge 未跨界)时才可复用缓存 KV —
+        // 保证"从公共前缀续接 state"与"从 pos 0 全量解码"得到同一条 token 序列(后者回退路径逐位一致)。
+        int Dp = -1;                     // <0 = 本问不使用前缀缓存
+        std::vector<int32_t> Pg;         // 稳定前缀 token ids = 前缀缓存指纹
+        const bool want_prefix = decision_.cache_prefix && backend_ && backend_->ok();
+        if (want_prefix) {
+            const size_t sp = tpl.find("{state}");
+            if (sp != std::string::npos && tpl.find("{state}", sp + 7) == std::string::npos) {
+                std::string pfx_tpl = tpl.substr(0, sp);   // {state} 之前(不含 {state})
+                std::string pg_str = pfx_tpl;
+                auto rep_pfx = [&](const std::string & ph, const std::string & val) {
+                    size_t at = 0;
+                    while ((at = pg_str.find(ph, at)) != std::string::npos) { pg_str.replace(at, ph.size(), val); at += val.size(); }
+                };
+                std::string opts_str_pfx;
+                for (size_t oi = 0; oi < q.options.size(); ++oi) { if (oi) opts_str_pfx += ", "; opts_str_pfx += q.options[oi]; }
+                rep_pfx("{instructions}", q.instr);
+                rep_pfx("{options}", opts_str_pfx);
+                Pg = kev::tokenize(tf, pg_str, /*add_special=*/false, /*parse_special=*/false);
+                if (!Pg.empty() && (int)Pg.size() < Lp &&
+                    std::equal(Pg.begin(), Pg.end(), P.begin(), P.begin() + (int64_t)Pg.size())) {
+                    Dp = (int) Pg.size();
+                }
+            }
+        }
+        // 本问的前缀槽(base 之上); <0 表示无可用前缀槽(补齐到 pseq 需 prefesh 稳定前缀)。
+        int pseq = -1;
+        if (Dp > 0) {
+            int evict = -1;
+            pseq = prefix_slot(Pg, &evict);
+            if (pseq < 0 && evict >= 0) {
+                // 未命中: 在该槽 prefill 稳定前缀 [0..Dp)
+                if (backend_) backend_->seq_clear(evict);
+                std::vector<int32_t> out_pre;
+                std::vector<int32_t> head(P.begin(), P.begin() + Dp);
+                if (decode_seq_chunked(head, 0, evict, &err2, {}, out_pre, chunk)) {
+                    prefix_lru_.register_(Pg, evict);
+                    pseq = evict;
+                }
+            }
+        }
+        const bool use_prefix = (Dp > 0) && (pseq >= 0);
+        // 从公共前缀槽续接 tail(state+Answer [+候选]) 到 scratch_seq_: 清空->复制前缀->decode。
+        auto decode_tail_from_prefix = [&](const std::vector<int32_t> & tail, int32_t start_pos,
+                                           const std::vector<int32_t> & out_global, int pseq,
+                                           std::vector<int32_t> & out_local) -> bool {
+            if (backend_) backend_->seq_clear(scratch_seq_);
+            if (!backend_ || !backend_->seq_copy(pseq, scratch_seq_)) return false;
+            return decode_seq_chunked(tail, start_pos, scratch_seq_, &err2, out_global, out_local, chunk);
+        };
+
         if (!keep) {
-            // aggregation == "first"(默认, 优化路径):
-            //   单次 decode P(不含任何候选后缀), 标记末位置 Lp-1 输出"全量 logits"; 同一向量内
-            //   按 token_id 直接查每个候选首 token 的 logit。K 候选 = 1 次 decode(旧实现逐候选 /
-            //   分支都会把整段 prompt P 重算一遍, K 候选 = 多次 decode)。
-            //
-            //   语义等价论证(为什么成立):
-            //     旧实现每个候选走分支 "P + [cand_first]", 读位置 Lp-1(原始 prompt 最后一个 token)
-            //     对候选的 logit。位置 Lp-1 的 logits 由 causal 注意力在位置 [0..Lp-1](原始 prompt
-            //     全量) 上计算, 用于预测"下一个 token"; 拼接的候选 token 位于位置 Lp(=cand), 在
-            //     attention 中排在 Lp-1 之后、对 Lp-1 因果不可见, 因此不会改变 Lp-1 的 logits。
-            //     故 model.logits[Lp-1][cand] 在"P+[cand]"与"仅 P"两种 decode 里逐位相等。
-            //     读一次 P 末位置的全量 logits, 再按候选 token_id 查询(O(1)/每个) 等价于逐候选,
-            //     但只付一次解码成本。
-            backend_->seq_clear(scratch_seq_);
+            // aggregation == "first"(默认, 优化路径): 单次 decode, 末位置 Lp-1 输出全量 logits,
+            // 按候选首 token 直接查 logit(K 候选 = 1 次 decode)。
             std::vector<int32_t> out_local;
-            if (!decode_seq_chunked(P, 0, scratch_seq_, &err2, {Lp - 1}, out_local, chunk)) {
-                // 单次 decode 失败(如仍超 n_batch 或其它): 降级逐候选(结果等价, 不崩溃)。
-                std::fprintf(stderr,
-                    "kev_model: logits single-decode failed at q=%d (%s); degrading to per-key decode\n",
-                    k, err2.c_str());
-                for (int j = 0; j < K; ++j) {
-                    if (cand_first[j] < 0) { z[j] = 0.0f; continue; }
-                    std::vector<int32_t> ids = P; ids.push_back(cand_first[j]);
-                    backend_->seq_clear(scratch_seq_);
-                    std::vector<int32_t> out1;
-                    if (!decode_seq_chunked(ids, 0, scratch_seq_, &err2, {Lp - 1}, out1, chunk)) {
-                        std::fprintf(stderr,
-                            "kev_model: degraded logits seq decode failed at q=%d,key=%d (%s)\n",
-                            k, j, err2.c_str());
-                        if (err && err->empty()) *err = err2;
-                        return res;
+            bool done = false;
+            if (use_prefix) {
+                // P2 续接: 只解码 state+Answer(跳过重算稳定前缀)。
+                std::vector<int32_t> tail(P.begin() + Dp, P.end());
+                std::vector<int32_t> out_tail;
+                if (decode_tail_from_prefix(tail, Dp, {Lp - 1 - Dp}, pseq, out_tail) && !out_tail.empty()) {
+                    out_local = out_tail; done = true;
+                }
+            }
+            if (!done) {
+                // 回退: 从 pos 0 全新解码整条 P(既有路径, 保证功能/正确性不坏)。
+                if (backend_) backend_->seq_clear(scratch_seq_);
+                if (!decode_seq_chunked(P, 0, scratch_seq_, &err2, {Lp - 1}, out_local, chunk)) {
+                    // 单次 decode 失败(如仍超 n_batch 或其它): 降级逐候选(结果等价, 不崩溃)。
+                    std::fprintf(stderr,
+                        "kev_model: logits single-decode failed at q=%d (%s); degrading to per-key decode\n",
+                        k, err2.c_str());
+                    for (int j = 0; j < K; ++j) {
+                        if (cand_first[j] < 0) { z[j] = 0.0f; continue; }
+                        std::vector<int32_t> ids = P; ids.push_back(cand_first[j]);
+                        if (backend_) backend_->seq_clear(scratch_seq_);
+                        std::vector<int32_t> out1;
+                        if (!decode_seq_chunked(ids, 0, scratch_seq_, &err2, {Lp - 1}, out1, chunk)) {
+                            std::fprintf(stderr,
+                                "kev_model: degraded logits seq decode failed at q=%d,key=%d (%s)\n",
+                                k, j, err2.c_str());
+                            if (err && err->empty()) *err = err2;
+                            return res;
+                        }
+                        float lt = 0;
+                        if (out1.empty() || !backend_->read_logits(out1[0], cand_first[j], &lt, &err2)) lt = 0.0f;
+                        z[j] = lt;
                     }
-                    float lt = 0;
-                    if (out1.empty() || !backend_->read_logits(out1[0], cand_first[j], &lt, &err2)) lt = 0.0f;
-                    z[j] = lt;
+                } else {
+                    const int32_t out_idx = out_local.empty() ? -1 : out_local[0];
+                    for (int j = 0; j < K; ++j) {
+                        if (cand_first[j] < 0) { z[j] = 0.0f; continue; }
+                        float lt = 0;
+                        if (out_idx < 0 || !backend_->read_logits(out_idx, cand_first[j], &lt, &err2)) {
+                            std::fprintf(stderr, "kev_model: read_logits failed at q=%d,key=%d (%s); using 0\n",
+                                         k, j, err2.c_str());
+                            lt = 0.0f;
+                        }
+                        z[j] = lt;
+                    }
                 }
             } else {
                 const int32_t out_idx = out_local.empty() ? -1 : out_local[0];
@@ -537,8 +618,6 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                 for (int j = 0; j < K; ++j) {
                     if (cand_first[j] < 0) { z[j] = 0.0f; continue; }
                     float lt = 0;
-                    // read_logits 内部取 llama_get_logits_ith(ctx, out_idx)[token_id], 即 P 末位置
-                    // 的全量 logits 里该候选 token 的下标项; O(1) 查询, 无额外 decode。
                     if (!backend_->read_logits(out_idx, cand_first[j], &lt, &err2)) {
                         std::fprintf(stderr, "kev_model: read_logits failed at q=%d,key=%d (%s); using 0\n",
                                      k, j, err2.c_str());
@@ -550,15 +629,27 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         } else {
             // "sum"/"mean": 逐候选 decode(P + 全 key token), 读每 token 位置的 logits 并聚合。
             for (int j = 0; j < K; ++j) {
-                std::vector<int32_t> ids = P;
-                ids.insert(ids.end(), cand_tok[j].begin(), cand_tok[j].end());
                 const int32_t M = (int32_t) cand_tok[j].size();
                 if (M == 0) { z[j] = 0.0f; continue; }
+                std::vector<int32_t> ids;
                 std::vector<int32_t> out_global;
-                for (int m = 0; m < M; ++m) out_global.push_back(Lp - 1 + m);   // 预测第 m 个候选 token 的位置
-                backend_->seq_clear(scratch_seq_);
+                bool okd;
+                if (use_prefix) {
+                    ids.insert(ids.end(), P.begin() + Dp, P.end());
+                    for (int m = 0; m < M; ++m) out_global.push_back((Lp - 1 - Dp) + m);
+                    ids.insert(ids.end(), cand_tok[j].begin(), cand_tok[j].end());
+                } else {
+                    ids = P;
+                    for (int m = 0; m < M; ++m) out_global.push_back(Lp - 1 + m);
+                    ids.insert(ids.end(), cand_tok[j].begin(), cand_tok[j].end());
+                }
                 std::vector<int32_t> out_local;
-                if (!decode_seq_chunked(ids, 0, scratch_seq_, &err2, out_global, out_local, chunk)) {
+                if (use_prefix) okd = decode_tail_from_prefix(ids, Dp, out_global, pseq, out_local);
+                else {
+                    if (backend_) backend_->seq_clear(scratch_seq_);
+                    okd = decode_seq_chunked(ids, 0, scratch_seq_, &err2, out_global, out_local, chunk);
+                }
+                if (!okd) {
                     std::fprintf(stderr, "kev_model: logits seq decode failed (%s)\n", err2.c_str());
                     if (err && err->empty()) *err = err2;
                     return res;

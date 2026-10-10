@@ -159,6 +159,9 @@ bool load_decision_config(const std::string & file, KevDecisionConfig & cfg, std
                 } else if (path == "logits.enable") {
                     bool v = raw == "true" || raw == "1";
                     c->enable_logits = v;
+                } else if (path == "logits.cache_prefix") {
+                    bool v = raw == "true" || raw == "1";
+                    c->cache_prefix = v;
                 }
             }
             return 1;

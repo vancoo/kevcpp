@@ -46,6 +46,10 @@ struct KevDecisionConfig {
     //   ""      = 自动(choice -> 各 criteria key; noul -> false/true; score -> 0..L-1)
     //   "choice"|"noul"|"score" 显式覆盖(模型无关; 通常留 "" 即可)
     std::string logits_type = "";
+    // P2 前缀缓存(P2, 模型无关): true = 同一类任务把"稳定公共前缀"{instructions}\n[ {options} ]\n
+    // 的 KV 缓存进前缀 slot, 每个请求从此前缀续接 state+Answer, 跳过重算稳定前段; false = 回到
+    // "从 pos 0 全新解码整条 prompt"(A/B 对照, 逐位一致)。默认 true。
+    bool cache_prefix = true;
 };
 
 // 默认决策配置(原版 Qwen3.5)。
@@ -60,7 +64,8 @@ inline KevDecisionConfig default_decision_config() { return KevDecisionConfig{};
 //        "enable": true,
 //        "prompt_template": "...",
 //        "aggregation": "first",
-//        "logits_type": ""
+//        "logits_type": "",
+//        "cache_prefix": true
 //     }
 //   }
 // 缺省字段沿用默认值。返回 false 且 *err 说明原因(文件打不开 / JSON 语法错 / 某字段类型错)。

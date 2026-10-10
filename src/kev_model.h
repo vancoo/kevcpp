@@ -48,8 +48,11 @@ struct KevModelOptions {
     int n_ctx          = 2048;
     int n_threads      = 0;      // 0 = auto
     int lru_capacity   = 2;      // 状态缓存 slot 数
+    // P2 前缀缓存槽位数(缓存"稳定公共前缀"{instructions}\n[ {options} ]\n 的 KV)。同一类任务的
+    // 多请求共享同一前缀 -> 只需 1~2 个槽即命中; 不同 instructions/options 任务各占一个 LRU 槽。
+    int prefix_capacity = 4;
     std::string backend = "cpu"; // pluggable backend name (default "cpu")
-    // 派生: n_seq_max = lru_capacity + 1(scratch) + kMaxBatch(branch 池)。
+    // 派生: n_seq_max = lru_capacity + 1(scratch) + kMaxBatch(branch 池) + prefix_capacity(前缀池)。
 };
 
 class KevModel {
@@ -144,14 +147,22 @@ private:
     // 从上次 decode 的 output 取 hidden[1024](经 backend read_hidden)
     std::vector<float> hidden_at_output(int out_idx, std::string * err);
 
+    // P2 前缀缓存(logits 通道): 稳定公共前缀 slot 查找/分配(返回缓存该前缀 token ids 的 seq)。
+    // 命中返回已缓存的前缀 seq; 未命中返回 -1 并经 *evict_seq 给出"需先 seq_clear 再 prefill"的
+    // 旧槽(调用方 decode P[0..Dp) 到该槽后调 register_)。不可缓存(无后端/前缀空)返回 -1。
+    int prefix_slot(const std::vector<int32_t> & prefix_ids, int * evict_seq);
+
     std::unique_ptr<Backend> backend_;
     // 路线 A: 无权重 KEV 打分器(替代旧 PointerHead)。kevhead_.dim/temperature 由 init 设入。
     KevKevHead   kevhead_;
     KevDecisionConfig decision_;   // 已解析的决策配置(marker + 温度)
-    PrefixLRU    lru_{2, 1};
+    PrefixLRU    lru_{2, 1};       // state-prefix LRU(KEV 回退通道)
+    PrefixLRU    prefix_lru_{4, 1}; // P2: 稳定公共前缀 LRU(logits 通道; base/capacity 在 init 覆写)
     int n_seq_max_   = 0;
     int scratch_seq_ = 1;
     int branch_seq_base_ = 1;
+    int prefix_seq_base_ = 1;      // P2: 前缀 slot 的起始 seq(高于 scratch + branch 池)
+    int prefix_capacity_ = 4;      // P2: 前缀槽位数
     int n_threads_   = 0;
     bool batch_enabled_ = true;
     bool ok_         = false;

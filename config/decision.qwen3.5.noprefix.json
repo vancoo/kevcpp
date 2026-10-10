@@ -1,0 +1,18 @@
+{
+  "_comment": "P2 A/B: 同 decision.qwen3.5.json 但 cache_prefix=false(关闭 P2 前缀缓存, 回到从 pos 0 全量解码)。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\nAnswer:",
+    "aggregation": "first",
+    "logits_type": "",
+    "cache_prefix": false
+  }
+}
