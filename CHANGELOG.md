@@ -46,6 +46,23 @@
 - **`.gitignore`**：新增对临时/实验产物的忽略规则（`logs/`、`microbench/`、`repro_*.json`、
   `tests/tmp_*`、`kab_*`、`*.docx` 等），保持仓库干净。
 
+### Added（方案3：logits 决策映射层轻量校准，无训练权重）
+
+- **校准机制（模型无关，默认关闭 = 原始行为，可回退）**
+  - `src/kev_config.h/.cpp`：`KevDecisionConfig` 新增 `LogitsCalibration calib` 子配置
+    （`enable` / `temperature_mode`(single|by_n) / `temperature` / `position_debias` /
+    `drop_low_conf` / `params_file`），JSON `calib.*` 解析；全部默认关闭。
+  - 新增 `src/kev_calibrate.h/.cpp`：`LogitsCalibrator` 只调「候选 logits → 概率」的决策映射
+    （温度桶 / 去位置偏置 / 低置信拒绝），不触碰模型权重、不改 llama 前向；附带参数文件读写。
+  - `src/kev_model.cpp` `probs_logits`（`:406` 起、缩放行原 `:667`）：末尾统一走
+    `calibrator_.apply(z, probs)`；关闭时逐位保持 `softmax(z / decision.temperature)`。新增
+    `raw_logits()`（取候选原始 logits）与 `rebuild_calibrator()`。
+  - `src/kev_api.cpp` `to_answers`：`choice` 增加低置信拒绝（`conf < drop_low_conf` → 置空 +
+    `low_confidence:true`），默认 0 = 原行为。
+  - 新增 `src/calib_harness.cpp` + CMake 目标 `calib_harness`（离线收集候选 logits，
+    统计基线 / 位置偏置 / 网格搜 T / 阈值，固定测试集回归）。样例数据 `calib/data_*.json`。
+  - 样例启用配置 `config/decision.qwen3.5.calib.json`（opt-in，默认加载关闭）。
+
 ### Fixed
 
 - `README.md` 旧文案中 `main_server.exe`、以及「Vulkan 为未构建扩展点 / ARCHIVED」等过时描述已更正。

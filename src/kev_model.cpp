@@ -110,6 +110,8 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     if (opt.temperature_override > 0.0f) decision_.temperature = opt.temperature_override;
     if (!opt.option_end_override.empty()) decision_.option_end = opt.option_end_override;
     if (!opt.decide_marker_override.empty()) decision_.decide_marker = opt.decide_marker_override;
+    // 方案3: 按决策配置构建 logits 决策映射校准器(默认恒等/关闭)。
+    rebuild_calibrator(err);
 
     // Pluggable backend: load by name (default "cpu"), then init it with the
     // same llama parameters the legacy single-module KevModel used.
@@ -402,6 +404,46 @@ KevModel::ProbsResult KevModel::probs(const KevRequest & req, std::string * err)
     return probs(enc, err);
 }
 
+// 方案3: 只取候选 key 的原始 logits(不应用校准映射的 softmax 概率)。校准/评测 harness 用。
+bool KevModel::raw_logits(const KevRequest & req, std::vector<std::vector<float>> & out,
+                          std::string * err) {
+    out.clear();
+    if (!logits_channel_active()) { if (err && err->empty()) *err = "logits channel inactive"; return false; }
+    std::string e2;
+    const bool prev_enabled = decision_.calib.enabled;
+    // 只收集原始 logits, 不应用校准映射(临时关闭校准, 后续由 harness 离线应用)。
+    decision_.calib.enabled = false;
+    calibrator_.enabled = false;
+    probs_logits(req, &e2, &out);
+    decision_.calib.enabled = prev_enabled;
+    calibrator_.enabled = prev_enabled;
+    if (out.empty() && !e2.empty()) {
+        if (err && err->empty()) *err = e2;
+        return false;
+    }
+    return true;
+}
+
+// 方案3: 按 decision_.calib 重建校准器(含可选的 params_file 加载)。模型无关。
+void KevModel::rebuild_calibrator(std::string * err) {
+    const LogitsCalibration & c = decision_.calib;
+    calibrator_.enabled = c.enabled;
+    calibrator_.temperature_mode = c.temperature_mode;
+    calibrator_.single_T = c.temperature > 0.0f ? c.temperature : decision_.temperature;
+    if (calibrator_.single_T <= 0.0f) calibrator_.single_T = 1.0f;
+    calibrator_.position_bias = c.position_bias;
+    calibrator_.drop_low_conf = c.drop_low_conf;
+    calibrator_.by_n_T.clear();
+    if (!c.params_file.empty()) {
+        std::string perr;
+        if (!calibrator_.load(c.params_file, &perr) && err && err->empty()) *err = perr;
+    }
+    if (c.enabled && calibrator_.temperature_mode == "by_n" && calibrator_.by_n_T.empty()) {
+        // by_n 但无分桶文件: 退化回单档(single_T), 仍生效(诚实)。
+        calibrator_.temperature_mode = "single";
+    }
+}
+
 bool KevModel::logits_channel_active() const {
     return decision_.enable_logits && backend_ &&
            backend_->ok() && backend_->vocab_n_tokens() > 0;
@@ -445,7 +487,8 @@ int KevModel::prefix_slot(const std::vector<int32_t> & prefix_ids, int * evict_s
 // 答案 token"(aggregation=first 取首个 token), 逐个作为支路 decode; 读该位置模型给该 token
 // 的 logits; 对全体候选做相对 softmax(可选 /temperature), 得各 key 概率。候选之间相对比较,
 // 不做全局 argmax。
-KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string * err) {
+KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string * err,
+                                             std::vector<std::vector<float>> * raw_out) {
     ProbsResult res;
     double t0 = now_ms();
     const int Q = (int) req.questions.size();
@@ -664,7 +707,17 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
             }
         }
 
-        softmax_scaled(z, decision_.temperature, probs[k]);
+        if (raw_out) {
+            // 收集候选 key 的原始 logits(校准/缩放前), 供校准 harness 离线统计。
+            if (raw_out->size() <= (size_t) k) raw_out->resize((size_t) k + 1);
+            (*raw_out)[k] = z;
+        }
+        // 方案3: 决策映射层校准(默认关闭 = 原行为 softmax(z / decision.temperature))。
+        if (calibrator_.enabled) {
+            calibrator_.apply(z, probs[k]);
+        } else {
+            softmax_scaled(z, decision_.temperature, probs[k]);
+        }
         qms[k] = now_ms() - tq0;
     }
     res.t_rows_ms = 0.0; for (double x : qms) res.t_rows_ms += x;

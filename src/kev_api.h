@@ -30,8 +30,11 @@ struct ParsedSystemOne {
 bool parse_systemone(const nlohmann::json & body, ParsedSystemOne & out, std::string * err);
 
 // to_answers: probs[Q][K] + meta -> 每问答案 dict(见 api.py)。
+// drop_low_conf>0 时, 对 choice 类型: 若 argmax 归一化置信 < drop_low_conf, 则把 choice 置空
+// 并加 "low_confidence":true(不改概率表, 只拒绝硬选)。默认 0 = 保持原始行为。
 nlohmann::json to_answers(const std::vector<std::vector<float>> & probs,
-                          const std::vector<SystemOneMeta> & meta);
+                          const std::vector<SystemOneMeta> & meta,
+                          float drop_low_conf = 0.0f);
 
 // 一次 /v1/systemone 服务: 解析->probs->answers->响应 JSON。
 // t_model_ms 由调用方传入(记录模型耗时)。err 非空表示 422。

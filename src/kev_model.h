@@ -19,6 +19,7 @@
 #include "kev_kevhead.h"
 #include "kev_prefix.h"
 #include "kev_backend_factory.h"
+#include "kev_calibrate.h"
 
 #include <cstdint>
 #include <memory>
@@ -84,6 +85,12 @@ public:
     ProbsResult probs(const KevRequest & req, std::string * err = nullptr);
     ProbsResult probs(const KevEnc & enc, std::string * err = nullptr);
 
+    // 方案3: 取「生成式 logits 判别通道」每个候选 key 的原始 logits(softmax 缩放前), [Q][K]。
+    // 供校准/评测 harness 离线统计使用(无需 re-decode 即可网格搜温度/去偏置)。模型无关。
+    // err 非空且失败时在其中说明原因; 返回 false。
+    bool raw_logits(const KevRequest & req, std::vector<std::vector<float>> & out,
+                    std::string * err = nullptr);
+
     // 生成式 logits 判别主通道是否生效(enable_logits 且后端支持 read_logits)。
     bool logits_channel_active() const;
 
@@ -114,6 +121,12 @@ public:
     // 已解析的决策配置(marker + 温度), 供调用方/日志/model_card 读取。
     const KevDecisionConfig & decision_config() const { return decision_; }
 
+    // 方案3: 当前生效的 logits 决策映射校准器(默认恒等)。供决策层(API)读取 drop_low_conf /
+    // 归一化置信, 应用低置信拒绝。
+    const LogitsCalibrator & calibrator() const { return calibrator_; }
+    // 按 decision_.calib 重建校准器(含加载 params_file)。供 init 与校准 harness 在拟合后调。
+    void rebuild_calibrator(std::string * err = nullptr);
+
     // Pluggable backend metadata (reported in /v1/models + startup log)
     const char * backend_name()   const { return backend_ ? backend_->name()   : "(none)"; }
     const char * backend_device() const { return backend_ ? backend_->device() : "(none)"; }
@@ -127,7 +140,9 @@ private:
 
     // 生成式 logits 判别主通道(模型无关, 填空式 prompt + 候选答案 token logits + softmax)。
     // req 的 questions[].keys 提供每问候选答案 key; 见决策配置 enable_logits/prompt_template/aggregation。
-    ProbsResult probs_logits(const KevRequest & req, std::string * err);
+    // 可选 *raw_out: 非空时把每问"候选 key 的原始 logits"([Q][K], 校准/缩放前)写入。
+    ProbsResult probs_logits(const KevRequest & req, std::string * err,
+                             std::vector<std::vector<float>> * raw_out = nullptr);
 
     // 解码 token 序列(续接在 start_pos 之后,写入 seq)。经 backend。
     bool decode_seq(const std::vector<int32_t> & tokens, int start_pos, int seq,
@@ -166,6 +181,8 @@ private:
     int n_threads_   = 0;
     bool batch_enabled_ = true;
     bool ok_         = false;
+    // 方案3: logits 决策映射层校准器(默认恒等; 由 decision_.calib 构建)。
+    LogitsCalibrator calibrator_;
     // P0b: 串行化所有访问共享 llama ctx/lru/scratch 的计算段。
     std::mutex compute_mutex_;
 };
