@@ -1,0 +1,17 @@
+{
+  "_comment": "临时验证用：旧模板次序（{state} 在前）。仅用于 A/B 对比，非生产配置。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{state}\n{instructions}\n[ {options} ]\nAnswer:",
+    "aggregation": "first",
+    "logits_type": ""
+  }
+}

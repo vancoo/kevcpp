@@ -10,7 +10,7 @@
   "temperature": 1.0,
   "logits": {
     "enable": true,
-    "prompt_template": "{state}\n{instructions}\n[ {options} ]\nAnswer:",
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\nAnswer:",
     "aggregation": "first",
     "logits_type": ""
   }
