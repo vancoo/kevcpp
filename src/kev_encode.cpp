@@ -8,6 +8,37 @@
 
 namespace kev {
 
+// 从决策配置解析 5 个 marker 的 token id; 任一缺失/非原子 token 则 *err 给出清晰错误并返回 false。
+// 模型无关: 一个合法 marker 必须是词表中的"单个原子 token"(即真正的 special token, 如
+// <|box_end|> tokenize 得 1 个 id)。若配置的 marker 在词表里不存在, tokenize 会把字面量
+// 拆成多个普通 BPE token(fallback), 这里拒绝之并给出可操作的错误信息。
+namespace {
+struct MarkerIds { int32_t state, question, opt_start, opt_end, decide; };
+bool resolve_markers(const TokenFeeder & tf, const KevDecisionConfig & cfg,
+                     MarkerIds & ids, std::string * err) {
+    auto need = [&](const char * name, const std::string & marker, int32_t & out) -> bool {
+        auto v = tokenize(tf, marker, /*add_special=*/false, /*parse_special=*/true);
+        if (v.size() != 1) {
+            if (err && err->empty()) {
+                *err = std::string("model lacks decision marker '") + name + "' = \"" + marker
+                     + "\": it is not a single token in this model's vocabulary (tokenized to "
+                     + std::to_string((long) v.size()) + " token(s)). "
+                       "Configure an existing marker via --decide-config / --opt-end / --decide-token / KevDecisionConfig.";
+            }
+            return false;
+        }
+        out = v[0];
+        return true;
+    };
+    ids.state     = -1; ids.question = -1; ids.opt_start = -1; ids.opt_end = -1; ids.decide = -1;
+    return need("state",       cfg.state_marker,    ids.state)
+        && need("question",    cfg.question_marker, ids.question)
+        && need("option_start",cfg.option_start,    ids.opt_start)
+        && need("option_end",  cfg.option_end,      ids.opt_end)
+        && need("decide",      cfg.decide_marker,   ids.decide);
+}
+} // namespace
+
 std::vector<int32_t> tokenize(const TokenFeeder & tf, const std::string & text,
                               bool add_special, bool parse_special) {
     if (!tf.tokenize) return {};
@@ -37,8 +68,13 @@ std::vector<int32_t> user_tokens(const TokenFeeder & tf, const std::string & tex
 }
 
 KevEnc encode(const TokenFeeder & tf, const KevRequest & rec,
-              int max_state, int max_branch, std::string * err) {
+              int max_state, int max_branch, std::string * err, const KevDecisionConfig * cfg) {
     KevEnc e;
+    // 模型无关: marker 来自注入配置(默认 Qwen3.5)。缺失则报清晰错误。
+    const KevDecisionConfig & dc = cfg ? *cfg : default_decision_config();
+    MarkerIds mid;
+    if (!resolve_markers(tf, dc, mid, err)) return e;
+
     // state
     auto state_tokens = user_tokens(tf, rec.state);
     if ((int) state_tokens.size() + 1 > max_state) {
@@ -46,11 +82,11 @@ KevEnc encode(const TokenFeeder & tf, const KevRequest & rec,
         state_tokens.resize((size_t) std::max(0, max_state - 1));
         e.labels.resize(rec.questions.size(), -1);
     }
-    const int32_t S0 = special_token_id(tf, SPECIAL[0]);
-    const int32_t q_id = special_token_id(tf, SPECIAL[1]);
-    const int32_t o_id = special_token_id(tf, SPECIAL[2]);
-    const int32_t c_id = special_token_id(tf, SPECIAL[3]);
-    const int32_t d_id = special_token_id(tf, SPECIAL[4]);
+    const int32_t S0 = mid.state;
+    const int32_t q_id = mid.question;
+    const int32_t o_id = mid.opt_start;
+    const int32_t c_id = mid.opt_end;
+    const int32_t d_id = mid.decide;
 
     e.ids.push_back(S0);
     e.seg.push_back(0);

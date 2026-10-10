@@ -45,6 +45,7 @@ enum kev_backend_capability {
     KEV_BACKEND_CAP_BATCH_DECODE = 1u << 0,  // decode_batch is implemented
     KEV_BACKEND_CAP_SEQ_MEMORY   = 1u << 1,  // seq_clear / seq_copy implemented
     KEV_BACKEND_CAP_HIDDEN_READ  = 1u << 2,  // read_hidden implemented
+    KEV_BACKEND_CAP_LOGITS_READ  = 1u << 3,  // read_logits implemented
 };
 
 // Version of the kev_backend_ops layout.
@@ -137,6 +138,19 @@ typedef struct kev_backend_ops {
     int         (*seq_clear)(kev_backend_t * b, int32_t seq);
     int         (*seq_copy)(kev_backend_t * b, int32_t src, int32_t dst);
 
+    // Read the logit the model assigns to `token_id` at the most recent decode's
+    // out_idx-th output position. `out_idx` uses the SAME index semantics as
+    // read_hidden (the llama_batch row-major index / llama output row for that
+    // position). Returns 0 on success and writes *out; non-zero on error (e.g.
+    // the position was not marked for output, lm_head / logits disabled, or
+    // token_id out of vocab range).
+    // NOTE: requires the backend context to have lm_head enabled (see
+    // kev_backend_params.lm_head) so the lm_head projection is computed.
+    int         (*read_logits)(kev_backend_t * b, int32_t out_idx, int32_t token_id,
+                               float * out);
+    // Number of tokens (vocab size) of the loaded model's vocabulary.
+    int32_t     (*vocab_n_tokens)(kev_backend_t * b);
+
     // capacity / sizing
     int32_t     (*n_ctx_seq_capacity)(kev_backend_t * b);
     int32_t     (*count_tokens)(kev_backend_t * b, const char * text);  // GGUF tokenizer
@@ -166,6 +180,14 @@ typedef struct kev_backend_ops {
     // special_token_id: id of the "<|name|>" special token (parse_special=true),
     // or -1 if not found.
     int32_t     (*special_token_id)(kev_backend_t * b, const char * special);
+
+    // n_batch: the backend context's logical max tokens per llama_decode call
+    // (its cparams.n_batch, default 512). KevModel uses this to size batch groups
+    // and to chunk long sequences so a single decode never exceeds n_batch (which
+    // would trigger llama.cpp's n_tokens_all <= n_batch assert). Appended at the
+    // END (never reorder); a backend that predates this field returns 0 and the
+    // host falls back to a conservative capacity.
+    int32_t     (*n_batch)(kev_backend_t * b);
 } kev_backend_ops;
 
 // Factory entry points every backend dll must export.

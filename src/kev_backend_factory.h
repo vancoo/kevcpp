@@ -75,6 +75,10 @@ public:
                     const std::vector<int32_t> & logits_pos = {});
     bool decode_batch(const std::vector<BackendBranch> & branches, std::string * err);
     std::vector<float> read_hidden(int32_t out_idx, std::string * err);
+    // read the logit the model assigns to token_id at the out_idx-th recent output
+    // position (same index semantics as read_hidden). Requires lm_head enabled.
+    bool read_logits(int32_t out_idx, int32_t token_id, float * out, std::string * err);
+    int32_t vocab_n_tokens() const;
     bool seq_clear(int32_t seq);
     bool seq_copy(int32_t src, int32_t dst);
 
@@ -82,6 +86,8 @@ public:
     int32_t model_n_embd() const;
     int32_t threads() const;
     int32_t threads_batch() const;
+    // Logical max tokens per llama_decode (cparams.n_batch). 0 if unsupported.
+    int32_t n_batch() const;
 
     // Opaque tokenizer/vocab handle (castable to const llama_vocab* only by a
     // consumer that itself links llama — single-llama rule).

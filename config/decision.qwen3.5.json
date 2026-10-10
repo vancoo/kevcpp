@@ -1,0 +1,17 @@
+{
+  "_comment": "kevcpp 路线A+D: 模型无关的决策配置 (marker + 温度 + 生成式 logits 判别主通道)。换模型改这份配置即可, 无需改代码。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{state}\n{instructions}\n[ {options} ]\nAnswer:",
+    "aggregation": "first",
+    "logits_type": ""
+  }
+}

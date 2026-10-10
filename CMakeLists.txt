@@ -111,6 +111,8 @@ add_executable(m3_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_kevhead.cpp
+    src/kev_config.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -128,6 +130,8 @@ add_executable(m5_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_kevhead.cpp
+    src/kev_config.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -146,6 +150,8 @@ add_executable(m7_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_kevhead.cpp
+    src/kev_config.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -167,6 +173,8 @@ add_executable(main_server
     src/main_server.cpp
     src/kev_api.cpp
     src/kev_model.cpp
+    src/kev_kevhead.cpp
+    src/kev_config.cpp
     src/kev_prefix.cpp
     src/kev_encode.cpp
     src/kev_head.cpp
@@ -206,6 +214,8 @@ add_executable(m8_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_kevhead.cpp
+    src/kev_config.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -241,6 +251,8 @@ add_executable(kab_bench
     src/kev_encode.cpp
     src/kev_prefix.cpp
     src/kev_model.cpp
+    src/kev_kevhead.cpp
+    src/kev_config.cpp
     src/kev_merge.cpp
     src/kev_backend_factory.cpp
     src/kev_backend_cpu.cpp
@@ -270,6 +282,8 @@ add_executable(lora_ab
     src/lora_ab.cpp
     src/kev_api.cpp
     src/kev_model.cpp
+    src/kev_kevhead.cpp
+    src/kev_config.cpp
     src/kev_prefix.cpp
     src/kev_encode.cpp
     src/kev_head.cpp
@@ -351,4 +365,17 @@ if (KEV_BUILD_BACKEND_VULKAN)
     set_target_properties(kev-backend-vulkan PROPERTIES
         OUTPUT_NAME "kev-backend-vulkan"
         PREFIX "")
+endif()
+
+# ---- 仅追加 ---- 
+# 路线 A: 无权重 KEV 打分器数值自检 (最小测试, 无框架; 纯数学, 不链接 llama)。
+add_executable(kev_kevhead_selftest
+    src/kev_kevhead_selftest.cpp
+    src/kev_kevhead.cpp
+    src/kev_config.cpp
+)
+target_link_libraries(kev_kevhead_selftest PRIVATE)
+target_compile_features(kev_kevhead_selftest PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(kev_kevhead_selftest PRIVATE /utf-8)
 endif()

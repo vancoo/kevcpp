@@ -1,0 +1,17 @@
+{
+  "_comment": "KEV 旧通道回退测试配置: enable_logits=false 时走旧 KEV 半边点积打分(而非 logits 主通道)。markers 需在目标模型词表中存在(通用 Qwen3.5 若缺 box 类 marker, encode 会给出清晰报错——这是既有行为, 属预期)。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": false,
+    "prompt_template": "{state}\n{instructions}\n[ {options} ]\nAnswer:",
+    "aggregation": "first",
+    "logits_type": ""
+  }
+}

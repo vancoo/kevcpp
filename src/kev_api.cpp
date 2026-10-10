@@ -133,7 +133,7 @@ bool parse_systemone(const json & body, ParsedSystemOne & out, std::string * err
             return errf(type + " '" + qid + "' needs 1.." + std::to_string(MAX_OPTIONS) + " options");
         m.keys = question_keys(type, type == "score" ? q["criteria"] : q["criteria"]);
 
-        KevQuestion kq; kq.instr = instr; kq.options = opts;
+        KevQuestion kq; kq.instr = instr; kq.options = opts; kq.keys = m.keys;
         out.rec.questions.push_back(std::move(kq));
         out.meta.push_back(std::move(m));
     }
@@ -225,8 +225,11 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
     }
 
     auto t0 = std::chrono::steady_clock::now();
-    // P.1: 复用已算好的 enc, 避免 probs(req) 内部再 encode+rows_of 一遍(消除原两次重复 encode + 正则重写)。
-    auto res = model.probs(enc, &enc_err);
+    // 生成式 logits 判别主通道(enable_logits)时, 打分走结构化 req(含各问候选 keys);
+    // 否则走旧 KEV 路径, 复用已算好的 enc(避免重复 encode)。响应/概率结构语义不变。
+    auto res = model.logits_channel_active()
+        ? model.probs(ps.rec, &enc_err)
+        : model.probs(enc, &enc_err);
     double model_ms = (double) std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count() / 1e3;
     if (TR) t_probs_c = now_us() - w;

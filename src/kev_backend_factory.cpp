@@ -121,6 +121,20 @@ std::vector<float> Backend::read_hidden(int32_t out_idx, std::string * err) {
     return out;
 }
 
+bool Backend::read_logits(int32_t out_idx, int32_t token_id, float * out, std::string * err) {
+    if (!handle_ || !ops_.read_logits) { set_err(err, "backend does not support read_logits (plugin ABI too old)"); return false; }
+    if (!out) { set_err(err, "null out"); return false; }
+    if (ops_.read_logits(handle_, out_idx, token_id, out) != 0) {
+        set_err(err, "read_logits failed (position not marked for output or lm_head disabled)");
+        return false;
+    }
+    return true;
+}
+
+int32_t Backend::vocab_n_tokens() const {
+    return (handle_ && ops_.vocab_n_tokens) ? ops_.vocab_n_tokens(handle_) : 0;
+}
+
 bool Backend::seq_clear(int32_t seq) {
     return handle_ && ops_.seq_clear && ops_.seq_clear(handle_, seq) == 0;
 }
@@ -139,6 +153,9 @@ int32_t Backend::threads() const {
 }
 int32_t Backend::threads_batch() const {
     return (handle_ && ops_.threads_batch) ? ops_.threads_batch(handle_) : 0;
+}
+int32_t Backend::n_batch() const {
+    return (handle_ && ops_.n_batch) ? ops_.n_batch(handle_) : 0;
 }
 void * Backend::vocab_opaque() const {
     return (handle_ && ops_.vocab_opaque) ? (void *) ops_.vocab_opaque(handle_) : nullptr;

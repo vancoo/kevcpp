@@ -1,0 +1,29 @@
+{
+  "_comment": "kevcpp 路线A+D: 决策配置模板 (marker + 温度 + 生成式 logits 判别主通道)。markers 列出的 5 个 token 必须都存在于目标模型的词表中(否则启动/请求时会给清晰报错); 字段缺省时沿用默认(Qwen3.5)。",
+  "_schema": {
+    "markers.state":        "状态段起始 marker token (KEV 回退通道用)",
+    "markers.question":     "每个 question 起始 marker token (KEV 回退通道用)",
+    "markers.option_start": "每个 option 起始 marker token (KEV 回退通道用)",
+    "markers.option_end":   "option 结束位置 token == KEV 打分取的 marker 隐层 (默认 <|box_end|>)",
+    "markers.decide":       "question 收尾/decide marker token == KEV pointer 隐层位置",
+    "temperature":          "softmax 温度 (同时作用于 KEV 与 logits softmax, 除以 T; 默认 1.0)",
+    "logits.enable":        "true=主决策通道用「填空式 prompt + 候选答案 token logits + softmax」(已实测验证); false=回退旧 KEV 半边点积",
+    "logits.prompt_template": "填空式 prompt 模板(模型无关)。占位符 {state}/{instructions}/{options}; 末尾保留一个提示续写候选答案 token 的接续(如 'Answer:')。**避免'列选项再让模型选A/B'式**, 会引入位置偏置",
+    "logits.aggregation":   "多 token 候选聚合: 'first'(取候选 key 首 token logit, 默认, 与验证一致) | 'sum' | 'mean'",
+    "logits.logits_type":   "候选来源覆盖: ''(自动: choice=criteria keys, noul=false/true, score=0..L-1) | 'choice' | 'noul' | 'score'"
+  },
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{state}\n{instructions}\n[ {options} ]\nAnswer:",
+    "aggregation": "first",
+    "logits_type": ""
+  }
+}

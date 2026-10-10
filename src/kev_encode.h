@@ -3,13 +3,17 @@
 // 目标: 与 E:\van\projects\kev\kev\model.py 的 encode()/user_tokens()/rows_of() 逐 token/逐索引
 // 对齐。分词用 GGUF 自带 llama_tokenize(等价于 HF fast tokenizer, 已对拍确认)。
 //
-//   SPECIAL = ["<|fim_prefix|>","<|fim_middle|>","<|box_start|>","<|box_end|>","<|fim_suffix|>"]
-//       SPECIAL[0]=state 开头; q/o/c/d = SPECIAL[1..3]; d(decide)=SPECIAL[4].
+//   DEFAULT_SPECIAL = ["<|fim_prefix|>","<|fim_middle|>","<|box_start|>","<|box_end|>","<|fim_suffix|>"]
+//       [0]=state 开头; q/o/c/d = [1..3]; d(decide)=[4]. 这些只是"默认值"(原版 Qwen3.5):
+//       路线 A 要求模型无关, marker 一律从注入的 KevDecisionConfig 读取(见 kev_config.h),
+//       不再在编码路径写死某个模型的 marker。encode() 传入 cfg==nullptr 时使用默认值。
 //   user_tokens(tok,text): <|x|> -> <¦x¦> 后 add_special_tokens=False 分词.
 //   encode(): [<state>...] 每个 question [<q> instr <o> opt </o>... <decide>].
 //       ids/seg/pos/opt/decide_idx/opt_idx 与 Python 一致. opt: OPT_NONE=-1(指令), j(选项span), OPT_DECIDE=-2(decide).
 //   rows_of(enc): 拆成 state_ids/state_pos + 每问 branch row(ids/pos/decide/opts 相对偏移).
 #pragma once
+
+#include "kev_config.h"
 
 #include <cstdint>
 #include <string>
@@ -41,6 +45,8 @@ struct TokenFeeder {
 constexpr int32_t OPT_NONE  = -1;
 constexpr int32_t OPT_DECIDE = -2;
 
+// 默认 marker 数组(原版 Qwen3.5), 与 KevDecisionConfig 默认完全一致。仅供默认; 编码路径
+// 实际上读取传入的 KevDecisionConfig(encode 的 cfg 参数) 中的 marker, 而不是直接索引本常量。
 const char * const SPECIAL[5] = {
     "<|fim_prefix|>", "<|fim_middle|>", "<|box_start|>", "<|box_end|>", "<|fim_suffix|>"};
 
@@ -49,6 +55,10 @@ struct KevOption { std::string text; };
 struct KevQuestion {
     std::string instr;
     std::vector<std::string> options;
+    // 每题判别的候选 key(choice: criteria keys; noul: ["false","true"]; score: ["0".."L-1"])。
+    // 由 API 层(parse_systemone)填充, 供「生成式 logits 判别」通道用作候选答案 token 来源;
+    // encode() 本身不依赖它, 空时 logits 通道会按 options 推导。
+    std::vector<std::string> keys;
 };
 
 struct KevRequest {
@@ -93,10 +103,12 @@ int32_t special_token_id(const TokenFeeder & tf, const char * special);
 std::vector<int32_t> user_tokens(const TokenFeeder & tf, const std::string & text);
 
 // encode(): 完整打包, 与 kev.model.encode(option_isolation=False) 对齐.
+// 模型无关: 决策 marker 取自 cfg (nullptr => 默认 Qwen3.5 marker)。若某 marker 在词表缺失
+// (special_token_id == -1), 返回空 KevEnc 且 *err 说明是哪个 marker 缺失/如何配置覆盖。
 // max_state/max_branch 语义: 返回状态是否被截断; 超限置 state_truncated / throw_on_overflow.
 KevEnc encode(const TokenFeeder & tf, const KevRequest & rec,
               int max_state = 384, int max_branch = 1024,
-              std::string * err = nullptr);
+              std::string * err = nullptr, const KevDecisionConfig * cfg = nullptr);
 
 // rows_of(enc): 拆成 state + per-question rows.
 KevRows rows_of(const KevEnc & enc, std::string * err = nullptr);

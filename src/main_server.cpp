@@ -56,7 +56,7 @@ static std::string request_id(const httplib::Request & req) {
 
 static json model_card(const kev::KevModel & m, const std::string & base) {
     json card;
-    card["description"] = "Kev pointer head on " + base + " (kevcpp C++ CPU serving)";
+    card["description"] = "KEV joint-head decision model on " + base + " (Route A: weightless KEV scoring, no LoRA/head, model-agnostic markers)";
     card["release_date"] = "unknown";
     card["run"] = "kevcpp";
     card["base"] = base;
@@ -66,6 +66,10 @@ static json model_card(const kev::KevModel & m, const std::string & base) {
     card["backend_version"] = m.backend_version();
     card["dtype"] = "fp32";
     card["temperature"] = m.temperature();
+    const auto & dc = m.decision_config();
+    card["decision_markers"] = {{"state", dc.state_marker}, {"question", dc.question_marker},
+                                {"option_start", dc.option_start}, {"option_end", dc.option_end},
+                                {"decide", dc.decide_marker}};
     card["prefix_cache"] = {{"size", m.lru().capacity()}, {"cached_states", (int) m.lru().contents().size()}};
     return card;
 }
@@ -74,7 +78,10 @@ int main(int argc, char ** argv) {
     std::string model_path, head, lora_path, host = "127.0.0.1";
     std::string prewarm_file;   // 可选: 启动预热 state 文本文件(--prewarm <file>)
     std::string backend = "cpu";  // pluggable backend (default "cpu")
-    int port = 8008, lru = 2, threads = 0, ctx = -1; float lora_scale = 1.0f;
+    std::string decision_config_file;   // 可选: 决策配置 JSON (模型无关 marker + 温度)
+    std::string opt_end_override;       // 可选: 覆盖 option_end marker (--opt-end)
+    std::string decide_token_override;  // 可选: 覆盖 decide marker (--decide-token)
+    int port = 8008, lru = 2, threads = 0, ctx = -1; float lora_scale = 1.0f, temperature = 0.0f;
     bool quiet = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -90,12 +97,20 @@ int main(int argc, char ** argv) {
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--backend") backend = next();
         else if (a == "--prewarm") prewarm_file = next();
+        else if (a == "--decide-config") decision_config_file = next();
+        else if (a == "--temperature") temperature = (float) std::atof(next().c_str());
+        else if (a == "--opt-end") opt_end_override = next();
+        else if (a == "--decide-token") decide_token_override = next();
         else if (a == "--quiet") quiet = true;
         else if (a == "--help" || a == "-h") {
             std::fprintf(stderr,
               "usage: main_server --model gguf [options]\n"
-              "  --head <bin>        pointer head .bin\n"
+              "  --head <bin>        [Route A 已弃用/忽略] 旧的独立 pointer head .bin(不再加载)\n"
               "  --lora <gguf>       LoRA adapter (optional); --lora-scale f\n"
+              "  --decide-config <json> 决策配置(marker + 温度), 模型无关; 见 config/ (optional)\n"
+              "  --temperature f     KEV softmax 温度 (default 1.0; 覆盖 config)\n"
+              "  --opt-end <token>   覆盖 option_end marker (如 <|box_end|>; 覆盖 config)\n"
+              "  --decide-token <token> 覆盖 decide marker(question 收尾, pointer 位置; 覆盖 config)\n"
               "  --host ip  --port p listen address/port (default 127.0.0.1:8008)\n"
               "  --threads N / -t N  compute threads (0 or unset = auto detect cores, cap 32)\n"
               "  --ctx N             context size (default 8192; 2048 typical for short states)\n"
@@ -109,7 +124,7 @@ int main(int argc, char ** argv) {
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: main_server --model model.gguf [--head head.bin] [--host ip] [--port p] [--lru n] [--lora lora.gguf] [--lora-scale f] [--threads N] [--ctx N] [--prewarm file] [--quiet]\n");
+        std::fprintf(stderr, "usage: main_server --model model.gguf [--decide-config cfg.json] [--host ip] [--port p] [--lru n] [--lora lora.gguf] [--lora-scale f] [--temperature f] [--opt-end tok] [--threads N] [--ctx N] [--prewarm file] [--quiet]\n");
         return 2;
     }
 
@@ -132,14 +147,21 @@ int main(int argc, char ** argv) {
     kev::KevModelOptions opt;
     opt.model_path = model_path; opt.head_path = head; opt.lru_capacity = lru;
     opt.n_ctx = ctx > 0 ? ctx : 8192; opt.n_threads = threads; opt.backend = backend;
+    opt.decision_config = decision_config_file;
+    opt.temperature_override = temperature > 0.0f ? temperature : 0.0f;
+    opt.option_end_override  = opt_end_override;
+    opt.decide_marker_override = decide_token_override;
     if (!lora_path.empty()) { opt.lora_path = lora_path; opt.lora_scale = lora_scale; }
     kev::KevModel model;
     std::string err;
     if (!model.init(opt, &err)) { std::fprintf(stderr, "kevcpp error: init failed: %s\n", err.c_str()); return 1; }
     if (!quiet) {
-        std::fprintf(stderr, "kevcpp server model ready (n_embd=%d temp=%.3f head=%s lora=%s)\n",
+        const auto & dc = model.decision_config();
+        std::fprintf(stderr, "kevcpp server model ready (n_embd=%d temp=%.3f KEV-scoring head=%s "
+                     "opt_end=%s lora=%s)\n",
                  model.n_seq_max() ? model.dim_in() : 0, model.temperature(),
-                 head.empty() ? "-" : head.c_str(), lora_path.empty() ? "-" : lora_path.c_str());
+                 head.empty() ? "- (weightless KEV)" : head.c_str(),
+                 dc.option_end.c_str(), lora_path.empty() ? "-" : lora_path.c_str());
         std::fprintf(stderr, "kevcpp using backend '%s' (device=%s, ver=%s)\n",
                  model.backend_name(), model.backend_device(), model.backend_version());
         std::fprintf(stderr, "kevcpp using %d threads %s (n_threads_batch=%d)\n",
@@ -253,9 +275,9 @@ int main(int argc, char ** argv) {
         auto card = [&](const std::string & name) {
             json c;
             c["name"] = name;
-            c["description"] = "Kev pointer head on Qwen3.5-0.8B (kevcpp C++ CPU serving)";
+            c["description"] = "KEV joint-head decision model (Route A: weightless KEV scoring, model-agnostic)";
             c["release_date"] = "unknown";
-            c["base"] = "qwen3.5-0.8b";
+            c["base"] = model_path;
             c["backend"] = "llama.cpp";
             c["backend_name"] = model.backend_name();
             c["backend_device"] = model.backend_device();

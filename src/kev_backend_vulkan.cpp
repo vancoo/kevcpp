@@ -222,6 +222,22 @@ int op_read_hidden(kev_backend_t * b, int32_t out_idx, float * out, size_t out_c
     return 0;
 }
 
+int op_read_logits(kev_backend_t * b, int32_t out_idx, int32_t token_id, float * out) {
+    KevVulkanBackend * kb = as_vulkan(b);
+    if (!kb || !kb->ctx || !out || !kb->vocab) return 1;
+    float * lt = llama_get_logits_ith(kb->ctx, out_idx);
+    if (!lt) return 1;   // position not marked for output / logits disabled
+    const int nv = llama_vocab_n_tokens(kb->vocab);
+    if (token_id < 0 || token_id >= nv) return 1;
+    *out = lt[token_id];
+    return 0;
+}
+
+int32_t op_vocab_n_tokens(kev_backend_t * b) {
+    KevVulkanBackend * kb = as_vulkan(b);
+    return (kb && kb->vocab) ? (int32_t) llama_vocab_n_tokens(kb->vocab) : 0;
+}
+
 int op_seq_clear(kev_backend_t * b, int32_t seq) {
     KevVulkanBackend * kb = as_vulkan(b);
     if (!kb || !kb->ctx) return 1;
@@ -243,6 +259,11 @@ int op_seq_copy(kev_backend_t * b, int32_t src, int32_t dst) {
 int32_t op_n_ctx_seq_capacity(kev_backend_t * b) {
     KevVulkanBackend * kb = as_vulkan(b);
     return (kb && kb->ctx) ? (int32_t) llama_n_ctx_seq(kb->ctx) : 0;
+}
+
+int32_t op_n_batch(kev_backend_t * b) {
+    KevVulkanBackend * kb = as_vulkan(b);
+    return (kb && kb->ctx) ? (int32_t) llama_n_batch(kb->ctx) : 0;
 }
 
 int32_t op_count_tokens(kev_backend_t * b, const char * text) {
@@ -323,7 +344,8 @@ KEV_BACKEND_API kev_backend_meta KEVVK_GET_META(void) {
     m.name         = "vulkan";
     m.device       = "vulkan";
     m.version      = "kev-backend-vulkan-0.1-static-ggml-vulkan";
-    m.capabilities = KEV_BACKEND_CAP_BATCH_DECODE | KEV_BACKEND_CAP_SEQ_MEMORY | KEV_BACKEND_CAP_HIDDEN_READ;
+    m.capabilities = KEV_BACKEND_CAP_BATCH_DECODE | KEV_BACKEND_CAP_SEQ_MEMORY | KEV_BACKEND_CAP_HIDDEN_READ
+                     | KEV_BACKEND_CAP_LOGITS_READ;
     m.struct_size  = sizeof(kev_backend_meta);
     return m;
 }
@@ -347,6 +369,9 @@ KEV_BACKEND_API kev_backend_ops KEVVK_GET_OPS(void) {
         g_ops.vocab_opaque    = op_vocab_opaque;
         g_ops.tokenize        = op_tokenize;
         g_ops.special_token_id = op_special_token_id;
+        g_ops.read_logits     = op_read_logits;
+        g_ops.vocab_n_tokens  = op_vocab_n_tokens;
+        g_ops.n_batch         = op_n_batch;
     }
     return g_ops;
 }

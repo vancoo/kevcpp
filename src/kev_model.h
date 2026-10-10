@@ -1,14 +1,14 @@
-// kev_model.h — 组装层: llama 上下文 + 编码器 + PointerHead + 状态前缀缓存 (M3)
+// kev_model.h — 组装层: llama 上下文 + 编码器 + 无权重 KEV 打分器 + 状态前缀缓存 (M3)
 //
 // 对应 kev 的 DecisionModel 接口子集(probs / encode / prefix 缓存), 纯 CPU, 混合架构 hybrid 走 row form:
 //   - state 只 prefill 一次(缓存到 LRU slot 的 KV + Gated DeltaNet 反复式状态)。
 //   - 每个 question 作为 continue row: llama_memory_seq_cp(slot -> scratch), 只解码 branch,
-//     于 decide/</opt> 取 hidden, 过 PointerHead 得概率。
+//     于 decide/</opt> 取 hidden, 过无权重 KEV 打分(KevKevHead::probs) 得概率。
 //   - prefix_min_tokens=0(hybrid)。
 //   - 同 state 的后续请求命中缓存, 不重跑 state prefill。
 //
 // Pluggable-backend (ARCHIVE): KevModel 保留全部组装/编排(LRU、encode 组装、rows 规划、
-// PointerHead、compute_mutex_、n_seq 布局 —— 均不扰动), 但 llama/ggml 算子耦合全部改经
+// KEV 打分、compute_mutex_、n_seq 布局 —— 均不扰动), 但 llama/ggml 算子耦合全部改经
 // kev::Backend*(来自 kev_backend_factory/BACKEND C-ABI) 调用, 不再直接调 llama_*。见
 // docs/portable_backend_deployment.md。encode/tokenize 也经后端: 由 backend 的
 // token_feeder()(delegated tokenize/special_token_id, llama-free) 提供(single-llama: 见文档)。
@@ -16,6 +16,7 @@
 
 #include "kev_encode.h"
 #include "kev_head.h"
+#include "kev_kevhead.h"
 #include "kev_prefix.h"
 #include "kev_backend_factory.h"
 
@@ -29,12 +30,21 @@ namespace kev {
 
 struct KevModelOptions {
     std::string model_path;
-    std::string head_path;
+    std::string head_path;      // 兼容旧客户代码: 保留字段但路线 A 不再强制加载/使用。
     std::string lora_path;      // 可选 llama.cpp GGUF lora 适配器 (M5)
     float       lora_scale = 1.0f;
     // merged-LoRA: 把 lora_path fold 进 model_path 的 Q8_0 权重, 前向走单份权重。
     bool        merge_lora = false;
     std::string merged_model_path;   // 可选: merged GGUF 的落盘位置
+    // 决策配置(模型无关 marker + temperature)。原版 Qwen3.5 用默认; 换模型改这里或
+    // decision_config 文件。temperature / option_end 等旧 CLI 覆盖项也回填到这里。
+    KevDecisionConfig decision;
+    std::string decision_config;   // 可选 JSON 决策配置文件路径 (加载后覆盖 decision; 见 config/)
+    // 便捷覆盖项(CLI): --temperature / --opt-end / --decide-token。非空/+0 则覆盖 decision。
+    // 优先级: decision_config 文件 < 如下 CLI 覆盖项 (CLI 显式覆盖始终胜出)。
+    float       temperature_override  = 0.0f;  // >0 时覆盖 decision.temperature
+    std::string option_end_override;          // 非空时覆盖 decision.option_end
+    std::string decide_marker_override;       // 非空时覆盖 decision.decide_marker
     int n_ctx          = 2048;
     int n_threads      = 0;      // 0 = auto
     int lru_capacity   = 2;      // 状态缓存 slot 数
@@ -71,6 +81,9 @@ public:
     ProbsResult probs(const KevRequest & req, std::string * err = nullptr);
     ProbsResult probs(const KevEnc & enc, std::string * err = nullptr);
 
+    // 生成式 logits 判别主通道是否生效(enable_logits 且后端支持 read_logits)。
+    bool logits_channel_active() const;
+
     bool prewarm_state(const std::vector<int32_t> & state_ids);
     bool warm_graph(bool warm_branch = true, int state_tokens = 38, int branch_tokens = 151,
                     std::string * err = nullptr);
@@ -92,8 +105,11 @@ public:
 
     int count_tokens(const std::string & text) const;
 
-    int   dim_in()  const { return head_.dim_in(); }
-    float temperature() const { return head_.temperature(); }
+    int   dim_in()  const { return kevhead_.dim(); }
+    float temperature() const { return kevhead_.temperature(); }
+
+    // 已解析的决策配置(marker + 温度), 供调用方/日志/model_card 读取。
+    const KevDecisionConfig & decision_config() const { return decision_; }
 
     // Pluggable backend metadata (reported in /v1/models + startup log)
     const char * backend_name()   const { return backend_ ? backend_->name()   : "(none)"; }
@@ -106,17 +122,32 @@ private:
                                                    std::vector<std::vector<float>> * out_hidden = nullptr,
                                                    std::vector<double> * rows_ms = nullptr);
 
+    // 生成式 logits 判别主通道(模型无关, 填空式 prompt + 候选答案 token logits + softmax)。
+    // req 的 questions[].keys 提供每问候选答案 key; 见决策配置 enable_logits/prompt_template/aggregation。
+    ProbsResult probs_logits(const KevRequest & req, std::string * err);
+
     // 解码 token 序列(续接在 start_pos 之后,写入 seq)。经 backend。
     bool decode_seq(const std::vector<int32_t> & tokens, int start_pos, int seq,
                     std::string * err, const std::vector<int32_t> & logits_pos);
     // P.4: 单次 decode 多个等长 branch(共享 state 前缀)。经 backend。
     bool decode_batch(const std::vector<BackendBranch> & branches, std::string * err);
 
+    // n_batch 安全解码: 把 ids 切成 <= chunk 的若干段, 逐段 decode_seq 续写同一 seq,
+    // 使单次 llama_decode 的 token 数不超过后端 cparams.n_batch(llama.cpp 会 GGML_ASSERT
+    // n_tokens_all <= n_batch, 长 prompt + 多候选时会把总 token 顶爆而崩溃)。所有要读的
+    // 输出位置(0-base 于 ids 内的 out_global)必须落在最后一段; 成功时把它们的 read_logits/
+    // read_hidden 索引(g 减该段起点)写回 out_local。
+    bool decode_seq_chunked(const std::vector<int32_t> & ids, int start_pos, int seq,
+                            std::string * err, const std::vector<int32_t> & out_global,
+                            std::vector<int32_t> & out_local, int chunk);
+
     // 从上次 decode 的 output 取 hidden[1024](经 backend read_hidden)
     std::vector<float> hidden_at_output(int out_idx, std::string * err);
 
     std::unique_ptr<Backend> backend_;
-    PointerHead  head_;
+    // 路线 A: 无权重 KEV 打分器(替代旧 PointerHead)。kevhead_.dim/temperature 由 init 设入。
+    KevKevHead   kevhead_;
+    KevDecisionConfig decision_;   // 已解析的决策配置(marker + 温度)
     PrefixLRU    lru_{2, 1};
     int n_seq_max_   = 0;
     int scratch_seq_ = 1;
