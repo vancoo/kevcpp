@@ -225,7 +225,12 @@ int KevModel::prefix_slot(const std::vector<int32_t> & prefix_ids, int * evict_s
 }
 
 // logits 通道该请求的输入 token 数 = 各问中最长 prompt 的 token 数。
+// P0 (concurrency): 该函数在锁外被 API 层(kev_api.cpp logits_input_tokens 预检)并发调用,
+// 其内部 kev::tokenize → llama_tokenize 访问共享 llama_vocab(session 态、非线程安全)。
+// 故在此取同一把 compute_mutex_, 使“任意时刻至多一个线程在分词”, 与 probs_logits 内受锁
+// 保护的 tokenize 串行, 消除真并发下的资料竞争崩溃。锁内只做渲染+分词, 无重入, 无死锁。
 int KevModel::logits_input_tokens(const KevRequest & req) const {
+    std::lock_guard<std::mutex> lock(compute_mutex_);
     if (!backend_ || !backend_->ok()) return 0;
     const TokenFeeder tf = backend_->token_feeder();
     const std::string & tpl = decision_.prompt_template;
@@ -479,6 +484,7 @@ bool KevModel::warm_graph(int state_tokens, int branch_tokens, std::string * err
 }
 
 int KevModel::count_tokens(const std::string & text) const {
+    std::lock_guard<std::mutex> lock(compute_mutex_);
     if (!backend_) return 0;
     return (int) kev::tokenize(backend_->token_feeder(), text,
                                /*add_special=*/false, /*parse_special=*/false).size();

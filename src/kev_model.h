@@ -141,7 +141,10 @@ private:
     int n_threads_   = 0;
     bool ok_         = false;
     // P0b: 串行化所有访问共享 llama ctx/scratch/前缀槽 的计算段。
-    std::mutex compute_mutex_;
+    // P0 (concurrency): mutable, 以使 count_tokens()/logits_input_tokens() 等 const 方法
+    // 也能把锁外四处运行的 kev::tokenize 对共享 llama_vocab 的访问纳入同一把互斥锁, 消除
+    // 跨线程并发llama_tokenize 的资料竞争(崩溃/UB)。二者均在锁内不重入, 无死锁。
+    mutable std::mutex compute_mutex_;
 };
 
 } // namespace kev
