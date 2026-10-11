@@ -1,0 +1,28 @@
+{
+  "_comment": "kevcpp 决策配置: 内联 few_shot.examples(不依赖外部文件)的变体。不设 prompt_template 的 {fewshot} 占位符 -> 示例段会自动紧跟 {instructions} 之后插入(仍落在 {state} 前稳定前缀内)。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\nAnswer:",
+    "aggregation": "first",
+    "logits_type": ""
+  },
+  "few_shot": {
+    "enabled": true,
+    "examples": [
+      { "state_text": "某企业与市政府签署合作框架协议投资50亿元建设产业园。", "answer_key": "投资" },
+      { "state_text": "市自然资源局挂牌出让一宗工业用地, 制造企业竞得并缴纳出让金。", "answer_key": "购地" },
+      { "state_text": "多栋标准厂房完成主体封顶, 进入外立面施工阶段。", "answer_key": "厂房" },
+      { "state_text": "新增产线投产试运行, 新设备进入调试, 设计年产能3万套。", "answer_key": "产线产能" },
+      { "state_text": "交易中心公示某工程中标候选人, 拟中标单位为本地建筑集团。", "answer_key": "中标" },
+      { "state_text": "政府召开安全生产专项整治会议, 部署隐患排查整改。", "answer_key": "其他" }
+    ]
+  }
+}

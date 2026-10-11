@@ -122,9 +122,10 @@ private:
                             std::string * err, const std::vector<int32_t> & out_global,
                             std::vector<int32_t> & out_local, int chunk);
 
-    // 填空式 prompt 渲染({state}/{instructions}/{options} 占位替换)。
-    static std::string render_prompt(const std::string & tpl, const KevQuestion & q,
-                                     const KevRequest & req, const std::vector<std::string> & opts);
+    // 填空式 prompt 渲染({state}/{instructions}/{options}/{fewshot} 占位替换; few-shot 见
+    // decision_.fewshot; 模板无 {fewshot} 时示例段自动紧跟 {instructions} 之后)。
+    std::string render_prompt(const std::string & tpl, const KevQuestion & q,
+                              const KevRequest & req, const std::vector<std::string> & opts) const;
 
     // P2 前缀缓存(logits 通道): 稳定公共前缀 slot 查找/分配(返回缓存该前缀 token ids 的 seq)。
     // 命中返回已缓存的前缀 seq; 未命中返回 -1 并经 *evict_seq 给出"需先 seq_clear 再 prefill"的

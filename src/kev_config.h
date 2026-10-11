@@ -1,4 +1,4 @@
-// kev_config.h — 决策配置 (模型无关 marker + 温度) 与轻量 JSON 加载
+// kev_config.h — 决策配置 (模型无关 marker + 温度 + few-shot) 与轻量 JSON 加载
 //
 // 路线 A 的核心: 不再把 Qwen3.5 的 <|box_start|>/<|box_end|> 等 marker 硬编码进代码路径,
 // 而是放到一份"决策配置"(KevDecisionConfig)里, 对任意开源 GGUF 可按模型指定 marker/temperature。
@@ -7,6 +7,8 @@
 #pragma once
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace kev {
 
@@ -49,6 +51,24 @@ struct KevDecisionConfig {
     //   ""      = 自动(choice -> 各 criteria key; noul -> false/true; score -> 0..L-1)
     //   "choice"|"noul"|"score" 显式覆盖(模型无关; 通常留 "" 即可)
     std::string logits_type = "";
+
+    // ---- 决策示例 (in-context few-shot, 模型无关) ----
+    // 在 prompt 里插入一组"决策示例"(state_text -> answer_key), 引导模型更准地续写候选答案,
+    // 不训练权重。示例是固定的(同一批示例对每请求一致), 均放在稳定公共前缀里(默认在
+    // {instructions} 之后、{state} 之前), 不破坏 P2 前缀缓存。
+    // prompt_template 用占位符 {fewshot} 指定插入位置(缺省则插在 {instructions} 之后)。
+    struct FewShot {
+        bool enabled = false;
+        // 内联示例:(state_text, answer_key)。answer_key 必须是该 question 的候选 key 之一
+        // (choice: criteria key; noul: 注意要匹配 "false"/"true")。
+        std::vector<std::pair<std::string, std::string>> examples;
+        // 外部示例库文件路径(可选, 相对进程工作目录): 与内联 examples 二选一或并存
+        // (都启用时先内联后文件)。文件是 JSON, 根可以是数组或 {"examples": [...]},
+        // 每项 {"state_text": "...", "answer_key": "..."}。
+        std::string examples_file;
+        // 渲染成放回 prompt 的 few-shot 段文本(模板/换行由模型无关的实现决定)。
+        std::string render() const;
+    } fewshot;
     // P2 前缀缓存(P2, 模型无关): true = 同一类任务把"稳定公共前缀"{instructions}\n[ {options} ]\n
     // 的 KV 缓存进前缀 slot, 每个请求从此前缀续接 state+Answer, 跳过重算稳定前段; false = 回到
     // "从 pos 0 全新解码整条 prompt"(A/B 对照, 逐位一致)。默认 true。
@@ -69,6 +89,11 @@ inline KevDecisionConfig default_decision_config() { return KevDecisionConfig{};
 //        "aggregation": "first",
 //        "logits_type": "",
 //        "cache_prefix": true
+//     },
+//     "few_shot": {                       // 可选 in-context 决策示例 (模型无关, 默认关闭)
+//        "enabled": true,
+//        "examples": [ { "state_text": "...", "answer_key": "..." }, ... ],  // 内联示例
+//        "examples_file": "config/fewshot_cn.json"                           // 或外部示例库文件
 //     }
 //   }
 // 缺省字段沿用默认值。返回 false 且 *err 说明原因(文件打不开 / JSON 语法错 / 某字段类型错)。

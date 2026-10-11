@@ -171,24 +171,50 @@ bool KevModel::logits_channel_active() const {
     return backend_ && backend_->ok() && backend_->vocab_n_tokens() > 0;
 }
 
-// 填空式 prompt 渲染({state}/{instructions}/{options} 占位替换)。
-std::string KevModel::render_prompt(const std::string & tpl, const KevQuestion & q,
-                                    const KevRequest & req,
-                                    const std::vector<std::string> & opts) {
+// 填空式 prompt 渲染({state}/{instructions}/{options}/{fewshot} 占位替换)。
+namespace {
+// 渲染模板占位符的共享实现(render_prompt 与 P2 前缀缓存路径共用, 保证逐位一致):
+//   - 模板含 `{fewshot}` 占位符时: 用 fs_segment 替换(未启用/空示例则置空)。
+//   - 模板不含 `{fewshot}` 且启用了 few-shot(fs_enabled 且 fs_segment 非空)时: 把示例段
+//     自动紧跟 `{instructions}` 之后插入(落在 {state} 前的稳定前缀内, 不破坏 P2 缓存)。
+// state 用于完整 prompt; 渲染前缀(pfx_tpl, 不含 {state})时传空即可(该段无 {state} 占位)。
+std::string kev_render_template(const std::string & tpl,
+                                const std::string & state,
+                                const std::string & instr,
+                                const std::string & opts,
+                                bool fs_enabled, const std::string & fs_segment) {
     std::string p = tpl;
-    auto rep = [&](const std::string & ph, const std::string & val) {
+    auto rep_all = [&](const std::string & ph, const std::string & val) {
         size_t at = 0;
         while ((at = p.find(ph, at)) != std::string::npos) { p.replace(at, ph.size(), val); at += val.size(); }
     };
+    const bool has_fs_ph = p.find("{fewshot}") != std::string::npos;
+    if (has_fs_ph) {
+        rep_all("{fewshot}", (fs_enabled && !fs_segment.empty()) ? fs_segment : std::string());
+    } else if (fs_enabled && !fs_segment.empty()) {
+        rep_all("{instructions}", instr + fs_segment);
+        rep_all("{options}", opts);
+        rep_all("{state}", state);
+        return p;
+    }
+    rep_all("{instructions}", instr);
+    rep_all("{options}", opts);
+    rep_all("{state}", state);
+    return p;
+}
+} // namespace
+
+std::string KevModel::render_prompt(const std::string & tpl, const KevQuestion & q,
+                                    const KevRequest & req,
+                                    const std::vector<std::string> & opts) const {
+    const bool fs_enabled = decision_.fewshot.enabled && !decision_.fewshot.examples.empty();
+    const std::string fs_seg = fs_enabled ? decision_.fewshot.render() : std::string();
     std::string opts_str;
     for (size_t i = 0; i < opts.size(); ++i) {
         if (i) opts_str += ", ";
         opts_str += opts[i];
     }
-    rep("{state}", req.state);
-    rep("{instructions}", q.instr);
-    rep("{options}", opts_str);
-    return p;
+    return kev_render_template(tpl, req.state, q.instr, opts_str, fs_enabled, fs_seg);
 }
 
 namespace {
@@ -257,6 +283,10 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
     const int nv = backend_->vocab_n_tokens();
     if (nv <= 0) { if (err && err->empty()) *err = "vocab unavailable (read_logits unsupported or lm_head disabled)"; return res; }
 
+    // 决策示例(模型无关): 每请求固定 -> 其渲染文本并入稳定公共前缀, 不破坏 P2 缓存。
+    const bool fs_enabled = decision_.fewshot.enabled && !decision_.fewshot.examples.empty();
+    const std::string fs_seg = fs_enabled ? decision_.fewshot.render() : std::string();
+
     std::vector<std::vector<float>> probs(Q);
     std::vector<double> qms(Q, 0.0);
     std::lock_guard<std::mutex> lock(compute_mutex_);
@@ -298,15 +328,11 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
             const size_t sp = tpl.find("{state}");
             if (sp != std::string::npos && tpl.find("{state}", sp + 7) == std::string::npos) {
                 std::string pfx_tpl = tpl.substr(0, sp);   // {state} 之前(不含 {state})
-                std::string pg_str = pfx_tpl;
-                auto rep_pfx = [&](const std::string & ph, const std::string & val) {
-                    size_t at = 0;
-                    while ((at = pg_str.find(ph, at)) != std::string::npos) { pg_str.replace(at, ph.size(), val); at += val.size(); }
-                };
+                // 用与完整 prompt 完全相同的渲染逻辑(含 {fewshot}/自动插入), 保证前缀文本逐位一致。
                 std::string opts_str_pfx;
                 for (size_t oi = 0; oi < q.options.size(); ++oi) { if (oi) opts_str_pfx += ", "; opts_str_pfx += q.options[oi]; }
-                rep_pfx("{instructions}", q.instr);
-                rep_pfx("{options}", opts_str_pfx);
+                std::string pg_str = kev_render_template(pfx_tpl, /*state=*/"", q.instr, opts_str_pfx,
+                                                         fs_enabled, fs_seg);
                 Pg = kev::tokenize(tf, pg_str, /*add_special=*/false, /*parse_special=*/false);
                 if (!Pg.empty() && (int)Pg.size() < Lp &&
                     std::equal(Pg.begin(), Pg.end(), P.begin(), P.begin() + (int64_t)Pg.size())) {
