@@ -10,11 +10,7 @@
     "logits.enable":        "true=主决策通道用「填空式 prompt + 候选答案 token logits + softmax」(已实测验证); false=回退旧 KEV 半边点积",
     "logits.prompt_template": "填空式 prompt 模板(模型无关)。占位符 {state}/{instructions}/{options}; 末尾保留一个提示续写候选答案 token 的接续(如 'Answer:')。**避免'列选项再让模型选A/B'式**, 会引入位置偏置",
     "logits.aggregation":   "多 token 候选聚合: 'first'(取候选 key 首 token logit, 默认, 与验证一致) | 'sum' | 'mean'",
-    "logits.logits_type":   "候选来源覆盖: ''(自动: choice=criteria keys, noul=false/true, score=0..L-1) | 'choice' | 'noul' | 'score'",
-    "logits.cache_prefix":  "P2 稳定公共前缀缓存: true=同任务共享 {state} 之前稳定前缀的 KV(默认); false=从 pos 0 全文解码",
-    "few_shot.enabled":     "true=在 prompt 插入 in-context 决策示例(不训练权重, 模型无关)。默认 false",
-    "few_shot.examples":    "内联示例数组: 每项 {state_text, answer_key}(answer_key 须为该 question 候选 key 之一)",
-    "few_shot.examples_file": "外部示例库 JSON 路径(根为数组或 {\"examples\":[...]}, 每项 {state_text,answer_key}); 与内联可并存"
+    "logits.logits_type":   "候选来源覆盖: ''(自动: choice=criteria keys, noul=false/true, score=0..L-1) | 'choice' | 'noul' | 'score'"
   },
   "markers": {
     "state":        "<|fim_prefix|>",

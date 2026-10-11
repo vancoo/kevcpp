@@ -71,8 +71,6 @@ static json model_card(const kev::KevModel & m, const std::string & base) {
                                 {"decide", dc.decide_marker}};
     card["prefix_cache"] = {{"size", m.prefix_cache().capacity()},
                             {"cached_prefixes", (int) m.prefix_cache().contents().size()}};
-    card["few_shot"] = {{"enabled", dc.fewshot.enabled},
-                        {"n_examples", (int) dc.fewshot.examples.size()}};
     return card;
 }
 
@@ -255,8 +253,6 @@ int main(int argc, char ** argv) {
             c["dtype"] = "fp32";
             c["temperature"] = model.temperature();
             c["prefix_cache"] = {{"size", model.prefix_cache().capacity()}};
-            c["few_shot"] = {{"enabled", model.decision_config().fewshot.enabled},
-                             {"n_examples", (int) model.decision_config().fewshot.examples.size()}};
             return c;
         };
         json out = {{"models", json::array({card("kev-latest"), card("jev-latest")})}};
