@@ -2,6 +2,7 @@
 #include "kev_prefix.h"
 
 #include <algorithm>
+#include <cstddef>
 
 namespace kev {
 
@@ -10,27 +11,49 @@ PrefixLRU::PrefixLRU(int capacity, int base_seq)
     entries_.reserve(capacity_);
 }
 
-std::pair<bool, int> PrefixLRU::lookup(const std::vector<int32_t> & ids, int * evict_seq) {
-    *evict_seq = -1;
-    // exact match
+// 判断 a 是否为 b 的前缀, 返回公共前缀(=a)长度; 不是前缀则返回 -1。
+namespace {
+int prefix_len_if_prefix(const std::vector<int32_t> & a, const std::vector<int32_t> & b) {
+    if (a.size() > b.size()) return -1;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i] != b[i]) return -1;
+    return (int) a.size();
+}
+} // namespace
+
+PrefixMatch PrefixLRU::lookup(const std::vector<int32_t> & ids, int min_lcp) {
+    PrefixMatch m;
+    if (min_lcp < 1) min_lcp = 1;
+    Entry * best = nullptr;
+    int best_len = 0;
     for (auto & e : entries_) {
-        if (e.ids == ids) {
-            e.last_use = ++clock_;
-            return {true, e.seq};
+        // 只能整体复用(见 kev_model P2 注释: M-RoPE 要求新解码起始位置 > 缓存 KV 末尾位置,
+        // 不能复用更长缓存序列的中间段)。故仅当「缓存的整段前缀是请求 ids 的前缀」才命中,
+        // 复用长度 = 该缓存槽的完整存储长度。
+        const int plen = prefix_len_if_prefix(e.ids, ids);
+        if (plen >= min_lcp && plen > best_len) {
+            best = &e;
+            best_len = plen;
         }
     }
-    // not cached: pick a slot (evict LRU if full)
-    if ((int) entries_.size() < capacity_) {
-        int seq = base_seq_ + (int) entries_.size();
-        *evict_seq = seq;                     // caller prefill here
-        return {false, -1};
+    if (best) {
+        best->last_use = ++clock_;
+        m.hit = true;
+        m.seq = best->seq;
+        m.lcp = best_len;
+        return m;
     }
-    // evict least-recently-used
+    // 未命中: 选一个槽(LRU 淘汰)供调用方 seq_clear + prefill + register。
+    m.hit = false;
+    if ((int) entries_.size() < capacity_) {
+        m.evict_seq = base_seq_ + (int) entries_.size();   // 全新未用槽
+        return m;
+    }
     auto it = std::min_element(entries_.begin(), entries_.end(),
                                [](const Entry & a, const Entry & b) { return a.last_use < b.last_use; });
-    *evict_seq = it->seq;
+    m.evict_seq = it->seq;
     entries_.erase(it);
-    return {false, -1};
+    return m;
 }
 
 void PrefixLRU::register_(const std::vector<int32_t> & ids, int seq) {

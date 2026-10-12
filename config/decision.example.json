@@ -8,9 +8,11 @@
     "markers.decide":       "question 收尾/decide marker token == KEV pointer 隐层位置",
     "temperature":          "softmax 温度 (同时作用于 KEV 与 logits softmax, 除以 T; 默认 1.0)",
     "logits.enable":        "true=主决策通道用「填空式 prompt + 候选答案 token logits + softmax」(已实测验证); false=回退旧 KEV 半边点积",
-    "logits.prompt_template": "填空式 prompt 模板(模型无关)。占位符 {state}/{instructions}/{options}; 末尾保留一个提示续写候选答案 token 的接续(如 'Answer:')。**避免'列选项再让模型选A/B'式**, 会引入位置偏置",
+    "logits.prompt_template": "填空式 prompt 模板(模型无关)。占位符 {state}/{instructions}/{options}; 末尾保留一个提示续写候选答案 token 的接续(如 'Answer:')。**建议把 {state} 放在模板末尾**(默认即如此), 使同一 instructions+options 仅 state 不同的请求共享稳定公共前缀、命中 LCP 前缀缓存。**避免'列选项再让模型选A/B'式**, 会引入位置偏置",
     "logits.aggregation":   "多 token 候选聚合: 'first'(取候选 key 首 token logit, 默认, 与验证一致) | 'sum' | 'mean'",
-    "logits.logits_type":   "候选来源覆盖: ''(自动: choice=criteria keys, noul=false/true, score=0..L-1) | 'choice' | 'noul' | 'score'"
+    "logits.logits_type":   "候选来源覆盖: ''(自动: choice=criteria keys, noul=false/true, score=0..L-1) | 'choice' | 'noul' | 'score'",
+    "logits.cache_prefix":  "true(默认)=前缀缓存: 缓存同任务稳定公共前缀(instructions 与 options)的 KV, 按最长公共前缀(LCP, 整体复用)匹配; 跨 state(仅 state 不同)与同报文连发都命中、只续算变化段; false=每次从 pos0 全新解码整条 prompt",
+    "logits.min_lcp_tokens": "LCP 命中所需最小前缀 token 数(默认 8): 缓存前缀长度需 >= 该值才复用, 否则直接全量 prefill"
   },
   "markers": {
     "state":        "<|fim_prefix|>",
@@ -22,8 +24,10 @@
   "temperature": 1.0,
   "logits": {
     "enable": true,
-    "prompt_template": "{state}\n{instructions}\n[ {options} ]\nAnswer:",
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\nAnswer:",
     "aggregation": "first",
-    "logits_type": ""
+    "logits_type": "",
+    "cache_prefix": true,
+    "min_lcp_tokens": 8
   }
 }

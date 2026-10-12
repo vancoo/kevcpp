@@ -162,6 +162,9 @@ bool load_decision_config(const std::string & file, KevDecisionConfig & cfg, std
                 } else if (path == "logits.cache_prefix") {
                     bool v = raw == "true" || raw == "1";
                     c->cache_prefix = v;
+                } else if (path == "logits.min_lcp_tokens") {
+                    int v = std::atoi(raw.c_str());
+                    if (v > 0) c->min_lcp_tokens = v;
                 }
             }
             return 1;

@@ -6,9 +6,10 @@
 //     (见 docs 与 kev_config.h)。
 //   - 不再保留原 kev 的 KEV 指针头 / KEV marker 布局 encode / KEV 半边点积打分 / 状态
 //     LRU(enable_logits=false 回退)等兼容路径。probs() 恒走 probs_logits。
-//   - P2 稳定公共前缀缓存(prefix_lru_, 独立于被删的 state LRU): 同一类任务的稳定公共前缀
-//     {instructions}\n[ {options} ]\n 的 KV 缓存进前缀 slot, 每个请求从此前缀续接 state 后
-//     continue decode, 跳过重算稳定前段。
+//   - P2 最长公共前缀(LCP)前缀缓存(prefix_lru_): 缓存 key = 同任务稳定公共前缀(模板 {state} 前
+//     的 instructions+options)的 token ids。匹配按 LCP 且受 M-RoPE 约束(须整体复用一个槽的完整
+//     前缀): 同一 instructions+options({state} 在模板末尾)的多请求共享稳定前段 KV, 只续算
+//     state+Answer; 同报文连发也命中。未命中时 prefill 新前缀到 LRU 槽并登记, 供后续跨请求复用。
 //
 // Pluggable-backend: KevModel 保留全部组装/编排(LRU、rows 规划、compute_mutex_、n_seq 布局),
 // 但 llama/ggml 算子耦合全部改经 kev::Backend*(来自 kev_backend_factory) 调用, 不再直接调
@@ -126,14 +127,9 @@ private:
     static std::string render_prompt(const std::string & tpl, const KevQuestion & q,
                                      const KevRequest & req, const std::vector<std::string> & opts);
 
-    // P2 前缀缓存(logits 通道): 稳定公共前缀 slot 查找/分配(返回缓存该前缀 token ids 的 seq)。
-    // 命中返回已缓存的前缀 seq; 未命中返回 -1 并经 *evict_seq 给出"需先 seq_clear 再 prefill"的
-    // 旧槽(调用方 decode P[0..Dp) 到该槽后调 register_)。不可缓存(无后端/前缀空)返回 -1。
-    int prefix_slot(const std::vector<int32_t> & prefix_ids, int * evict_seq);
-
     std::unique_ptr<Backend> backend_;
     KevDecisionConfig decision_;   // 已解析的决策配置(marker + 温度 + logits 通道)
-    PrefixLRU    prefix_lru_{4, 1}; // P2: 稳定公共前缀 LRU(logits 通道; base/capacity 在 init 覆写)
+    PrefixLRU    prefix_lru_{4, 1}; // P2: LCP 前缀 LRU(logits 通道; base/capacity 在 init 覆写)
     int n_seq_max_   = 0;
     int scratch_seq_ = 1;
     int prefix_seq_base_ = 1;      // P2: 前缀 slot 的起始 seq(在 scratch 之后)

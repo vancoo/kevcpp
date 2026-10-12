@@ -37,9 +37,11 @@ struct KevDecisionConfig {
     //   {state}        用户 state 文本(原始上下文)
     //   {instructions} 该 question 的 instructions
     //   {options}      该 question 各候选 option 文本, 以 ", " 连接(choice/noul: "key: desc"; score: 等级文本)
-    // 默认与验证探针一致: 先给上下文/指令, 再列选项, 末尾 "Answer:" 提示续写候选答案 token。
+    // 默认与 config/decision.qwen3.5.json 一致: {state} 位于模板**末尾**。这使得"同一 instructions+
+    // options、仅 state 不同"的多次请求共享一个稳定公共前缀(前缀缓存可按最长公共前缀 LCP 命中、
+    // 只续算变化的 state)。末尾 "Answer:" 提示续写候选答案 token。
     // **不要用"列出选项再让模型选 A/B"式 prompt**——实测会引入位置偏差。
-    std::string prompt_template = "{state}\n{instructions}\n[ {options} ]\nAnswer:";
+    std::string prompt_template = "{instructions}\n[ {options} ]\n{state}\nAnswer:";
     // 多 token 候选的聚合策略:
     //   "first" = 只取该候选 key 的第一个 token 的 logit(与验证结果一致, 天然无位置偏置)
     //   "sum"   = 对候选 key 的全部 token 的 logit 求和
@@ -50,9 +52,15 @@ struct KevDecisionConfig {
     //   "choice"|"noul"|"score" 显式覆盖(模型无关; 通常留 "" 即可)
     std::string logits_type = "";
     // P2 前缀缓存(P2, 模型无关): true = 同一类任务把"稳定公共前缀"{instructions}\n[ {options} ]\n
-    // 的 KV 缓存进前缀 slot, 每个请求从此前缀续接 state+Answer, 跳过重算稳定前段; false = 回到
-    // "从 pos 0 全新解码整条 prompt"(A/B 对照, 逐位一致)。默认 true。
+    // 的 KV 缓存进前缀 slot, 每个请求从此前缀续接 state+Answer, 跳过重算稳定前段; 匹配按最长
+    // 公共前缀(LCP, 须整体复用一个槽的完整前缀, 受 M-RoPE 约束): 跨 state(仅 state 不同)与同报文
+    // 连发都命中、只续算变化段; false = 回到"从 pos 0 全新解码整条 prompt"。默认 true。
     bool cache_prefix = true;
+    // LCP 命中最小前段 token 数(模型无关)。只有缓存的稳定前缀(整段)长度 >= 该值且是请求前段时才
+    // 复用, 否则直接全量 prefill。默认 8: 既足以覆盖"真实共享的 instructions+options 前段"远长于
+    // 8 token, 又避免"LCP 过短→复用得便宜但续算接近全量"得不偿失, 也避免模板标点等偶然的短公共
+    // token 误命中。
+    int min_lcp_tokens = 8;
 };
 
 // 默认决策配置(原版 Qwen3.5)。
@@ -68,7 +76,8 @@ inline KevDecisionConfig default_decision_config() { return KevDecisionConfig{};
 //        "prompt_template": "...",
 //        "aggregation": "first",
 //        "logits_type": "",
-//        "cache_prefix": true
+//        "cache_prefix": true,
+//        "min_lcp_tokens": 8
 //     }
 //   }
 // 缺省字段沿用默认值。返回 false 且 *err 说明原因(文件打不开 / JSON 语法错 / 某字段类型错)。
