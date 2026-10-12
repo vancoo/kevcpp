@@ -147,6 +147,8 @@ int main(int argc, char ** argv) {
     // B2: 并发批处理开关。默认开; KEV_NO_BATCH=1 退回原 compute_mutex_ 全程串行路径
     // (作 A/B 基准 / 可回退)。
     if (std::getenv("KEV_NO_BATCH")) { opt.enable_batching = false; }
+    // B3: continuous-batching 窗口可调(微秒)。KEV_BATCH_AGG_US=0 即完全事件驱动(到达即解码)。
+    if (const char * agg = std::getenv("KEV_BATCH_AGG_US")) { opt.batch_aggregation_us = std::atol(agg); }
     kev::KevModel model;
     std::string err;
     if (!model.init(opt, &err)) { std::fprintf(stderr, "kevcpp error: init failed: %s\n", err.c_str()); return 1; }

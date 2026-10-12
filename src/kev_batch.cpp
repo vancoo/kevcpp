@@ -6,8 +6,9 @@
 
 namespace kev {
 
-BatchScheduler::BatchScheduler(Backend * backend, int32_t n_batch)
-    : backend_(backend), n_batch_(n_batch > 0 ? n_batch : 512) {
+BatchScheduler::BatchScheduler(Backend * backend, int32_t n_batch, int32_t max_jobs_per_decode)
+    : backend_(backend), n_batch_(n_batch > 0 ? n_batch : 512),
+      max_jobs_per_decode_(max_jobs_per_decode) {
     worker_ = std::thread(&BatchScheduler::worker_loop, this);
 }
 
@@ -102,16 +103,27 @@ void BatchScheduler::worker_loop() {
             std::unique_lock<std::mutex> lk(mu_);
             cv_queue_.wait(lk, [&] { return stop_ || !pending_.empty(); });
             if (stop_) return;
-            batch = std::move(pending_);
-            pending_.clear();
-            // Optional short coalesce window when exactly one job is pending.
-            if (batch.size() == 1 && agg_us_ > 0) {
+            // B3: bounded dynamic batch. Take at most max_jobs_per_decode_ jobs
+            // (0 = unlimited) — leaves the rest for the next drain (continuous).
+            const size_t cap = max_jobs_per_decode_ > 0 ? (size_t)max_jobs_per_decode_ : pending_.size();
+            const size_t take = std::min(cap, pending_.size());
+            batch.assign(pending_.begin(), pending_.begin() + take);
+            pending_.erase(pending_.begin(), pending_.begin() + take);
+            // B3: wait a short bounded aggregation window ONLY when the queue is sparse
+            // (fewer than a full batch). If the queue is already full we decode
+            // immediately (no added latency under load).
+            const bool full_batch = max_jobs_per_decode_ > 0 ? (batch.size() >= (size_t)max_jobs_per_decode_) : (batch.size() == pending_.size());
+            if (!full_batch && agg_us_ > 0) {
                 lk.unlock();
                 std::this_thread::sleep_for(std::chrono::microseconds(agg_us_));
                 lk.lock();
-                if (!pending_.empty()) {
-                    batch.insert(batch.end(), pending_.begin(), pending_.end());
-                    pending_.clear();
+                const size_t cap2 = max_jobs_per_decode_ > 0 ? (size_t)max_jobs_per_decode_ : (size_t)-1;
+                if (!pending_.empty() && batch.size() < cap2) {
+                    const size_t more = std::min(cap2 - batch.size(), pending_.size());
+                    const size_t base = batch.size();
+                    batch.resize(base + more);
+                    for (size_t i = 0; i < more; ++i) batch[base + i] = pending_[i];
+                    pending_.erase(pending_.begin(), pending_.begin() + more);
                 }
             }
         }

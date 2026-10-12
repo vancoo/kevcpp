@@ -92,11 +92,12 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     // llama_decode + read_logits, 并发请求各自用独立 sequence 槽, 合并进同一次 decode。
     batching_enabled_ = opt.enable_batching && backend_->supports_multi_seq();
     if (batching_enabled_) {
-        scheduler_ = std::make_unique<BatchScheduler>(backend_.get(), backend_->n_batch());
+        scheduler_ = std::make_unique<BatchScheduler>(backend_.get(), backend_->n_batch(), max_concurrency_);
         scheduler_->set_aggregation_us(opt.batch_aggregation_us);
-        std::fprintf(stderr, "kev_model: batch scheduler ON (max_concurrency=%d, n_seq_max=%d, "
-                             "conc_base=%d, agg_us=%ld)\n",
-                     max_concurrency_, n_seq_max_, concurrent_seq_base_, opt.batch_aggregation_us);
+        std::fprintf(stderr, "kev_model: batch scheduler ON (max_concurrency=%d, max_jobs/decode=%d, "
+                             "n_seq_max=%d, conc_base=%d, agg_us=%ld)\n",
+                     max_concurrency_, max_concurrency_, n_seq_max_, concurrent_seq_base_,
+                     opt.batch_aggregation_us);
     } else {
         std::fprintf(stderr, "kev_model: batch scheduler OFF (enable_batching=%d, backend_multi_seq=%d) "
                              "; serial compute_mutex_ path\n",

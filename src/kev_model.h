@@ -55,9 +55,9 @@ struct KevModelOptions {
     bool enable_batching = true;
     // B2: 并发 scratch sequence 槽位数(同时 in-flight 的请求数上限)。在后缀槽之后分配。
     int max_concurrency = 8;
-    // B2: batch 合并窗口(微秒)。单请求 pending 时 worker 等待这么久以攒到更多请求再 decode;
-    // 0 = 立即 decode(不额外等待)。默认 1500us。
-    long batch_aggregation_us = 1500;
+    // B2: batch 合并窗口(微秒)。B3(continuous): 仅当队列稀疏(未满一个 batch)时才等这么短的一
+    // 段时间以攒到更多并发请求; 队列满时立即 decode(不加延迟)。默认 400us。
+    long batch_aggregation_us = 400;
     // 派生: n_seq_max = scratch(1) + prefix_capacity(前缀池) + max_concurrency(并发槽)。
 };
 

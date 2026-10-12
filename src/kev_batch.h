@@ -58,22 +58,30 @@ struct BatchJob {
     std::condition_variable cv;
 };
 
-// B2: single-ctx decode worker. Construct with the Backend (owned by KevModel) and
+// B2/B3: single-ctx decode worker. Construct with the Backend (owned by KevModel) and
 // the max tokens per llama_decode (n_batch). submit() blocks until the worker has
 // decoded the job's sequences (possibly batched with other pending jobs) and filled
 // job.logits.
+//
+// B3 (continuous batching): the worker uses a *bounded dynamic batch* — it takes at
+// most max_jobs_per_decode jobs per drain, and decodes IMMEDIATELY (no wait) whenever
+// the pending queue already holds a full batch; it only waits a short, bounded
+// aggregation window (aggregation_us) when the queue is sparse (fewer jobs than the
+// cap), hoping to coalesce a few simultaneous arrivals. This keeps the batch size
+// adaptive to load while adding minimal latency to sparse traffic (lower P95).
 class BatchScheduler {
 public:
-    BatchScheduler(Backend * backend, int32_t n_batch);
+    // max_jobs_per_decode > 0 caps jobs coalesced into one drain (default = all pending
+    // up to n_batch tokens). Pass ~max_concurrency to bound batch size to available seqs.
+    BatchScheduler(Backend * backend, int32_t n_batch, int32_t max_jobs_per_decode = 0);
     ~BatchScheduler();
 
     // Returns false (and sets job->err) if the job could not be decoded. Blocks until
     // the worker handles it. thread-safe; may be called from many request threads.
     bool submit(std::shared_ptr<BatchJob> job);
 
-    // Max aggregation window (microseconds) the worker waits with a single pending job
-    // hoping for more to coalesce, before decoding it alone. 0 = no wait (decode as
-    // soon as at least one is pending). 0 means immediate; set via agg_us().
+    // Max aggregation window (microseconds) the worker waits with a SPARSE queue hoping
+    // for more jobs before decoding, all else equal. 0 = never wait. Default 400.
     void set_aggregation_us(long agg_us) { agg_us_ = agg_us; }
     long aggregation_us() const { return agg_us_; }
 
@@ -82,7 +90,8 @@ private:
 
     Backend * backend_;
     int32_t   n_batch_;
-    long      agg_us_ = 0;          // coalesce window when a lone job awaits more
+    int32_t   max_jobs_per_decode_ = 0;
+    long      agg_us_ = 400;        // bounded coalesce window (sparse queue only)
 
     std::mutex              mu_;
     std::condition_variable cv_queue_;
