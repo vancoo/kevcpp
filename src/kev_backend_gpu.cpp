@@ -111,10 +111,22 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     int ng = p->n_gpu_layers;
     if (ng == 0 && p->moe_offload) ng = -1;   // 显式要求省显存但未给层数时, 默认除专家外全上设备
     mparams.n_gpu_layers = ng;
-    // MoE 专家 offload: 专家张量留 host RAM, 其余按 n_gpu_layers 进设备(降低显存占用)。
-    kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng, p->model_path);
-    if (!kb->moe_overrides_.empty()) {
-        mparams.tensor_buft_overrides = kb->moe_overrides_.data();
+    // MoE 专家 offload(实验性): 用 tensor_buft_overrides 把专家张量留 host RAM 以省显存。
+    // 同 Vulkan 后端(kev_backend_vulkan.cpp): 对含真实 MoE 专家张量的模型设置 override 在本机
+    // Vulkan+UMA 配置上会原生崩溃, 故 GPU/HIP 后端同样默认不启用, 专家留在设备并给出告警。
+    // CPU 后端(n_gpu_layers=0)本就全权重在内存; 离散 GPU 上该 override 等价 llama.cpp --n-cpu-moe,
+    // 验证后再放开。
+    if (p->moe_offload && ng != 0 && kev_backend_moe::model_has_expert_tensors(p->model_path)) {
+        std::fprintf(stderr,
+            "[kev] WARN: --moe-mode ram (MoE experts to host RAM) is not applied on the GPU/HIP "
+            "backend (tensor_buft_overrides is unreliable there; it crashes on this UMA GPU). "
+            "Experts stay on-device. Use the cpu backend (--backend cpu) for host-RAM expert "
+            "offload.\n");
+    } else {
+        kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng, p->model_path);
+        if (!kb->moe_overrides_.empty()) {
+            mparams.tensor_buft_overrides = kb->moe_overrides_.data();
+        }
     }
     kb->model = llama_model_load_from_file(p->model_path, mparams);
     if (!kb->model) { write_err(err, err_cap, "failed to load model: " + std::string(p->model_path)); return 1; }
