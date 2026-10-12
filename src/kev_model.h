@@ -19,7 +19,9 @@
 #include "kev_encode.h"
 #include "kev_prefix.h"
 #include "kev_backend_factory.h"
+#include "kev_batch.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -46,7 +48,17 @@ struct KevModelOptions {
     // 多请求共享同一前缀 -> 只需 1~2 个槽即命中; 不同 instructions/options 任务各占一个 LRU 槽。
     int prefix_capacity = 4;
     std::string backend = "cpu"; // pluggable backend name (default "cpu")
-    // 派生: n_seq_max = scratch(1) + prefix_capacity(前缀池)。
+    // B2: 并发批处理。enable_batching=true 且后端支持 decode_multi_seq 时, 解码经
+    // BatchScheduler 单 worker 集中: 并发到达的请求各自用独立 sequence 槽, worker 把它们的
+    // 单条 decode 合并进同一次 decode_multi_seq(摊销 per-decode 固定开销)。false 时退回
+    // 原「compute_mutex_ 全程串行」路径(可回退/基准)。
+    bool enable_batching = true;
+    // B2: 并发 scratch sequence 槽位数(同时 in-flight 的请求数上限)。在后缀槽之后分配。
+    int max_concurrency = 8;
+    // B2: batch 合并窗口(微秒)。单请求 pending 时 worker 等待这么久以攒到更多请求再 decode;
+    // 0 = 立即 decode(不额外等待)。默认 1500us。
+    long batch_aggregation_us = 1500;
+    // 派生: n_seq_max = scratch(1) + prefix_capacity(前缀池) + max_concurrency(并发槽)。
 };
 
 class KevModel {
@@ -127,6 +139,22 @@ private:
     static std::string render_prompt(const std::string & tpl, const KevQuestion & q,
                                      const KevRequest & req, const std::vector<std::string> & opts);
 
+    // ---- B2: batched-decode helpers ----
+    // Decode `tokens` (possibly continued from cached prefix `copy_src`) into `seq`,
+    // read candidate logits at `out_pos`, and return them in `logits[out][cand]`.
+    // Works in both modes: batched path submits to schedule_mu_ worker; serial path
+    // (compute_mutex_ already held) calls decode_seq directly.
+    bool decode_one_to_logits(const std::vector<int32_t> & tokens, int32_t start_pos,
+                              int32_t seq, int32_t copy_src,
+                              const std::vector<int32_t> & out_pos,
+                              const std::vector<std::vector<int32_t>> & out_cands,
+                              std::vector<std::vector<float>> & logits,
+                              std::string * err);
+
+    // acquire/release a per-request scratch sequence slot (concurrent pool).
+    int  acquire_scratch_slot();
+    void release_scratch_slot(int seq);
+
     std::unique_ptr<Backend> backend_;
     KevDecisionConfig decision_;   // 已解析的决策配置(marker + 温度 + logits 通道)
     PrefixLRU    prefix_lru_{4, 1}; // P2: LCP 前缀 LRU(logits 通道; base/capacity 在 init 覆写)
@@ -134,6 +162,14 @@ private:
     int scratch_seq_ = 1;
     int prefix_seq_base_ = 1;      // P2: 前缀 slot 的起始 seq(在 scratch 之后)
     int prefix_capacity_ = 4;      // P2: 前缀槽位数
+    int concurrent_seq_base_ = 0;  // B2: 并发 scratch 槽起始 seq(在前缀槽之后)
+    int max_concurrency_   = 0;    // B2: 并发槽数
+    bool batching_enabled_ = false; // B2: 实际启用了 batch 调度器
+    std::unique_ptr<BatchScheduler> scheduler_;  // B2
+    std::vector<bool> slot_used_;   // B2: 并发槽占用表
+    std::mutex slot_mutex_;         // B2: 槽位分配
+    std::mutex tokenizer_mutex_;    // B2: llama_vocab 分词串行(替代原来整函数持 compute_mutex_)
+    std::mutex prefix_mutex_;       // B2: LRU prepare/register + 前缀 prefill 串行
     int n_threads_   = 0;
     bool ok_         = false;
     // P0b: 串行化所有访问共享 llama ctx/scratch/前缀槽 的计算段。

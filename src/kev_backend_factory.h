@@ -117,6 +117,9 @@ public:
     const char * device() const { return meta_.device; }
     const char * version() const { return meta_.version; }
     bool ok() const { return handle_ != nullptr && ops_.init != nullptr; }
+    // B2: whether the loaded backend ABI provides decode_multi_seq (single-ctx
+    // multi-seq batched decode primitive). False -> host falls back to serial.
+    bool supports_multi_seq() const { return handle_ != nullptr && ops_.decode_multi_seq != nullptr; }
     void close();
 
 private:

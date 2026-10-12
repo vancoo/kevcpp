@@ -82,6 +82,8 @@ add_executable(main_server
     src/main_server.cpp
     src/kev_api.cpp
     src/kev_model.cpp
+    src/kev_batch.h
+    src/kev_batch.cpp
     src/kev_config.cpp
     src/kev_prefix.cpp
     src/kev_encode.cpp

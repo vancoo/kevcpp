@@ -32,15 +32,20 @@ void KevModel::close() {
 bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     if (err && err->size()) err->clear();
 
-    // P2: 前缀缓存槽位数; seq 布局 = scratch(1) + prefix 池。
+    // P2: 前缀缓存槽位数; seq 布局 = scratch(1) + 前缀池 + B2 并发 scratch 池。
     const int n_prefix = opt.prefix_capacity > 0 ? opt.prefix_capacity : 4;
     const int scratch   = 1;
     const int prefix_base = scratch + 1;          // P2: 前缀 slot 池(在 scratch 之后)
-    n_seq_max_ = prefix_base + n_prefix;
-    scratch_seq_ = scratch;
     prefix_seq_base_ = prefix_base;               // P2
     prefix_capacity_ = n_prefix;                  // P2
+    const int conc_base = prefix_base + n_prefix; // B2: 并发 scratch 槽(在前缀池之后)
+    concurrent_seq_base_ = conc_base;
+    max_concurrency_     = opt.max_concurrency > 0 ? opt.max_concurrency : 8;
+    if (max_concurrency_ > 64) max_concurrency_ = 64;
+    n_seq_max_ = conc_base + max_concurrency_;
+    scratch_seq_ = scratch;
     prefix_lru_ = PrefixLRU(n_prefix, prefix_base); // P2: LCP 前缀 LRU(按稳定公共前缀 token ids 索引)
+    slot_used_.assign(max_concurrency_, false);
     n_threads_ = opt.n_threads > 0 ? opt.n_threads : (int) std::thread::hardware_concurrency();
     if (n_threads_ <= 0) n_threads_ = 1;
     if (n_threads_ > 32) n_threads_ = 32;
@@ -82,6 +87,21 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     bopt.embeddings        = 0;
     bopt.lm_head           = 1;
     if (!backend_->init(bopt, err)) return false;
+
+    // B2: 批量调度器(仅在启用且后端支持单 ctx 多 seq decode 时创建)。单 worker 集中
+    // llama_decode + read_logits, 并发请求各自用独立 sequence 槽, 合并进同一次 decode。
+    batching_enabled_ = opt.enable_batching && backend_->supports_multi_seq();
+    if (batching_enabled_) {
+        scheduler_ = std::make_unique<BatchScheduler>(backend_.get(), backend_->n_batch());
+        scheduler_->set_aggregation_us(opt.batch_aggregation_us);
+        std::fprintf(stderr, "kev_model: batch scheduler ON (max_concurrency=%d, n_seq_max=%d, "
+                             "conc_base=%d, agg_us=%ld)\n",
+                     max_concurrency_, n_seq_max_, concurrent_seq_base_, opt.batch_aggregation_us);
+    } else {
+        std::fprintf(stderr, "kev_model: batch scheduler OFF (enable_batching=%d, backend_multi_seq=%d) "
+                             "; serial compute_mutex_ path\n",
+                     (int) opt.enable_batching, backend_->supports_multi_seq() ? 1 : 0);
+    }
 
     std::fprintf(stderr, "kev_model: backend '%s' loaded (device=%s, ver=%s)\n",
                  backend_->name(), backend_->device(), backend_->version());
@@ -160,6 +180,68 @@ bool KevModel::decode_seq_chunked(const std::vector<int32_t> & ids, int start_po
     if (!backend_->decode_seq(tail, start_pos + tail_start, seq, err, local_pos)) return false;
     out_local = local_pos;
     return true;
+}
+
+// B2: 解码 tokens(可选从缓存 prefix `copy_src` 续接)写入 seq, 在 out_pos 读取候选 logits。
+// 批处理路径: 提交给 BatchScheduler 单 worker(集中 llama_decode + read_logits, 与并发请求
+// 合并进同一次 decode_multi_seq)。串行路径(compute_mutex_ 已持, 未启用 batch): 直调
+// decode_seq_chunked + read_logits。两种模式产出 logits[out][cand]。
+bool KevModel::decode_one_to_logits(const std::vector<int32_t> & tokens, int32_t start_pos,
+                                    int32_t seq, int32_t copy_src,
+                                    const std::vector<int32_t> & out_pos,
+                                    const std::vector<std::vector<int32_t>> & out_cands,
+                                    std::vector<std::vector<float>> & logits,
+                                    std::string * err) {
+    logits.assign(out_pos.size(), {});
+    if (batching_enabled_ && scheduler_) {
+        auto job = std::make_shared<BatchJob>();
+        Backend::MultiSeqRequest r;
+        r.tokens = tokens; r.start_pos = start_pos; r.seq = seq;
+        job->reqs.push_back(std::move(r));
+        job->copy_src.push_back(copy_src);
+        for (int32_t p : out_pos) job->outs.push_back({0, p});
+        job->out_cands = out_cands;
+        if (!scheduler_->submit(job)) {
+            if (err && err->empty()) *err = job->err.empty() ? std::string("batched decode failed") : job->err;
+            return false;
+        }
+        logits = std::move(job->logits);
+        return true;
+    }
+    // serial fallback (caller holds compute_mutex_; ctx exclusively ours)
+    if (!backend_) { if (err && err->empty()) *err = "backend not initialized"; return false; }
+    std::string e2;
+    (void) backend_->seq_clear(seq);
+    if (copy_src >= 0 && !backend_->seq_copy(copy_src, seq)) { if (err && err->empty()) *err = "seq_copy failed"; return false; }
+    std::vector<int32_t> out_local;
+    const int chunk = backend_->n_batch() > 0 ? backend_->n_batch() : 512;
+    if (!decode_seq_chunked(tokens, start_pos, seq, &e2, out_pos, out_local, chunk)) {
+        if (err && err->empty()) *err = e2;
+        return false;
+    }
+    for (size_t o = 0; o < out_local.size(); ++o) {
+        logits[o].resize(out_cands[o].size());
+        for (size_t c = 0; c < out_cands[o].size(); ++c) {
+            float v = 0.0f;
+            backend_->read_logits(out_local[o], out_cands[o][c], &v, &e2);
+            logits[o][c] = v;
+        }
+    }
+    return true;
+}
+
+int KevModel::acquire_scratch_slot() {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
+    for (size_t i = 0; i < slot_used_.size(); ++i) {
+        if (!slot_used_[i]) { slot_used_[i] = true; return concurrent_seq_base_ + (int) i; }
+    }
+    return -1;
+}
+
+void KevModel::release_scratch_slot(int seq) {
+    std::lock_guard<std::mutex> lk(slot_mutex_);
+    const int idx = seq - concurrent_seq_base_;
+    if (idx >= 0 && idx < (int) slot_used_.size()) slot_used_[idx] = false;
 }
 
 KevModel::ProbsResult KevModel::probs(const KevRequest & req, std::string * err) {
@@ -253,14 +335,31 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
 
     std::vector<std::vector<float>> probs(Q);
     std::vector<double> qms(Q, 0.0);
-    std::lock_guard<std::mutex> lock(compute_mutex_);
+
+    // B2: 并发批处理模式不持 compute_mutex_(解码经 BatchScheduler 单 worker 串行 + 批量);
+    // 非批处理回退路径保持原「整函数持 compute_mutex_」串行语义。批处理时每请求取一个独立
+    // sequence 槽(并发池), 避免请求间 KV 冲突; 分词 / LRU 前缀管理分别用短锁串行。
+    const bool batched = batching_enabled_ && scheduler_;
+    std::unique_ptr<std::lock_guard<std::mutex>> compute_lock;
+    if (!batched) compute_lock.reset(new std::lock_guard<std::mutex>(compute_mutex_));
+    const int my_slot = batched ? acquire_scratch_slot() : scratch_seq_;
+    if (my_slot < 0) { if (err && err->empty()) *err = "no free concurrent sequence slot"; return res; }
+    struct SlotGuard {
+        bool active; int seq; KevModel * m;
+        ~SlotGuard() { if (active) m->release_scratch_slot(seq); }
+    } slot_guard{batched, my_slot, this};
+    // 分词(共享 llama_vocab 非线程安全, 短锁串行; 非批处理也已持 compute_mutex_ 无需此锁但无害)。
+    auto tok = [&](const std::string & t) {
+        std::lock_guard<std::mutex> lk(tokenizer_mutex_);
+        return kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/false);
+    };
 
     for (int k = 0; k < Q; ++k) {
         const KevQuestion & q = req.questions[k];
         const int K = (int) q.keys.size();
         if (K == 0) { if (err && err->empty()) *err = "question " + std::to_string(k) + ": no candidate keys"; return res; }
         std::string prompt = render_prompt(tpl, q, req, q.options);
-        std::vector<int32_t> P = kev::tokenize(tf, prompt, /*add_special=*/false, /*parse_special=*/false);
+        std::vector<int32_t> P = tok(prompt);
         while (!P.empty() && P.back() < 0) P.pop_back();   // 剔除退化/占位
         const int32_t Lp = (int32_t) P.size();
         if (Lp == 0) { if (err && err->empty()) *err = "question " + std::to_string(k) + ": empty prompt"; return res; }
@@ -270,14 +369,11 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         std::vector<std::vector<int32_t>> cand_tok(K);
         std::vector<int32_t> cand_first(K, -1);
         for (int j = 0; j < K; ++j) {
-            cand_tok[j] = kev::tokenize(tf, q.keys[j], /*add_special=*/false, /*parse_special=*/false);
+            cand_tok[j] = tok(q.keys[j]);
             cand_first[j] = cand_tok[j].empty() ? -1 : cand_tok[j][0];
         }
         std::vector<float> z(K, 0.0f);
         std::string err2;
-
-        // ---- n_batch 安全解码 ----
-        const int32_t chunk = (backend_->n_batch() > 0) ? backend_->n_batch() : 512;
 
         // ===================== P2: 最长公共前缀(LCP)缓存 =====================
         // 默认模板 {instructions}\n[ {options} ]\n{state}\nAnswer: 中 {state} 在**末尾**。故
@@ -297,6 +393,10 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         std::string slot_hit = "miss";
         int trace_lcp = 0;                 // [TRACE] 命中时复用长度(仅供诊断)
         if (want_prefix) {
+            // B2(批处理): LRU prepare + 前缀 prefill 需跨请求串行(避免两请求并发 prefill 同一
+            // 淘汰槽). 非批处理已在 compute_mutex_ 内, 无需额外锁(prefix_mutex_ 未呕由此保护).
+            std::unique_lock<std::mutex> pfx_lock;
+            if (batched) pfx_lock = std::unique_lock<std::mutex>(prefix_mutex_);
             const int min_lcp = decision_.min_lcp_tokens > 0 ? decision_.min_lcp_tokens : 1;
             // 待缓存/匹配的目标前缀 = 模板 {state} 之前的稳定段(渲染 instructions+options)。
             std::vector<int32_t> Pg;
@@ -311,7 +411,7 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                 for (size_t oi = 0; oi < q.options.size(); ++oi) { if (oi) opts_str_pfx += ", "; opts_str_pfx += q.options[oi]; }
                 rep_pfx("{instructions}", q.instr);
                 rep_pfx("{options}", opts_str_pfx);
-                Pg = kev::tokenize(tf, pg_str, /*add_special=*/false, /*parse_special=*/false);
+                Pg = tok(pg_str);
                 // BPE 边界校验: Pg 必须是整条 P 的前缀, 否则不能安全复用(跨界)。
                 if (!Pg.empty() && (int) Pg.size() < Lp &&
                     std::equal(Pg.begin(), Pg.end(), P.begin(), P.begin() + (int64_t) Pg.size())) {
@@ -323,9 +423,9 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                         // 未命中: prefill 稳定公共前缀 Pg 到淘汰槽并登记为新 key; 当前请求也
                         // 从该前缀续算 tail(state+Answer), 避免多一次全量解码。
                         Dp = (int) Pg.size(); slot_hit = "miss";
-                        if (backend_) backend_->seq_clear(pm.evict_seq);
-                        std::vector<int32_t> out_pre;
-                        if (decode_seq_chunked(Pg, 0, pm.evict_seq, &err2, {}, out_pre, chunk)) {
+                        std::vector<std::vector<float>> pre_lg;
+                        if (decode_one_to_logits(Pg, 0, pm.evict_seq, /*copy_src=*/-1,
+                                                 /*out_pos=*/{}, /*out_cands=*/{}, pre_lg, &err2)) {
                             prefix_lru_.register_(Pg, pm.evict_seq);
                             pseq = pm.evict_seq;
                         }
@@ -342,116 +442,79 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                 trace_lcp, Dp, pseq, slot_hit.c_str(), (int)use_prefix,
                 (int)prefix_lru_.contents().size());
         }
-        // 从公共前缀槽续接 tail(state+Answer [+候选]) 到 scratch_seq_: 清空->复制前缀->decode。
-        auto decode_tail_from_prefix = [&](const std::vector<int32_t> & tail, int32_t start_pos,
-                                           const std::vector<int32_t> & out_global, int pseq,
-                                           std::vector<int32_t> & out_local) -> bool {
-            if (backend_) backend_->seq_clear(scratch_seq_);
-            if (!backend_ || !backend_->seq_copy(pseq, scratch_seq_)) return false;
-            return decode_seq_chunked(tail, start_pos, scratch_seq_, &err2, out_global, out_local, chunk);
-        };
-
+        // 解码并读候选 logits(批处理: 经 BatchScheduler 单 worker + per-request my_slot,
+        // 与并发请求合并进同一次 decode_multi_seq; 串行: compute_mutex_ + my_slot==scratch_seq_)。
         if (!keep) {
-            // aggregation == "first"(默认, 优化路径): 单次 decode, 末位置 Lp-1 输出全量 logits,
-            // 按候选首 token 直接查 logit(K 候选 = 1 次 decode)。
-            std::vector<int32_t> out_local;
-            bool done = false;
+            // aggregation == "first"(默认): 单次 decode 末位置 Lp-1 输出全量候选 logits。
+            std::vector<std::vector<int32_t>> one_cand(1, cand_first);
+            std::vector<std::vector<float>> lg;
+            bool okd = false;
             if (use_prefix) {
-                // P2 续接: 只解码 state+Answer(跳过重算稳定前缀)。
+                // P2 续接: 只解码 state+Answer(跳过重算稳定前缀), copy pseq -> my_slot。
                 std::vector<int32_t> tail(P.begin() + Dp, P.end());
-                std::vector<int32_t> out_tail;
-                if (decode_tail_from_prefix(tail, Dp, {Lp - 1 - Dp}, pseq, out_tail) && !out_tail.empty()) {
-                    out_local = out_tail; done = true;
-                }
+                okd = decode_one_to_logits(tail, Dp, my_slot, pseq, {Lp - 1 - Dp}, one_cand, lg, &err2);
             }
-            if (!done) {
-                // 回退: 从 pos 0 全新解码整条 P(既有路径, 保证功能/正确性不坏)。
-                if (backend_) backend_->seq_clear(scratch_seq_);
-                if (!decode_seq_chunked(P, 0, scratch_seq_, &err2, {Lp - 1}, out_local, chunk)) {
-                    // 单次 decode 失败(如仍超 n_batch 或其它): 降级逐候选(结果等价, 不崩溃)。
+            if (!okd) {
+                // 回退: 从 pos 0 全新解码整条 P。
+                std::vector<std::vector<float>> lg2;
+                okd = decode_one_to_logits(P, 0, my_slot, /*copy_src=*/-1, {Lp - 1}, one_cand, lg2, &err2);
+                if (okd) lg = std::move(lg2);
+                else {
+                    // 仍失败: 降级逐候选(结果等价, 不崩溃)。
                     std::fprintf(stderr,
                         "kev_model: logits single-decode failed at q=%d (%s); degrading to per-key decode\n",
                         k, err2.c_str());
                     for (int j = 0; j < K; ++j) {
                         if (cand_first[j] < 0) { z[j] = 0.0f; continue; }
                         std::vector<int32_t> ids = P; ids.push_back(cand_first[j]);
-                        if (backend_) backend_->seq_clear(scratch_seq_);
-                        std::vector<int32_t> out1;
-                        if (!decode_seq_chunked(ids, 0, scratch_seq_, &err2, {Lp - 1}, out1, chunk)) {
+                        std::vector<std::vector<int32_t>> kc(1, std::vector<int32_t>{cand_first[j]});
+                        std::vector<std::vector<float>> klg;
+                        if (!decode_one_to_logits(ids, 0, my_slot, -1, {Lp - 1}, kc, klg, &err2)) {
                             std::fprintf(stderr,
                                 "kev_model: degraded logits seq decode failed at q=%d,key=%d (%s)\n",
                                 k, j, err2.c_str());
                             if (err && err->empty()) *err = err2;
                             return res;
                         }
-                        float lt = 0;
-                        if (out1.empty() || !backend_->read_logits(out1[0], cand_first[j], &lt, &err2)) lt = 0.0f;
-                        z[j] = lt;
-                    }
-                } else {
-                    const int32_t out_idx = out_local.empty() ? -1 : out_local[0];
-                    for (int j = 0; j < K; ++j) {
-                        if (cand_first[j] < 0) { z[j] = 0.0f; continue; }
-                        float lt = 0;
-                        if (out_idx < 0 || !backend_->read_logits(out_idx, cand_first[j], &lt, &err2)) {
-                            std::fprintf(stderr, "kev_model: read_logits failed at q=%d,key=%d (%s); using 0\n",
-                                         k, j, err2.c_str());
-                            lt = 0.0f;
-                        }
-                        z[j] = lt;
+                        z[j] = klg.empty() || klg[0].empty() ? 0.0f : klg[0][0];
                     }
                 }
-            } else {
-                const int32_t out_idx = out_local.empty() ? -1 : out_local[0];
-                if (out_idx < 0) {
-                    if (err && err->empty()) *err = "logits decode produced no output position";
-                    return res;
-                }
+            }
+            if (okd && !lg.empty() && !lg[0].empty()) {
                 for (int j = 0; j < K; ++j) {
                     if (cand_first[j] < 0) { z[j] = 0.0f; continue; }
-                    float lt = 0;
-                    if (!backend_->read_logits(out_idx, cand_first[j], &lt, &err2)) {
-                        std::fprintf(stderr, "kev_model: read_logits failed at q=%d,key=%d (%s); using 0\n",
-                                     k, j, err2.c_str());
-                        lt = 0.0f;
-                    }
-                    z[j] = lt;
+                    z[j] = lg[0][j];
                 }
             }
         } else {
-            // "sum"/"mean": 逐候选 decode(P + 全 key token), 读每 token 位置的 logits 并聚合。
+            // "sum"/"mean": 逐候选 decode(P + 全 key token), 读每 token 位置 logits 并聚合。
             for (int j = 0; j < K; ++j) {
                 const int32_t M = (int32_t) cand_tok[j].size();
                 if (M == 0) { z[j] = 0.0f; continue; }
                 std::vector<int32_t> ids;
                 std::vector<int32_t> out_global;
-                bool okd;
+                int32_t start_pos; int copy_src;
                 if (use_prefix) {
                     ids.insert(ids.end(), P.begin() + Dp, P.end());
                     for (int m = 0; m < M; ++m) out_global.push_back((Lp - 1 - Dp) + m);
                     ids.insert(ids.end(), cand_tok[j].begin(), cand_tok[j].end());
+                    start_pos = Dp; copy_src = pseq;
                 } else {
                     ids = P;
                     for (int m = 0; m < M; ++m) out_global.push_back(Lp - 1 + m);
                     ids.insert(ids.end(), cand_tok[j].begin(), cand_tok[j].end());
+                    start_pos = 0; copy_src = -1;
                 }
-                std::vector<int32_t> out_local;
-                if (use_prefix) okd = decode_tail_from_prefix(ids, Dp, out_global, pseq, out_local);
-                else {
-                    if (backend_) backend_->seq_clear(scratch_seq_);
-                    okd = decode_seq_chunked(ids, 0, scratch_seq_, &err2, out_global, out_local, chunk);
-                }
-                if (!okd) {
+                std::vector<std::vector<int32_t>> m_cands(M);
+                for (int m = 0; m < M; ++m) m_cands[m] = { cand_tok[j][m] };
+                std::vector<std::vector<float>> mlg;
+                if (!decode_one_to_logits(ids, start_pos, my_slot, copy_src, out_global, m_cands, mlg, &err2)) {
                     std::fprintf(stderr, "kev_model: logits seq decode failed (%s)\n", err2.c_str());
                     if (err && err->empty()) *err = err2;
                     return res;
                 }
                 float s = 0;
-                for (int m = 0; m < M; ++m) {
-                    float lt = 0;
-                    if (!backend_->read_logits(out_local[m], cand_tok[j][m], &lt, &err2)) lt = 0.0f;
-                    s += lt;
-                }
+                for (int m = 0; m < M; ++m) s += (mlg[m].empty() ? 0.0f : mlg[m][0]);
                 z[j] = (agg == "mean") ? (s / (float) M) : s;
             }
         }

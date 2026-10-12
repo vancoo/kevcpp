@@ -144,6 +144,9 @@ int main(int argc, char ** argv) {
     opt.option_end_override  = opt_end_override;
     opt.decide_marker_override = decide_token_override;
     if (!lora_path.empty()) { opt.lora_path = lora_path; opt.lora_scale = lora_scale; }
+    // B2: 并发批处理开关。默认开; KEV_NO_BATCH=1 退回原 compute_mutex_ 全程串行路径
+    // (作 A/B 基准 / 可回退)。
+    if (std::getenv("KEV_NO_BATCH")) { opt.enable_batching = false; }
     kev::KevModel model;
     std::string err;
     if (!model.init(opt, &err)) { std::fprintf(stderr, "kevcpp error: init failed: %s\n", err.c_str()); return 1; }
