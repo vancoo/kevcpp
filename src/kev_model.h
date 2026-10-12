@@ -59,6 +59,9 @@ struct KevModelOptions {
     // 段时间以攒到更多并发请求; 队列满时立即 decode(不加延迟)。默认 400us。
     long batch_aggregation_us = 400;
     // 派生: n_seq_max = scratch(1) + prefix_capacity(前缀池) + max_concurrency(并发槽)。
+    // MoE 专家 offload(透传给后端; 见 kev_backend.h)。
+    int n_gpu_layers = 0;   // 0 = 全 CPU; 负 = 全 GPU; 正 = N 层 GPU
+    int moe_offload  = 0;   // 1 = MoE 专家张量强制留 host RAM, 其余按 n_gpu_layers
 };
 
 class KevModel {

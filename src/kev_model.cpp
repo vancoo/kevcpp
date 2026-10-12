@@ -86,6 +86,9 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     // hidden 计算)。故 logits 主线恒 关 embeddings、开 lm_head。
     bopt.embeddings        = 0;
     bopt.lm_head           = 1;
+    // MoE 专家 offload: 透传 n_gpu_layers 与 moe_offload(见 kev_backend.h)。
+    bopt.n_gpu_layers      = opt.n_gpu_layers;
+    bopt.moe_offload       = opt.moe_offload;
     if (!backend_->init(bopt, err)) return false;
 
     // B2: 批量调度器(仅在启用且后端支持单 ctx 多 seq decode 时创建)。单 worker 集中

@@ -24,6 +24,8 @@
 // to prefix them to kev_backend_vulkan_*.
 #include "kev_backend.h"
 
+#include "kev_backend_moe.h"
+
 #include "llama.h"
 
 #include <cstring>
@@ -54,6 +56,8 @@ struct KevVulkanBackend {
     int32_t               n_embd = 0;
     int32_t               n_seq_max = 0;
     bool                  ok = false;
+    // MoE expert offload: tensor_buft_overrides 数组须覆盖 model 生命周期。
+    std::vector<llama_model_tensor_buft_override> moe_overrides_;
 };
 
 KevVulkanBackend * as_vulkan(kev_backend_t * b) {
@@ -103,11 +107,18 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     // Host is llama-free; log filter installed here inside the single-llama module.
     llama_log_set(kev_vulkan_log_filter, nullptr);
 
-    // Vulkan backend: offload ALL layers to the Vulkan device (like llama.cpp -ngl -1).
+    // Vulkan backend: offload 层数由参数决定(默认 -1 = all layers to GPU, 与 legacy 一致)。
     // Under a GGML_VULKAN build, n_gpu_layers < 0 steers the whole model onto the
     // Vulkan device (ggml-vulkan selected by ggml_backend_load_all / GPU mask).
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = -1;   // negative = all layers to GPU
+    int ng = p->n_gpu_layers;
+    if (ng == 0 && p->moe_offload) ng = -1;   // 显式要求省显存但未给层数时, 默认除专家外全上设备
+    mparams.n_gpu_layers = ng;
+    // MoE 专家 offload: 专家张量留 host RAM, 其余按 n_gpu_layers 进设备(降低显存占用)。
+    kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng);
+    if (!kb->moe_overrides_.empty()) {
+        mparams.tensor_buft_overrides = kb->moe_overrides_.data();
+    }
     kb->model = llama_model_load_from_file(p->model_path, mparams);
     if (!kb->model) { write_err(err, err_cap, "failed to load model: " + std::string(p->model_path)); return 1; }
     kb->vocab = llama_model_get_vocab(kb->model);

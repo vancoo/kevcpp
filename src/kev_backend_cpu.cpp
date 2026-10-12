@@ -23,6 +23,8 @@
 // directly, so decode semantics are preserved exactly (same llama underneath).
 #include "kev_backend.h"
 
+#include "kev_backend_moe.h"
+
 #include "llama.h"
 
 #include <cstring>
@@ -41,6 +43,8 @@ struct KevCpuBackend {
     int32_t               n_embd = 0;
     int32_t               n_seq_max = 0;
     bool                  ok = false;
+    // MoE expert offload: tensor_buft_overrides 的生命期必须覆盖 model 生命周期。
+    std::vector<llama_model_tensor_buft_override> moe_overrides_;
 };
 
 KevCpuBackend * as_cpu(kev_backend_t * b) {
@@ -95,7 +99,13 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     llama_log_set(kev_cpu_log_filter, nullptr);
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0;
+    mparams.n_gpu_layers = p->n_gpu_layers;   // 默认 0 = 全 CPU(legacy); 负数 = 全 GPU
+    // MoE 专家 offload: moe_offload 且走 GPU 时, 把专家张量强制留 host RAM(省显存),
+    // 其余按 n_gpu_layers 进设备。纯 CPU(n_gpu_layers=0)时为空, 行为与 legacy 完全一致。
+    kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, p->n_gpu_layers);
+    if (!kb->moe_overrides_.empty()) {
+        mparams.tensor_buft_overrides = kb->moe_overrides_.data();
+    }
     kb->model = llama_model_load_from_file(p->model_path, mparams);
     if (!kb->model) { write_err(err, err_cap, "failed to load model: " + std::string(p->model_path)); return 1; }
     kb->vocab = llama_model_get_vocab(kb->model);

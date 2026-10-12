@@ -80,6 +80,15 @@ typedef struct kev_backend_params {
     int         n_outputs_max_per_seq;      // llama n_outputs_max_per_seq (default 128)
     int         embeddings;                 // 1 = read hidden states
     int         lm_head;                    // 0 = skip lm_head projection (hidden-only serving)
+    // ---- MoE 专家 offload(追加在结构体末尾, 不破坏 ABI; 旧后端忽略新字段) ----
+    // n_gpu_layers: 要 offload 到 GPU 的层数。负数 = 全部层到 GPU(与 llama.cpp -ngl -1 一致);
+    //   0 = 全部留 CPU。供 CPU/Vulkan/GPU 后端统一透传给 llama_model_params.n_gpu_layers。
+    int         n_gpu_layers = 0;
+    // moe_offload: 0 = MoE 专家权重跟随 n_gpu_layers(默认全部进 VRAM); 1 = MoE 专家张量
+    //   (*_exps.weight 等专家张量)强制留在系统内存(host RAM), 其余(attention/shared/KV)仍按
+    //   n_gpu_layers 进 VRAM。用于"小显存显卡: 模型放内存, 专家按需转显存"以降低显存占用。
+    //   仅在 GPU/Vulkan 后端、且 n_gpu_layers != 0 时有实际效果(CPU 后端本就全在内存)。
+    int         moe_offload  = 0;
 } kev_backend_params;
 
 // Opaque handle for a live backend instance (one model+context).

@@ -37,6 +37,9 @@ struct BackendOptions {
     int         n_outputs_max_per_seq = 128;
     int         embeddings   = 1;
     int         lm_head      = 0;
+    // MoE 专家 offload(透传给 kev_backend_params; 见 kev_backend.h)。
+    int         n_gpu_layers = 0;   // 0 = 全 CPU; 负 = 全 GPU; 正 = N 层 GPU
+    int         moe_offload  = 0;   // 1 = MoE 专家张量强制留 host RAM, 其余按 n_gpu_layers
 };
 
 // A single branch for batch decode (backend-ABI flavor; llama_seq_id is int).

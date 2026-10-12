@@ -82,6 +82,12 @@ int main(int argc, char ** argv) {
     std::string decide_token_override;  // 可选: 覆盖 decide marker (--decide-token)
     int port = 8008, threads = 0, ctx = -1; float lora_scale = 1.0f, temperature = 0.0f;
     bool quiet = false;
+    // MoE 专家 offload / GPU 层数控制。--gpu-layers N: offload 到 GPU 的层数(负=全上设备,
+    // 0=全 CPU); --moe-mode vram|ram: vram=专家全量进显存(跟随 --gpu-layers), ram=专家强制
+    // 留系统内存、按需转显存(降低显存占用, 默认节省显存)。仅对 MoE 模型 + 非 cpu 后端有意义。
+    int gpu_layers = 0;
+    bool gpu_layers_set = false;    // 是否显式指定 --gpu-layers
+    std::string moe_mode = "ram";   // 默认省显存: 专家留内存, 其余按 --gpu-layers
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -93,6 +99,8 @@ int main(int argc, char ** argv) {
         else if (a == "--threads" || a == "-t") threads = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--backend") backend = next();
+        else if (a == "--gpu-layers") { gpu_layers = std::atoi(next().c_str()); gpu_layers_set = true; }
+        else if (a == "--moe-mode") moe_mode = next();
         else if (a == "--decide-config") decision_config_file = next();
         else if (a == "--temperature") temperature = (float) std::atof(next().c_str());
         else if (a == "--opt-end") opt_end_override = next();
@@ -110,6 +118,9 @@ int main(int argc, char ** argv) {
               "  --threads N / -t N  compute threads (0 or unset = auto detect cores, cap 32)\n"
               "  --ctx N             context size (default 8192; 2048 typical for short states)\n"
               "  --backend <name>    inference backend: 'cpu' (default). 'vulkan'(需对应 dll 构建).\n"
+              "  --gpu-layers N      layers offloaded to GPU (neg=all, 0=none; default: neg for gpu backends).\n"
+              "  --moe-mode <mode>   MoE expert placement: 'ram' (default, experts stay in host RAM to save\n"
+              "                       VRAM, loaded on demand) or 'vram' (experts fully in VRAM). MoE only.\n"
               "  --quiet             suppress per-request log lines\n");
             return 0;
         }
@@ -139,6 +150,18 @@ int main(int argc, char ** argv) {
     kev::KevModelOptions opt;
     opt.model_path = model_path;
     opt.n_ctx = ctx > 0 ? ctx : 8192; opt.n_threads = threads; opt.backend = backend;
+    // MoE 专家 offload / GPU 层数:
+    //  - 后端为 CPU 时 n_gpu_layers 恒 0(全 CPU, legacy 行为; MoE offload 无意义)。
+    //  - 后端为 GPU/Vulkan 时, 未显式给 --gpu-layers 则默认全层上设备(n_gpu_layers=-1);
+    //    显式给了则用给定值。
+    //  - --moe-mode ram  => moe_offload=1, 专家经 tensor_buft_overrides 强制留 host RAM;
+    //    --moe-mode vram => moe_offload=0, 专家跟随 n_gpu_layers 全量进显存。
+    if (backend == "cpu") {
+        opt.n_gpu_layers = 0;
+    } else {
+        opt.n_gpu_layers = gpu_layers_set ? gpu_layers : -1;
+    }
+    opt.moe_offload  = (moe_mode == "ram") ? 1 : 0;
     opt.decision_config = decision_config_file;
     opt.temperature_override = temperature > 0.0f ? temperature : 0.0f;
     opt.option_end_override  = opt_end_override;

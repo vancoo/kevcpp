@@ -59,6 +59,8 @@ bool Backend::init(const BackendOptions & opt, std::string * err) {
     p.n_outputs_max_per_seq = opt.n_outputs_max_per_seq;
     p.embeddings            = opt.embeddings;
     p.lm_head               = opt.lm_head;
+    p.n_gpu_layers          = opt.n_gpu_layers;
+    p.moe_offload           = opt.moe_offload;
 
     char ebuf[1024] = {0};
     if (ops_.init(handle_, &p, ebuf, sizeof(ebuf)) != 0) {
