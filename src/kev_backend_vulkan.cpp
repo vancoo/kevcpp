@@ -115,7 +115,7 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     if (ng == 0 && p->moe_offload) ng = -1;   // 显式要求省显存但未给层数时, 默认除专家外全上设备
     mparams.n_gpu_layers = ng;
     // MoE 专家 offload: 专家张量留 host RAM, 其余按 n_gpu_layers 进设备(降低显存占用)。
-    kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng);
+    kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng, p->model_path);
     if (!kb->moe_overrides_.empty()) {
         mparams.tensor_buft_overrides = kb->moe_overrides_.data();
     }

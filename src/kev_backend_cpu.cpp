@@ -102,7 +102,7 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     mparams.n_gpu_layers = p->n_gpu_layers;   // 默认 0 = 全 CPU(legacy); 负数 = 全 GPU
     // MoE 专家 offload: moe_offload 且走 GPU 时, 把专家张量强制留 host RAM(省显存),
     // 其余按 n_gpu_layers 进设备。纯 CPU(n_gpu_layers=0)时为空, 行为与 legacy 完全一致。
-    kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, p->n_gpu_layers);
+    kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, p->n_gpu_layers, p->model_path);
     if (!kb->moe_overrides_.empty()) {
         mparams.tensor_buft_overrides = kb->moe_overrides_.data();
     }
