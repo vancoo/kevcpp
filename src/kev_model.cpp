@@ -291,15 +291,25 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         const int32_t chunk = (backend_->n_batch() > 0) ? backend_->n_batch() : 512;
 
         // ===================== P2: 稳定公共前缀缓存 =====================
-        // 结构: {instructions}\n[ {options} ]\n{state}\nAnswer:
-        //   [D0..Dp) = tpl 中 {state} 之前的部分(渲染 instructions/options) = 同任务不变的稳定前缀
-        //   [Dp..)   = state + "\nAnswer:"(每次请求变化)
-        // 仅当 P[0..Dp) 与单独 tokenize(前缀文本) 逐位相等(BPE merge 未跨界)时才可复用缓存 KV —
-        // 保证"从公共前缀续接 state"与"从 pos 0 全量解码"得到同一条 token 序列(后者回退路径逐位一致)。
+        // 结构: {instructions}\n[ {options} ]\n{state}\nAnswer:(默认模板为 {state} 在前)
+        //   [D0..Dp) = 可复用前缀缓存 token 段; [Dp..) = 其余(tail, 每次续接 decode)。
+        // 候选 A(优先): tpl 中 {state} 之前的部分(渲染 instructions/options) = 同任务跨请求的稳定
+        //               前缀(仅当 {state} 不在模板首时该段非空)。默认模板 {state} 在首 -> 该段为空。
+        // 候选 B(回退): 整条已渲染 prompt 的前缀 P[0..Lp-1)(去掉最后一个 token 留作 tail)= 同报文
+        //               完全相同请求的整段复用。由于 Pg 直接取 P 自身的切片, 恒与 P 前缀逐位相等
+        //               (无 BPE 跨界问题): 续接 tail=P[Lp-1..] 与该请求从 pos0 全量解码得到同一条
+        //               token 序列, logits 逐位一致(仅极小浮点差, 同既有回退路径)。
+        // 候选 A 有效(A->Dp>0)时用 A(保留跨 state 复用的原设计); 否则用候选 B 兜底, 使命中
+        // "相同报文连发" 时能整段复用 prefill、只续接最后一个 token, 明显变快。
+        // 仅当 P[0..Dp) 与缓存指纹 Pg 逐位相等(BPE merge 未跨界)时才可复用缓存 KV。
         int Dp = -1;                     // <0 = 本问不使用前缀缓存
-        std::vector<int32_t> Pg;         // 稳定前缀 token ids = 前缀缓存指纹
+        std::vector<int32_t> Pg;         // 前缀缓存指纹 = 稳定前缀 token ids
         const bool want_prefix = decision_.cache_prefix && backend_ && backend_->ok();
+        // [TRACE] 诊断: 前缀缓存各环节(KEV_TRACE=1 时打印)。
+        const bool PFX_TRACE = (std::getenv("KEV_TRACE") != nullptr && std::string(std::getenv("KEV_TRACE")) == "1");
+        std::string pfx_mode;
         if (want_prefix) {
+            // ---- 候选 A: tpl 中 {state} 之前的部分(跨请求稳定前缀) ----
             const size_t sp = tpl.find("{state}");
             if (sp != std::string::npos && tpl.find("{state}", sp + 7) == std::string::npos) {
                 std::string pfx_tpl = tpl.substr(0, sp);   // {state} 之前(不含 {state})
@@ -318,12 +328,33 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                     Dp = (int) Pg.size();
                 }
             }
+            // ---- 候选 B(兜底): 相同报文整段复用 = 去掉最后一个 token 的整条 prompt 前缀 ----
+            // 仅当候选 A 未给出可用前缀(典型: 默认模板 {state} 在首 -> 前缀段为空, Dp<0)时启用。
+            if (Dp <= 0 && Lp >= 2) {
+                Pg.assign(P.begin(), P.end() - 1);   // P[0..Lp-1): 原样切片, 恒为 P 前缀
+                Dp = Lp - 1;
+                pfx_mode = "B(full-prompt-prefix)";
+            } else if (Dp > 0) {
+                pfx_mode = "A(template-stable-prefix)";
+            }
+            if (PFX_TRACE) {
+                const size_t sp0 = tpl.find("{state}");
+                std::fprintf(stderr,
+                    "[PFX][q=%d] Lp=%d state_first=%d Dp=%d Pg.size=%d mode=%s\n",
+                    k, (int)Lp, (int)(sp0 == 0), Dp, (int)Pg.size(),
+                    (want_prefix ? (pfx_mode.empty() ? "none" : pfx_mode.c_str()) : "want_prefix=false"));
+            }
+        } else if (PFX_TRACE) {
+            std::fprintf(stderr, "[PFX][q=%d] want_prefix=false (cache_prefix=%d backend_ok=%d)\n",
+                         k, (int)decision_.cache_prefix, backend_ ? (int)backend_->ok() : 0);
         }
         // 本问的前缀槽(base 之上); <0 表示无可用前缀槽。
         int pseq = -1;
+        std::string slot_hit;
         if (Dp > 0) {
             int evict = -1;
             pseq = prefix_slot(Pg, &evict);
+            slot_hit = (pseq >= 0) ? "HIT" : "miss";
             if (pseq < 0 && evict >= 0) {
                 // 未命中: 在该槽 prefill 稳定前缀 [0..Dp)
                 if (backend_) backend_->seq_clear(evict);
@@ -336,6 +367,11 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
             }
         }
         const bool use_prefix = (Dp > 0) && (pseq >= 0);
+        if (PFX_TRACE) {
+            std::fprintf(stderr, "[PFX][q=%d] want_prefix=%d Dp=%d pseq=%d slot=%s use_prefix=%d cachedPrefixes=%d\n",
+                         k, (int)want_prefix, Dp, pseq, slot_hit.c_str(), (int)use_prefix,
+                         (int)prefix_lru_.contents().size());
+        }
         // 从公共前缀槽续接 tail(state+Answer [+候选]) 到 scratch_seq_: 清空->复制前缀->decode。
         auto decode_tail_from_prefix = [&](const std::vector<int32_t> & tail, int32_t start_pos,
                                            const std::vector<int32_t> & out_global, int pseq,

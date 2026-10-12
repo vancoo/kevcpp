@@ -252,7 +252,8 @@ int main(int argc, char ** argv) {
             c["backend_version"] = model.backend_version();
             c["dtype"] = "fp32";
             c["temperature"] = model.temperature();
-            c["prefix_cache"] = {{"size", model.prefix_cache().capacity()}};
+            c["prefix_cache"] = {{"size", model.prefix_cache().capacity()},
+                                 {"cached_prefixes", (int) model.prefix_cache().contents().size()}};
             return c;
         };
         json out = {{"models", json::array({card("kev-latest"), card("jev-latest")})}};
