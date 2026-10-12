@@ -74,6 +74,20 @@ public:
                     std::string * err,
                     const std::vector<int32_t> & logits_pos = {});
     bool decode_batch(const std::vector<BackendBranch> & branches, std::string * err);
+
+    // B1: decode N independent sequences (each its own KV slot) in ONE llama_decode.
+    // Each request r provides tokens + start_pos + seq. out requests select
+    // (req_index, local_pos) and get back the global llama_get_logits_ith ordinal
+    // in out_idx. Returns false (sets *err) on failure.
+    struct MultiSeqRequest {
+        std::vector<int32_t> tokens;
+        int32_t              start_pos = 0;
+        int32_t              seq       = 0;
+    };
+    bool decode_multi_seq(const std::vector<MultiSeqRequest> & reqs,
+                          std::string * err,
+                          const std::vector<std::pair<int32_t,int32_t>> & out = {},
+                          std::vector<int32_t> * out_idx = nullptr);
     std::vector<float> read_hidden(int32_t out_idx, std::string * err);
     // read the logit the model assigns to token_id at the out_idx-th recent output
     // position (same index semantics as read_hidden). Requires lm_head enabled.

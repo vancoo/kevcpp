@@ -210,6 +210,83 @@ int op_read_hidden(kev_backend_t * b, int32_t out_idx, float * out, size_t out_c
     return 0;
 }
 
+// B1: decode multiple independent sequences (each its own KV slot) in ONE
+// llama_decode. seq-major token layout; each seq's positions are counted relative
+// to its own start_pos (independent M-RoPE). For every requested output
+// (out_seq[i], out_pos[i]) we mark llama_batch.logits[row]=1 and fill out_idx[i]
+// with the ordinal of that marked row in llama_get_logits_ith order (batch-row
+// major among all marked logits). This lets the host pass out_idx[] straight into
+// read_logits().
+int op_decode_multi_seq(kev_backend_t * b, const int32_t * tokens,
+                        const int32_t * n_tokens, const int32_t * start_pos,
+                        const int32_t * seq, int32_t n_seq,
+                        const int32_t * out_seq, const int32_t * out_pos, int32_t n_out,
+                        int32_t * out_idx, int32_t out_idx_cap,
+                        char * err, size_t err_cap) {
+    KevCpuBackend * kb = as_cpu(b);
+    if (!kb || !kb->ctx) { write_err(err, err_cap, "backend not initialized"); return 1; }
+    if (n_seq <= 0 || !tokens || !n_tokens || !start_pos || !seq) { write_err(err, err_cap, "invalid multi-seq request"); return 1; }
+    if (n_out > 0 && (!out_seq || !out_pos)) { write_err(err, err_cap, "invalid output request"); return 1; }
+    if (out_idx_cap < n_out) { write_err(err, err_cap, "out_idx buffer too small"); return 1; }
+
+    // Validate seq ids are distinct and within n_seq_max.
+    std::vector<int32_t> seen(kb->n_seq_max, 0);
+    for (int32_t s = 0; s < n_seq; ++s) {
+        if (seq[s] < 0 || seq[s] >= kb->n_seq_max) { write_err(err, err_cap, "seq id out of range"); return 1; }
+        if (seen[seq[s]]) { write_err(err, err_cap, "duplicate seq id in multi-seq batch"); return 1; }
+        seen[seq[s]] = 1;
+    }
+
+    // Total tokens; must not exceed n_batch (llama asserts n_tokens_all <= n_batch).
+    int64_t total = 0;
+    std::vector<int32_t> base(n_seq);
+    for (int32_t s = 0; s < n_seq; ++s) {
+        base[s] = (int32_t) total;
+        if (n_tokens[s] <= 0) { write_err(err, err_cap, "empty sequence in multi-seq batch"); return 1; }
+        total += n_tokens[s];
+    }
+    const int32_t nb = (int32_t) llama_n_batch(kb->ctx);
+    if (total > nb) { write_err(err, err_cap, "multi-seq batch too large: " + std::to_string(total) + " > n_batch " + std::to_string(nb)); return 1; }
+
+    llama_batch batch = llama_batch_init((int32_t) total, /*embd=*/0, kb->n_seq_max);
+    for (int32_t s = 0; s < n_seq; ++s) {
+        const int32_t n = n_tokens[s];
+        for (int32_t t = 0; t < n; ++t) {
+            const int32_t row = base[s] + t;
+            batch.token[row]     = (llama_token) tokens[row];
+            batch.pos[row]       = (llama_pos)(start_pos[s] + t);
+            batch.n_seq_id[row]  = 1;
+            batch.seq_id[row][0] = (llama_seq_id) seq[s];
+            batch.logits[row]    = 0;
+        }
+    }
+    for (int32_t i = 0; i < n_out; ++i) {
+        const int32_t s = out_seq[i];
+        const int32_t p = out_pos[i];
+        if (s < 0 || s >= n_seq || p < 0 || p >= n_tokens[s]) { write_err(err, err_cap, "output position out of range"); llama_batch_free(batch); return 1; }
+        const int32_t row = base[s] + p;
+        batch.logits[row] = 1;
+    }
+    batch.n_tokens = (int32_t) total;
+
+    const int r = llama_decode(kb->ctx, batch);
+    if (r != 0) { write_err(err, err_cap, "multi-seq decode failed ret=" + std::to_string(r)); llama_batch_free(batch); return 1; }
+
+    // The host reads each requested output via read_logits(out_idx, token, &lt), whose
+    // out_idx is passed straight to llama_get_logits_ith(ctx, out_idx). get_logits_ith
+    // treats its argument as a BATCH ROW index and translates it to the contiguous logits
+    // row via ctx->output_ids[row] (= ordinal among all llama_batch.logits!=0 rows, in
+    // batch order). So we must hand back the batch row base[s]+pos for each output.
+    // (The existing single-seq path does the same: it hands back the local position,
+    // which equals the batch row because that decode starts at batch row 0.)
+    for (int32_t i = 0; i < n_out; ++i) {
+        const int32_t s = out_seq[i];
+        out_idx[i] = base[s] + out_pos[i];
+    }
+    llama_batch_free(batch);
+    return 0;
+}
+
 int op_read_logits(kev_backend_t * b, int32_t out_idx, int32_t token_id, float * out) {
     KevCpuBackend * kb = as_cpu(b);
     if (!kb || !kb->ctx || !out || !kb->vocab) return 1;
@@ -379,6 +456,7 @@ KEV_BACKEND_API kev_backend_ops kev_backend_get_ops(void) {
         g_ops.read_logits     = op_read_logits;
         g_ops.vocab_n_tokens  = op_vocab_n_tokens;
         g_ops.n_batch         = op_n_batch;
+        g_ops.decode_multi_seq = op_decode_multi_seq;
     }
     return g_ops;
 }

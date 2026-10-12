@@ -188,6 +188,40 @@ typedef struct kev_backend_ops {
     // END (never reorder); a backend that predates this field returns 0 and the
     // host falls back to a conservative capacity.
     int32_t     (*n_batch)(kev_backend_t * b);
+
+    // ---- B1: single-ctx multi-sequence batched decode ----
+    // decode N independent sequences (each its own KV slot) in ONE llama_decode
+    // call. This is the core primitive for sequence-level parallelism: concurrent
+    // requests each occupy a distinct seq id and are decoded together, so the
+    // shared llama_context amortizes the graph/prefill across the batch.
+    //
+    //   * tokens    = concatenation of all seqs' token ids, seq-major
+    //                 (seq s occupies rows [base_s, base_s + n_tokens[s])).
+    //   * n_tokens  = [n_seq] token count per seq.
+    //   * start_pos = [n_seq] position offset where each seq continues (its own
+    //                 M-RoPE position accounting; independent per seq).
+    //   * seq       = [n_seq] target seq id (each must be distinct, < n_seq_max).
+    //   * out_seq/out_pos = per-requested-output: which seq and which local token
+    //                 position within that seq's tokens should produce logits.
+    //   * out_idx   = [n_out] filled by the backend: for each requested output, the
+    //                 ordinal index into llama_get_logits_ith(ctx, i) (0-based,
+    //                 batch-row major among all marked logits). The host passes the
+    //                 returned out_idx[] straight into read_logits(out_idx, token, &lt).
+    //
+    // Returns 0 on success, non-zero on error. Appended at the END (never reorder);
+    // a backend that predates this feature leaves it NULL and the host falls back
+    // to per-sequence decode_seq (serial).
+    int         (*decode_multi_seq)(kev_backend_t * b,
+                                    const int32_t * tokens,
+                                    const int32_t * n_tokens,
+                                    const int32_t * start_pos,
+                                    const int32_t * seq,
+                                    int32_t n_seq,
+                                    const int32_t * out_seq,
+                                    const int32_t * out_pos,
+                                    int32_t n_out,
+                                    int32_t * out_idx, int32_t out_idx_cap,
+                                    char * err, size_t err_cap);
 } kev_backend_ops;
 
 // Factory entry points every backend dll must export.

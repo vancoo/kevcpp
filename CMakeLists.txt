@@ -139,6 +139,27 @@ target_compile_features(kev-backend-cpu PRIVATE cxx_std_17)
 if (MSVC)
     target_compile_options(kev-backend-cpu PRIVATE /utf-8)
 endif()
+# ---- B1: single-ctx multi-sequence parallel-decode verification probe ----
+# Links the CPU backend + wrapper in-process (NO KEV_BACKEND_USE_DLL, so
+# load_cpu_inprocess() resolves kev_backend_get_* from kev_backend_cpu.cpp in the
+# SAME binary — the safe single-llama state). Proves N independent-KV sequences
+# decoded in one llama_decode(mlti-seq) are bit-identical to N serial decode_seq.
+add_executable(b1_multi_seq_probe
+    src/b1_multi_seq_probe.cpp
+    src/kev_backend_factory.cpp
+    src/kev_backend_cpu.cpp
+    src/kev_encode.cpp
+)
+target_link_libraries(b1_multi_seq_probe PRIVATE llama)
+target_compile_features(b1_multi_seq_probe PRIVATE cxx_std_17)
+# In-process static build (no KEV_BACKEND_USE_DLL): kev_backend_cpu.cpp's exported
+# factory symbols must be __declspec(dllexport) (not dllimport) so they are real
+# definitions in this binary, resolving wrap_loaded() in the factory.
+target_compile_definitions(b1_multi_seq_probe PRIVATE KEV_BACKEND_BUILD)
+if (MSVC)
+    target_compile_options(b1_multi_seq_probe PRIVATE /utf-8)
+endif()
+
 set_target_properties(kev-backend-cpu PROPERTIES
     OUTPUT_NAME "kev-backend-cpu"
     PREFIX "")

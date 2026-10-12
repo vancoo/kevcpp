@@ -108,6 +108,49 @@ bool Backend::decode_batch(const std::vector<BackendBranch> & branches, std::str
     return true;
 }
 
+bool Backend::decode_multi_seq(const std::vector<MultiSeqRequest> & reqs,
+                               std::string * err,
+                               const std::vector<std::pair<int32_t,int32_t>> & out,
+                               std::vector<int32_t> * out_idx) {
+    if (!handle_ || !ops_.decode_multi_seq) { set_err(err, "backend does not support decode_multi_seq (plugin ABI too old)"); return false; }
+    if (reqs.empty()) { set_err(err, "empty multi-seq batch"); return false; }
+    // Flatten tokens seq-major and gather the per-seq side arrays.
+    std::vector<int32_t> tokens;              tokens.reserve(0);
+    std::vector<int32_t> n_tokens(reqs.size());
+    std::vector<int32_t> start_pos(reqs.size());
+    std::vector<int32_t> seqs(reqs.size());
+    for (size_t s = 0; s < reqs.size(); ++s) {
+        const MultiSeqRequest & r = reqs[s];
+        n_tokens[s]  = (int32_t) r.tokens.size();
+        start_pos[s] = r.start_pos;
+        seqs[s]      = r.seq;
+        if (r.tokens.empty()) { set_err(err, "empty sequence in multi-seq batch"); return false; }
+        tokens.insert(tokens.end(), r.tokens.begin(), r.tokens.end());
+    }
+    std::vector<int32_t> out_seq(out.size());
+    std::vector<int32_t> out_pos(out.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        out_seq[i] = out[i].first;
+        out_pos[i] = out[i].second;
+    }
+    std::vector<int32_t> idx(out.size());
+    char ebuf[1024] = {0};
+    const int rc = ops_.decode_multi_seq(
+        handle_,
+        tokens.empty() ? nullptr : tokens.data(),
+        n_tokens.data(), start_pos.data(), seqs.data(), (int32_t) reqs.size(),
+        out.empty() ? nullptr : out_seq.data(),
+        out.empty() ? nullptr : out_pos.data(), (int32_t) out.size(),
+        idx.data(), (int32_t) idx.size(),
+        ebuf, sizeof(ebuf));
+    if (rc != 0) {
+        set_err(err, ebuf[0] ? ebuf : "decode_multi_seq failed");
+        return false;
+    }
+    if (out_idx) *out_idx = std::move(idx);
+    return true;
+}
+
 std::vector<float> Backend::read_hidden(int32_t out_idx, std::string * err) {
     if (!handle_ || !ops_.read_hidden) { set_err(err, "backend not loaded"); return {}; }
     const int32_t n = model_n_embd();
