@@ -125,11 +125,24 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     // 全权重在内存, --moe-mode ram 无需 override 即达成"加载到内存"; 离散 GPU(CUDA/Metal)上该
     // override 是 llama.cpp 官方 --n-cpu-moe 同机制, 可在验证后再放开。
     if (p->moe_offload && ng != 0 && kev_backend_moe::model_has_expert_tensors(p->model_path)) {
-        std::fprintf(stderr,
-            "[kev] WARN: --moe-mode ram (MoE experts to host RAM) is not applied on the Vulkan "
-            "backend (tensor_buft_overrides triggers a native crash on this UMA Vulkan device). "
-            "Experts stay on-device. Use the cpu backend (--backend cpu) for host-RAM expert "
-            "offload, or a CUDA/Metal GPU backend where llama.cpp supports --n-cpu-moe.\n");
+        // 实测门槛: 默认在 UMA Vulkan 上不启用(会原生崩溃)。若显式用 KEV_GPU_MOE_OVERRIDE=1
+        // 强制放开, 则真正对专家设置 tensor_buft_overrides(离散 GPU 语义), 用于实证本机制。
+        const bool force_override = std::getenv("KEV_GPU_MOE_OVERRIDE") != nullptr;
+        if (!force_override) {
+            std::fprintf(stderr,
+                "[kev] WARN: --moe-mode ram (MoE experts to host RAM) is not applied on the Vulkan "
+                "backend (tensor_buft_overrides triggers a native crash on this UMA Vulkan device). "
+                "Experts stay on-device. Set KEV_GPU_MOE_OVERRIDE=1 to force-enable for validation. "
+                "Or use the cpu backend (--backend cpu) for host-RAM expert offload.\n");
+        } else {
+            kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng, p->model_path);
+            if (!kb->moe_overrides_.empty()) {
+                mparams.tensor_buft_overrides = kb->moe_overrides_.data();
+                std::fprintf(stderr,
+                    "[kev] --moe-mode ram FORCE-ENABLED (KEV_GPU_MOE_OVERRIDE=1): MoE experts routed "
+                    "to host RAM via tensor_buft_overrides.\n");
+            }
+        }
     } else {
         kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng, p->model_path);
         if (!kb->moe_overrides_.empty()) {
