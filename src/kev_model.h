@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -179,6 +180,17 @@ private:
     // acquire/release a per-request scratch sequence slot (concurrent pool).
     int  acquire_scratch_slot();
     void release_scratch_slot(int seq);
+
+    // ---- 调研实验: 上下文校准 (contextual calibration; KEV_CALIB=1, 零训练) ----
+    // Zhao et al., "Calibrate Before Use", ICML 2021 (arXiv:2102.09690)。
+    // 治"模型对某答案有恒定先验偏置"(如 noul always-yes): 用内容中性输入估计每个候选的
+    // 系统性偏置 logit, 真实请求在 softmax 前做 z'[c] = z[c] - z_bias[c]。
+    // 缓存按 (候选 key 列表 + aggregation) 键控, 惰性估算一次。归 compute_mutex_ 串行保护
+    // (校准开启时 probs_logits 强制走串行路径)。不引入任何训练产物。
+    std::vector<float> estimate_answer_bias(const std::vector<std::string> & keys);
+    void apply_calibration(const KevQuestion & q, std::vector<float> & z);
+    bool calibrate_ = false;                       // KEV_CALIB=1 时开启
+    std::map<std::string, std::vector<float>> calib_cache_;  // key -> bias (compute_mutex_ 保护)
 
     std::unique_ptr<Backend> backend_;
     KevDecisionConfig decision_;   // 已解析的决策配置(marker + 温度 + logits 通道)

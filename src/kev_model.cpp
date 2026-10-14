@@ -64,6 +64,12 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     if (!opt.option_end_override.empty()) decision_.option_end = opt.option_end_override;
     if (!opt.decide_marker_override.empty()) decision_.decide_marker = opt.decide_marker_override;
 
+    // 调研实验: 上下文校准开关(KEV_CALIB=1), 零训练纯后处理。默认关, 行为完全不变。
+    calibrate_ = std::getenv("KEV_CALIB") != nullptr && std::string(std::getenv("KEV_CALIB")) == "1";
+    if (calibrate_) {
+        std::fprintf(stderr, "kev_model: contextual calibration ON (KEV_CALIB=1)\n");
+    }
+
     // Pluggable backend: load by name (default "cpu"), then init it with the
     // same llama parameters the legacy single-module KevModel used.
     backend_ = BackendFactory_load(opt.backend.empty() ? std::string("cpu") : opt.backend, err);
@@ -357,7 +363,9 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
     // B2: 并发批处理模式不持 compute_mutex_(解码经 BatchScheduler 单 worker 串行 + 批量);
     // 非批处理回退路径保持原「整函数持 compute_mutex_」串行语义。批处理时每请求取一个独立
     // sequence 槽(并发池), 避免请求间 KV 冲突; 分词 / LRU 前缀管理分别用短锁串行。
-    const bool batched = batching_enabled_ && scheduler_;
+    // 上下文校准(calibrate_)强制走串行路径: 偏置需在同一锁内惰性估算、用 scratch_seq_ 解码,
+    // 与批调度器的并发 decode 不冲突(实验期简单可靠)。
+    const bool batched = !calibrate_ && batching_enabled_ && scheduler_;
     std::unique_ptr<std::lock_guard<std::mutex>> compute_lock;
     if (!batched) compute_lock.reset(new std::lock_guard<std::mutex>(compute_mutex_));
     const int my_slot = batched ? acquire_scratch_slot() : scratch_seq_;
@@ -537,6 +545,8 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
             }
         }
 
+        // 上下文校准(KEV_CALIB=1): softmax 前减去该候选集的系统性先验偏置 z'[c]=z[c]-z_bias[c]。
+        if (calibrate_) apply_calibration(q, z);
         softmax_scaled(z, decision_.temperature, probs[k]);
         qms[k] = now_ms() - tq0;
     }
@@ -727,6 +737,93 @@ KevModel::ProbsResult KevModel::probs_hidden(const KevRequest & req, bool use_st
     res.rows_ms_per_q = std::move(qms);
     res.t_total_ms = now_ms() - t0;
     return res;
+}
+
+// 上下文校准: 用内容中性输入(空 instructions + state="N/A")拼同模板, 跑 logits 通道的
+// "first" 聚合, 求得该候选集每个候选的**系统性先验偏置 logit**。缓存按候选集缓存一次。
+// 前置: 调用方须已持 compute_mutex_ 且处于串行路径(校准开启时 probs_logits 强制串行),
+// 因此可安全使用 scratch_seq_ 解码、并安全读写 calib_cache_(无并发竞争)。
+std::vector<float> KevModel::estimate_answer_bias(const std::vector<std::string> & keys) {
+    std::vector<float> bias(keys.size(), 0.0f);
+    if (keys.empty() || !backend_ || !backend_->ok()) return bias;
+    const int nv = backend_->vocab_n_tokens();
+    if (nv <= 0) return bias;
+
+    const TokenFeeder tf = backend_->token_feeder();
+    const std::string & tpl = decision_.prompt_template;
+    const std::string & agg = decision_.aggregation;
+
+    // 合成一条"无信息"请求(state="N/A", instructions 空), 其余(模板/候选)与真实一致。
+    KevQuestion sq;
+    sq.instr = "";
+    sq.keys = keys;
+    sq.options = keys;          // 直接用 key 作为 option 文本(仅用到其首 token 的 logits)。
+    KevRequest sreq;
+    sreq.state = "N/A";
+    sreq.questions.push_back(sq);
+
+    std::string prompt = render_prompt(tpl, sq, sreq, sq.options);
+    std::vector<int32_t> P = kev::tokenize(tf, prompt, /*add_special=*/false, /*parse_special=*/false);
+    while (!P.empty() && P.back() < 0) P.pop_back();
+    const int32_t Lp = (int32_t) P.size();
+    if (Lp == 0) return bias;
+
+    // only support the default "first" aggregation for bias (the实验聚焦默认路径; sum/mean 需另估)。
+    if (agg != "first") return bias;
+
+    std::vector<std::vector<int32_t>> cand_tok(keys.size());
+    std::vector<int32_t> cand_first(keys.size(), -1);
+    for (size_t j = 0; j < keys.size(); ++j) {
+        cand_tok[j] = kev::tokenize(tf, keys[j], /*add_special=*/false, /*parse_special=*/false);
+        cand_first[j] = cand_tok[j].empty() ? -1 : cand_tok[j][0];
+    }
+
+    std::string e2;
+    (void) backend_->seq_clear(scratch_seq_);
+    std::vector<std::vector<int32_t>> one_cand(1, cand_first);
+    std::vector<std::vector<float>> lg;
+    // 用与 probs_logits "first" 路径相同的语义: 单次 decode 末位置 Lp-1 读各候选首 token logits。
+    if (backend_->decode_seq(P, 0, scratch_seq_, &e2, /*logits_pos=*/{Lp - 1})) {
+        // decode_seq 标记了 Lp-1 输出; 读那一个位置的各候选首 token logits。
+        for (size_t j = 0; j < keys.size(); ++j) {
+            if (cand_first[j] < 0) { bias[j] = 0.0f; continue; }
+            float v = 0.0f;
+            // out_idx 语义: 该次 decode 中标记输出的位置序。这里只标记了 1 个位置(Lp-1), 故 out_idx=0。
+            (void) backend_->read_logits(0, cand_first[j], &v, &e2);
+            bias[j] = v;
+        }
+    }
+    if (backend_) backend_->seq_clear(scratch_seq_);
+    return bias;
+}
+
+void KevModel::apply_calibration(const KevQuestion & q, std::vector<float> & z) {
+    if (q.keys.empty() || z.size() != q.keys.size()) return;
+    // 校准强度 scale(KEV_CALIB_SCALE, 默认 1.0)。z'[c] = (z[c]-z_bias[c])*scale。
+    // scale>1 放大偏置扣减的相对分离(置信度锐化); 不改 sign, 仅放大已有分离。
+    static const float calib_scale = []() {
+        const char * s = std::getenv("KEV_CALIB_SCALE");
+        return (s && *s) ? (float) std::atof(s) : 1.0f;
+    }();
+    // 缓存键 = 候选 key 列表 + 模板 + 聚合方式(同一"答案空间"共用一份偏置)。
+    std::string key = decision_.prompt_template + "|" + decision_.aggregation + "|";
+    for (const auto & k : q.keys) { key += k; key += "\x1f"; }
+    auto it = calib_cache_.find(key);
+    if (it == calib_cache_.end()) {
+        std::vector<float> bias = estimate_answer_bias(q.keys);
+        it = calib_cache_.emplace(key, std::move(bias)).first;
+        const bool TR = std::getenv("KEV_TRACE") != nullptr && std::string(std::getenv("KEV_TRACE")) == "1";
+        if (TR && !q.keys.empty()) {
+            std::string ks; for (const auto & k : q.keys) ks += (ks.empty() ? "" : ",") + k;
+            std::string bs; for (size_t i = 0; i < it->second.size(); ++i) { char b[24]; std::snprintf(b, sizeof b, "%.2f", it->second[i]); bs += (i ? "," : "") + std::string(b); }
+            std::fprintf(stderr, "[CALIB] bias(%s) = [%s]\n", ks.c_str(), bs.c_str());
+        }
+    }
+    const auto & bias = it->second;
+    if (bias.size() != z.size()) return;
+    for (size_t c = 0; c < z.size(); ++c) {
+        z[c] = (z[c] - bias[c]) * calib_scale;   // z'[c]; softmax 在调用方随后施加。
+    }
 }
 
 bool KevModel::warm_graph(int state_tokens, int branch_tokens, std::string * err) {
