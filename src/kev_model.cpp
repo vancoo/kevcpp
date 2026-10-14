@@ -368,6 +368,18 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
     const int nv = backend_->vocab_n_tokens();
     if (nv <= 0) { if (err && err->empty()) *err = "vocab unavailable (read_logits unsupported or lm_head disabled)"; return res; }
 
+    // 调研实验(KEV_ANSWERLABEL): 选项标签化 + 答案位锁死(零训练)。
+    // 落实两个用户观点: (1) 不让 'Answer:' 后首 token 被解释/铺垫污染 → 强约束只能输出标签;
+    //                    (2) 比对的应是"选项(稳定标签)"而非"选项内容(description)"。
+    //  modenum: 把候选编号成 1..K, 模板改为"只输出编号", 候选 token 用数字标签。
+    //  modeyn : (noul) 候选 token 用 "No"/"Yes"(多选题评测共识 label word), 模板要求答 Yes/No。
+    // 默认 off, 行为完全不变。候选 token 由 q.keys[j] 换成标签 token, 但 probs 顺序仍按原候选
+    // (索引 0..K-1), 故 to_answers 的 key 映射不变。
+    const char * kev_al = std::getenv("KEV_ANSWERLABEL");
+    const std::string label_mode = kev_al ? kev_al : "";
+    const bool label_num = (label_mode == "num");
+    const bool label_yn  = (label_mode == "yn");
+
     std::vector<std::vector<float>> probs(Q);
     std::vector<double> qms(Q, 0.0);
 
@@ -396,6 +408,28 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         const int K = (int) q.keys.size();
         if (K == 0) { if (err && err->empty()) *err = "question " + std::to_string(k) + ": no candidate keys"; return res; }
         std::string prompt = render_prompt(tpl, q, req, q.options);
+        // ---- 标签化模式: 用编号/YesNo 重建 prompt + 把候选 token 换成稳定标签 ----
+        std::vector<std::string> label_strs(K);   // 每个候选对应的打分标签文本
+        bool use_label = label_num || label_yn;
+        if (use_label) {
+            // 判断是否 noul(2 选项, key=="false")——仅 yn 模式限定 noul。
+            const bool is_noul = (K == 2) && (q.keys.size() == 2) && q.keys[0] == "false";
+            if (label_yn && !is_noul) use_label = false;   // yn 只对 noul 生效
+        }
+        if (use_label) {
+            if (label_yn) {
+                label_strs[0] = "No"; label_strs[1] = "Yes";
+                prompt = q.instr + "\n" + req.state +
+                         "\n请只回答 Yes 或 No(不要输出其他任何内容或解释):\n答案:";
+            } else { // label_num
+                for (int j = 0; j < K; ++j) label_strs[j] = std::to_string(j + 1);
+                prompt = q.instr + "\n" + req.state +
+                         "\n请只回答下列选项的编号(只输出一个数字,不要其他任何内容或解释):\n";
+                for (int j = 0; j < K; ++j) prompt += std::to_string(j + 1) + ". " + q.options[j] + "\n";
+                prompt += "答案:";
+            }
+            use_label = true;
+        }
         std::vector<int32_t> P = tok(prompt);
         while (!P.empty() && P.back() < 0) P.pop_back();   // 剔除退化/占位
         const int32_t Lp = (int32_t) P.size();
@@ -406,7 +440,10 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         std::vector<std::vector<int32_t>> cand_tok(K);
         std::vector<int32_t> cand_first(K, -1);
         for (int j = 0; j < K; ++j) {
-            cand_tok[j] = tok(q.keys[j]);
+            // 默认: 候选 token = option 的 key(比对"选项内容/别名");
+            // 标签模式: 候选 token = 稳定标签("1"/"2"/"No"/"Yes"), 落实"比对选项而非内容"。
+            const std::string & cs = use_label ? label_strs[j] : q.keys[j];
+            cand_tok[j] = tok(cs);
             cand_first[j] = cand_tok[j].empty() ? -1 : cand_tok[j][0];
         }
         std::vector<float> z(K, 0.0f);
@@ -422,7 +459,7 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         // 公共前缀 token ids; 命中 = 某缓存槽存的整段前缀是请求 P 的前缀(公共前缀语义), 取最长者;
         // Dp = 该槽的完整存储前缀长度, 从 Dp 续算 tail(state+Answer)。这取代了旧的「候选 A/B 双路径」,
         // 且同任务连发(含相同报文)与跨 state 都能命中。
-        const bool want_prefix = decision_.cache_prefix && backend_ && backend_->ok() && Lp >= 2;
+        const bool want_prefix = !use_label && decision_.cache_prefix && backend_ && backend_->ok() && Lp >= 2;
         // [TRACE] 诊断: 前缀缓存各环节(KEV_TRACE=1 时打印)。
         const bool PFX_TRACE = std::getenv("KEV_TRACE") != nullptr && std::string(std::getenv("KEV_TRACE")) == "1";
         int Dp = -1;                       // 本问复用前缀长度(<0 = 不使用前缀缓存)
