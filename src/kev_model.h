@@ -44,6 +44,12 @@ struct KevModelOptions {
     std::string decide_marker_override;       // 非空时覆盖 decision.decide_marker
     int n_ctx          = 2048;
     int n_threads      = 0;      // 0 = auto
+    // 解码批大小 (llama n_batch / n_ubatch, 默认 512 / 256)。n_batch 是单次 llama_decode
+    // 的「逻辑上限」token 数(超了会触发 llama GGML_ASSERT); llama.cpp 内部把一次 n_batch 的
+    // 前向按 n_ubatch 切子批、每个子批重建并运行一次计算图(真正的 prefill 块)。n_ubatch 必须
+    // <= n_batch。0 = 用后端各默认(512/256)。两者一起加大对长 prompt / 高并发合并有明显影响。
+    int n_batch        = 512;
+    int n_ubatch       = 256;
     // P2 前缀缓存槽位数(缓存"稳定公共前缀"{instructions}\n[ {options} ]\n 的 KV)。同一类任务的
     // 多请求共享同一前缀 -> 只需 1~2 个槽即命中; 不同 instructions/options 任务各占一个 LRU 槽。
     int prefix_capacity = 4;
@@ -141,6 +147,22 @@ private:
     // 填空式 prompt 渲染({state}/{instructions}/{options} 占位替换)。
     static std::string render_prompt(const std::string & tpl, const KevQuestion & q,
                                      const KevRequest & req, const std::vector<std::string> & opts);
+
+    // ---- 调研实验: hidden 聚合判别通道(零训练, KEV_DECIDE=hidden|hidden_state) ----
+    // 读隐层读入表示向量, 在 hidden 空间聚合/打分, 替代"仅取候选首 token 的 vocab logits"。
+    //   use_state_agg=true  → 先用 h_decide 对 {state} 各 token hidden 做软注意力加权聚合,
+    //                         得 h_agg(即"用注意力找相关内容再 sum")。
+    //   score[c] = cos(query, h_cand[c]), query = h_decide 或 h_agg。零训练, 模型无关。
+    ProbsResult probs_hidden(const KevRequest & req, bool use_state_agg, std::string * err);
+
+    // Decode `tokens` 续接在 seq, 在 out_pos 各位置读 hidden 向量(read_hidden), 返回
+    // hidden[out][n_embd]。串行路径(调用方须已持 compute_mutex_)。copy_src>=0 表示从缓存
+    // 前缀 continue。out_pos 使用与 decode_one_to_logits 相同的全局位置语义。
+    bool decode_one_to_hidden(const std::vector<int32_t> & tokens, int32_t start_pos,
+                              int32_t seq, int32_t copy_src,
+                              const std::vector<int32_t> & out_pos,
+                              std::vector<std::vector<float>> & hidden,
+                              std::string * err);
 
     // ---- B2: batched-decode helpers ----
     // Decode `tokens` (possibly continued from cached prefix `copy_src`) into `seq`,

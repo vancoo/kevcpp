@@ -78,13 +78,18 @@ bool KevModel::init(const KevModelOptions & opt, std::string * err) {
     bopt.n_ctx             = opt.n_ctx > 0 ? opt.n_ctx : 2048;
     bopt.n_seq_max         = n_seq_max_;
     bopt.n_threads         = n_threads_;
-    bopt.n_batch           = 512;             // legacy value
-    bopt.n_ubatch          = 256;             // legacy value
+    bopt.n_batch           = opt.n_batch > 0 ? opt.n_batch : 512;    // legacy default 512
+    bopt.n_ubatch          = opt.n_ubatch > 0 ? opt.n_ubatch : 256;  // legacy default 256
     bopt.n_outputs_max_per_seq = 128;         // legacy value
     // 生成式 logits 判别主通道(read_logits 经 llama_get_logits_ith 读 token logits)
     // 只需要 lm_head 投影的 logits 缓冲, 不需要 hidden 输出(embeddings=true 会多付一次
     // hidden 计算)。故 logits 主线恒 关 embeddings、开 lm_head。
-    bopt.embeddings        = 0;
+    // · 调研实验: hidden 聚合判别通道(KEV_DECIDE=hidden|hidden_state)需要读隐层向量,
+    //   故此处恒开 embeddings=1(read_hidden 可用)。llama.cpp 在 embeddings 模式下会对全部
+    //   token 输出 hidden, 但 logits/embeddings 共享同套 output_ids 索引, 现有 read_logits
+    //   通道的 out_idx 语义不变, 不受影响(仅多一次 hidden 计算, 实验通道才实际读取)。
+    //   仅当非实验(不使用 hidden 通道)时… 实验期统一开, 保持简单。
+    bopt.embeddings        = 1;
     bopt.lm_head           = 1;
     // MoE 专家 offload: 透传 n_gpu_layers 与 moe_offload(见 kev_backend.h)。
     bopt.n_gpu_layers      = opt.n_gpu_layers;
@@ -250,6 +255,15 @@ void KevModel::release_scratch_slot(int seq) {
 
 KevModel::ProbsResult KevModel::probs(const KevRequest & req, std::string * err) {
     // 生成式 logits 判别主通道(logits 主线; 不再有 KEV 回退)。
+    // 调研实验: 用 KEV_DECIDE 启用 hidden 聚合判别通道(零训练), default 保持 logits。
+    //   "hidden"         : score[c] = cos(h_decide, h_cand[c])  决定向量 vs 各候选表示
+    //   "hidden_state"   : 先对 {state} 的 hidden 做注意力加权聚合 -> h_agg, 再
+    //                       score[c] = cos(h_agg, h_cand[c])(即'用注意力找相关内容再聚合')
+    const char * dec = std::getenv("KEV_DECIDE");
+    std::string m = dec ? dec : "";
+    if (m == "hidden" || m == "hidden_state") {
+        return probs_hidden(req, m == "hidden_state", err);
+    }
     return probs_logits(req, err);
 }
 
@@ -521,6 +535,188 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                 for (int m = 0; m < M; ++m) s += (mlg[m].empty() ? 0.0f : mlg[m][0]);
                 z[j] = (agg == "mean") ? (s / (float) M) : s;
             }
+        }
+
+        softmax_scaled(z, decision_.temperature, probs[k]);
+        qms[k] = now_ms() - tq0;
+    }
+    res.t_rows_ms = 0.0; for (double x : qms) res.t_rows_ms += x;
+    res.probs = std::move(probs);
+    res.rows_ms_per_q = std::move(qms);
+    res.t_total_ms = now_ms() - t0;
+    return res;
+}
+
+// ---- 调研实验: hidden 聚合判别通道(零训练) ----
+// decode + 在多个位置读 hidden 表示向量。
+bool KevModel::decode_one_to_hidden(const std::vector<int32_t> & tokens, int32_t start_pos,
+                                    int32_t seq, int32_t copy_src,
+                                    const std::vector<int32_t> & out_pos,
+                                    std::vector<std::vector<float>> & hidden,
+                                    std::string * err) {
+    hidden.assign(out_pos.size(), {});
+    if (!backend_ || !backend_->ok()) { if (err && err->empty()) *err = "backend not initialized"; return false; }
+    const int32_t n_embd = backend_->model_n_embd();
+    if (n_embd <= 0) { if (err && err->empty()) *err = "hidden channel needs embeddings (read_hidden) enabled"; return false; }
+
+    std::string e2;
+    (void) backend_->seq_clear(seq);
+    if (copy_src >= 0 && !backend_->seq_copy(copy_src, seq)) { if (err && err->empty()) *err = "seq_copy failed"; return false; }
+    std::vector<int32_t> out_local;
+    const int chunk = backend_->n_batch() > 0 ? backend_->n_batch() : 512;
+    if (!decode_seq_chunked(tokens, start_pos, seq, &e2, out_pos, out_local, chunk)) {
+        if (err && err->empty()) *err = e2;
+        return false;
+    }
+    for (size_t o = 0; o < out_local.size(); ++o) {
+        auto h = backend_->read_hidden(out_local[o], &e2);
+        if (h.empty()) { if (err && err->empty()) *err = e2.empty() ? std::string("read_hidden failed") : e2; return false; }
+        hidden[o] = std::move(h);
+    }
+    return true;
+}
+
+// 计算填充式 P 里 {state} 占位替换所得文本的 token 区间 [start,end)。
+// P 由 render_prompt 得到(已把 {state} 换成 req.state)。此处复刻前缀/后缀替换以确定边界。
+namespace {
+void hidden_state_span(const std::string & tpl, const KevQuestion & q, const KevRequest & req,
+                       const std::vector<std::string> & opts, const TokenFeeder & tf,
+                       std::vector<int32_t> & P,
+                       int * state_start, int * state_end) {
+    auto fill = [&](std::string s) {
+        auto rep = [&](const char * ph, const std::string & val) {
+            size_t at = 0;
+            while ((at = s.find(ph, at)) != std::string::npos) { s.replace(at, std::strlen(ph), val); at += val.size(); }
+        };
+        std::string opts_str;
+        for (size_t i = 0; i < opts.size(); ++i) { if (i) opts_str += ", "; opts_str += opts[i]; }
+        rep("{instructions}", q.instr);
+        rep("{options}", opts_str);
+        return s;
+    };
+    const size_t sp = tpl.find("{state}");
+    std::string prefix_s = fill(tpl.substr(0, sp));      // {state} 之前(含 instructions/options)
+    std::string prefix_state = prefix_s + req.state;     // prefix + state(即 {state} 替换后截止)
+    auto strip = [&](std::vector<int32_t> & v) { while (!v.empty() && v.back() < 0) v.pop_back(); };
+    std::vector<int32_t> Pfx = kev::tokenize(tf, prefix_s, /*add_special=*/false, /*parse_special=*/false); strip(Pfx);
+    std::vector<int32_t> PfxSt = kev::tokenize(tf, prefix_state, /*add_special=*/false, /*parse_special=*/false); strip(PfxSt);
+    *state_start = (int) Pfx.size();
+    *state_end   = (int) PfxSt.size();
+    // 与 render_prompt 产生的整条 P 对齐; 若 P 长度小于约定(异常), 夹紧。
+    if (*state_end > (int) P.size()) { *state_end = (int) P.size(); if (*state_start > *state_end) *state_start = *state_end; }
+}
+} // namespace
+
+KevModel::ProbsResult KevModel::probs_hidden(const KevRequest & req, bool use_state_agg, std::string * err) {
+    ProbsResult res;
+    double t0 = now_ms();
+    const int Q = (int) req.questions.size();
+    if (!backend_ || !backend_->ok()) { if (err && err->empty()) *err = "backend not initialized"; return res; }
+    if (Q == 0) { if (err && err->empty()) *err = "no questions"; return res; }
+
+    const TokenFeeder tf = backend_->token_feeder();
+    const std::string & tpl = decision_.prompt_template;
+    const int n_embd = backend_->model_n_embd();
+    if (n_embd <= 0) { if (err && err->empty()) *err = "hidden channel unavailable (embeddings disabled)"; return res; }
+
+    // 串行路径: 整个函数持有 compute_mutex_(实验通道不接入 batch 调度器, 简单可靠)。
+    std::lock_guard<std::mutex> lock(compute_mutex_);
+    auto tok = [&](const std::string & t) {
+        std::lock_guard<std::mutex> lk(tokenizer_mutex_);
+        return kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/false);
+    };
+
+    std::vector<std::vector<float>> probs(Q);
+    std::vector<double> qms(Q, 0.0);
+
+    // 余弦相似度 query(决定向量或聚合向量) vs 各候选续写末尾 hidden。
+    auto cos_ = [&](const std::vector<float> & a, const std::vector<float> & b) {
+        if (a.size() != b.size() || a.empty()) return 0.0f;
+        double na = 0, nb = 0, d = 0;
+        for (size_t i = 0; i < a.size(); ++i) { d += (double) a[i] * b[i]; na += (double) a[i] * a[i]; nb += (double) b[i] * b[i]; }
+        double den = std::sqrt(na) * std::sqrt(nb);
+        return (float)(den > 0 ? d / den : 0.0);
+    };
+
+    for (int k = 0; k < Q; ++k) {
+        const KevQuestion & q = req.questions[k];
+        const int K = (int) q.keys.size();
+        if (K == 0) { if (err && err->empty()) *err = "question " + std::to_string(k) + ": no candidate keys"; return res; }
+        std::string prompt = render_prompt(tpl, q, req, q.options);
+        std::vector<int32_t> P = tok(prompt);
+        while (!P.empty() && P.back() < 0) P.pop_back();
+        const int32_t Lp = (int32_t) P.size();
+        if (Lp == 0) { if (err && err->empty()) *err = "question " + std::to_string(k) + ": empty prompt"; return res; }
+
+        double tq0 = now_ms();
+        // 决定向量 = 最后一个位置(prompt 末尾, 'Answer:' 之后)的 hidden, 已对全文注意力聚合。
+        std::vector<std::vector<float>> hd;
+        std::string e2;
+        if (!decode_one_to_hidden(P, 0, scratch_seq_, -1, {Lp - 1}, hd, &e2)) {
+            if (err && err->empty()) *err = e2; return res;
+        }
+        std::vector<float> h_decide = hd.empty() ? std::vector<float>() : hd[0];
+
+        // 可选: 用 h_decide 对 {state} 的 token hidden 做软注意力加权聚合 -> h_agg。
+        std::vector<float> query = h_decide;
+        if (use_state_agg) {
+            int st0 = 0, st1 = 0;
+            hidden_state_span(tpl, q, req, q.options, tf, P, &st0, &st1);
+            if (st1 > st0 && st0 >= 0 && st1 <= (int) Lp) {
+                // 取 state 末尾至多 kStateMaxTok 个 token(控制读取成本), 读取各自 hidden。
+                const int kStateMaxTok = 256;
+                int take_start = std::max(st0, st1 - kStateMaxTok);
+                std::vector<int32_t> state_pos;
+                for (int p = take_start; p < st1; ++p) state_pos.push_back(p);
+                std::vector<std::vector<float>> hs;
+                if (!decode_one_to_hidden(P, 0, scratch_seq_, -1, state_pos, hs, &e2)) { if (err && err->empty()) *err = e2; return res; }
+                // 软注意力: w_t = softmax( (h_decide·h_t)/sqrt(d) ) over state tokens;
+                // 数值稳定缩放到余弦相似度区间。
+                double mx = -1e30; std::vector<double> att(hs.size(), 0.0);
+                const double scale = 1.0 / std::sqrt((double) n_embd);
+                for (size_t t = 0; t < hs.size(); ++t) {
+                    double dp = 0;
+                    for (int i = 0; i < n_embd && i < (int) h_decide.size() && i < (int) hs[t].size(); ++i) dp += (double) h_decide[i] * hs[t][i];
+                    att[t] = dp * scale; if (att[t] > mx) mx = att[t];
+                }
+                for (size_t t = 0; t < hs.size(); ++t) att[t] = std::exp(att[t] - mx);
+                double zn = 0; for (double a : att) zn += a; if (zn > 0) for (double & a : att) a /= zn;
+                query.assign(n_embd, 0.0f);
+                for (size_t t = 0; t < hs.size(); ++t)
+                    for (int i = 0; i < n_embd && i < (int) hs[t].size(); ++i) query[i] += (float)(att[t] * hs[t][i]);
+            }
+        }
+
+        // 每候选: 解码 P + 完整候选 token, 读末尾 hidden(该候选续写后的表示)。
+        // 评分 = 中心化后的余弦(query, h_cand)。原始高维残差流里各候选共享一大片"通用 LM
+        // 激活"方向, 导致 raw cos 全部近同(实测近 0.5/0.5 均布)。故先对各候选 hidden 求质心,
+        // 把 query 与各候选都减去质心, 只保留"候选相对彼此差异 + 该差异与 query 的对齐"。
+        std::vector<std::vector<float>> HC(K);
+        std::vector<float> centroid(n_embd, 0.0f);
+        bool anyCand = false;
+        for (int j = 0; j < K; ++j) {
+            std::vector<int32_t> cand = tok(q.keys[j]);
+            while (!cand.empty() && cand.back() < 0) cand.pop_back();
+            std::vector<int32_t> ids = P; ids.insert(ids.end(), cand.begin(), cand.end());
+            int out_pos = ids.empty() ? (int) Lp - 1 : (int) ids.size() - 1;
+            std::vector<std::vector<float>> hc;
+            if (!decode_one_to_hidden(ids, 0, scratch_seq_, -1, {out_pos}, hc, &e2)) { HC[j].clear(); continue; }
+            HC[j] = hc.empty() ? query : hc[0];
+            if ((int) HC[j].size() == n_embd) {
+                anyCand = true;
+                for (int i = 0; i < n_embd; ++i) centroid[i] += HC[j][i];
+            } else { HC[j].clear(); }
+        }
+        if (anyCand) for (int i = 0; i < n_embd; ++i) centroid[i] /= (float) K;
+
+        std::vector<float> z(K, 0.0f);
+        for (int j = 0; j < K; ++j) {
+            if ((int) HC[j].size() != n_embd) { z[j] = 0.0f; continue; }
+            // query 与候选都减去候选质心(只取相对差异方向)。
+            std::vector<float> qc(n_embd), kc(n_embd);
+            for (int i = 0; i < n_embd; ++i) { qc[i] = query[i] - centroid[i]; kc[i] = HC[j][i] - centroid[i]; }
+            z[j] = cos_(qc, kc);
+            if (std::isnan(z[j])) z[j] = 0.0f;
         }
 
         softmax_scaled(z, decision_.temperature, probs[k]);
