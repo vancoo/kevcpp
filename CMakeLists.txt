@@ -121,6 +121,19 @@ if (MSVC)
     target_compile_options(cold_profile PRIVATE /utf-8)
 endif()
 
+# ---- token_position_probe: 诊断工具。直接链接 vendored llama。
+# 目的: 对 kevcpp 默认模板('...\nAnswer:')下的 prompt, 看模型从 Answer: 位置开始
+# 实际(top-k)倾向输出什么,以及贪心滚动的头几 token, 判断"读 Lp-1 首 token logit"
+# 这条线是否成立、首 token 常错是不是因为前面有解释/铺垫 token。零训练, 只诊断。
+add_executable(token_position_probe
+    src/token_position_probe.cpp
+)
+target_link_libraries(token_position_probe PRIVATE llama)
+target_compile_features(token_position_probe PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(token_position_probe PRIVATE /utf-8)
+endif()
+
 # ---- Pluggable backend (Path B): backend plugin dlls ----
 # The production / portable path: each backend is a SHARED library that is the
 # ONLY module linking llama ("single-llama rule"). main_server (llama-free host)
