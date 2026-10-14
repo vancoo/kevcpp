@@ -164,3 +164,24 @@ def batch_loss(...):
 - 概念边界：`docs/research/PLAN_B_design.md`（KEV 切半点积=无权重，V3 未验证）、`docs/FEASIBILITY_headless_gguf_research.md`（PointerHead=决策本体）。
 
 > 本调研只读 + 设计建议，未改主分支决策代码；相关改动/开关请在独立代码分支上进行并跑基准 A/B。
+
+---
+
+## 附录 — 对 0.8B 明细的实测佐证："始终答 Yes"的 LM 续写先验
+
+取 `build/correctness_0.8B.md`（零样本 logits 通道 / Vulkan / 裸基座 Qwen3.5-0.8B）逐条看 **noul 型**错误，模式极清晰：
+
+| id | 问题类型 | 正确解 | 预测 |
+|---|---|---|---|
+| 16 | 金额阈值 | False | True |
+| 18 | 金额阈值 | False | True |
+| 20 | 金额阈值 | False | True |
+| 27 | 距离阈值 | False | True |
+| 36 | 同比方向 | False | True |
+| 56-60 | 否定/反义（含"不存在/未否认/不参与"） | False | 全 True |
+| 62,63 | 逻辑/量词 | False | True |
+| 76,79,80 | 量词理解 | False | True |
+
+即 noul 上 0.8B 总体 24/40=60%，但**绝大多数 `False` 被答成 `True`**。这正是基础模型在 `prompt…Answer:` 后"顺着续写"(默认倾向 yes/肯定) 的 next-token 高频先验——**不是缺一个分类头能修的**，而是"续写文本的分布"与"判断题是否成立"没有打通。kev 微调后 0.8B 的 noul 判别是"选项打分 CE 训出来的"，不会这样回摆。
+
+这条证据直接支撑正文结论：**kevcpp 想要正确率，靠 on-the-fly 文章/prompt 修 logits 收效有限；真正的手段是引入"训过的打分"（P0）或至少共识聚合+校准门控（P1/P2）。**
