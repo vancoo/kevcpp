@@ -1,0 +1,6 @@
+{
+  "_comment": "实验: aggregation=sum(候选完整 token log-prob 求和)",
+  "markers": { "state":"<|fim_prefix|>", "question":"<|fim_middle|>", "option_start":"<|box_start|>", "option_end":"<|box_end|>", "decide":"<|fim_suffix|>" },
+  "temperature": 1.0,
+  "logits": { "enable": true, "prompt_template": "{instructions}\n[ {options} ]\n{state}\nAnswer:", "aggregation": "sum", "logits_type": "" }
+}

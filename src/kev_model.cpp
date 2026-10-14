@@ -352,7 +352,18 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
     if (Q == 0) { if (err && err->empty()) *err = "no questions"; return res; }
 
     const TokenFeeder tf = backend_->token_feeder();
-    const std::string & tpl = decision_.prompt_template;
+    // 调研实验(KEV_TEMPLATE=chatml): 把普通填空式模板包成 Qwen 系 ChatML, 让 'Answer:'/末尾
+    // 位置更接近"assistant 段起始"(而非可能触发 '<|im_start|>think 的纯文本'Answer:')。
+    // 仍保留 {instructions}/{options}/{state} 占位符, 使 render_prompt 与前缀缓存逻辑不变。
+    std::string tpl_eff = decision_.prompt_template;
+    const char * kev_tpl = std::getenv("KEV_TEMPLATE");
+    if (kev_tpl && std::string(kev_tpl) == "chatml") {
+        tpl_eff =
+            "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，绝不输出任何思考或推理过程。<|im_end|>\n"
+            "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+            "<|im_start|>assistant\n";
+    }
+    const std::string & tpl = tpl_eff;
     const std::string & agg = decision_.aggregation;
     const int nv = backend_->vocab_n_tokens();
     if (nv <= 0) { if (err && err->empty()) *err = "vocab unavailable (read_logits unsupported or lm_head disabled)"; return res; }
