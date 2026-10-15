@@ -33,9 +33,12 @@ std::string render_prompt(const std::string & tpl, const std::string & state,
     std::string p = tpl;
     std::string opt_str;
     for (size_t i = 0; i < opts.size(); ++i) { if (i) opt_str += ", "; opt_str += opts[i]; }
+    std::string opt_lines;
+    for (size_t i = 0; i < opts.size(); ++i) { if (i) opt_lines += "\n"; opt_lines += opts[i]; }
     rep(p, "{state}", state);
     rep(p, "{instructions}", instr);
     rep(p, "{options}", opt_str);
+    rep(p, "{optlist}", opt_lines);
     return p;
 }
 
@@ -120,32 +123,54 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cpar);
     if (!ctx) { std::fprintf(stderr, "fail: init ctx\n"); return 1; }
 
-    // 模板变体数组(任务: prompt 模板调试)。tpl0 为基线, 其余为"让答案候选标签贴近首位"的措辞变体。
+    // 模板变体数组(任务: prompt 次序/内容调优)。目标是"Lp-1 首 decode(argmax) == 候选标签 token"出现频率最高。
+    // {optlist} = 选项逐行(A. xx\nB. yy); {options} = 逗号连接。{instructions}/{state} 占位。
     const std::vector<const char *> TEMPLATES = {
-        // T0 基线(现状)
+        // ---- 基线 / 收敛词 ----
+        // V0 基线(现状)
         "{instructions}\n[ {options} ]\n{state}\nAnswer:",
-        // T1 中文指令, 禁空格/禁解释
-        "{instructions}\n[ {options} ]\n{state}\n请只输出一个选项，不要空格、标点或任何其他内容。\n答案:",
-        // T2 先列选项后问, 只输出序号
-        "{instructions}\n{state}\n请从以下选项中选择正确的一项（只输出序号）：\n[ {options} ]\n答案:",
-        // T3 收尾词换成"结论是"
+        // V1 结论是 (已知 85 题 best template 之一)
         "{instructions}\n[ {options} ]\n{state}\n结论是：",
-        // T4 少字强命令
-        "{instructions}\n{state}\n正确选项：",
-        // T5 few-shot(前置一个"答案是 X"的例子)
-        "例子：已知某题正确选项是 A。\n{instructions}\n[ {options} ]\n{state}\n答案是：",
-        // T6 括号限定候选集
-        "{instructions}\n[ {options} ]\n{state}\n请在下列括号内填一个选项字母：(A/B/C/D)\n答案：",
-        // T7 中文冒号收尾
-        "{instructions}\n[ {options} ]\n{state}\nAnswer：",
-        // T8 强命令"只输出字母"
-        "{instructions}\n[ {options} ]\n{state}\n只输出一个选项字母，不做任何解释。答案：",
+        // V2 少字强命令
+        "{instructions}\n[ {options} ]\n{state}\n正确选项是：",
+        // ---- 次序/结构 ----
+        // V3 state 在选项前
+        "{state}\n{instructions}\n[ {options} ]\n结论是：",
+        // V4 state 在选项后(与默认同), 但收尾"答案是"
+        "{instructions}\n[ {options} ]\n{state}\n答案是：",
+        // V5 选项逐行 + 结论是
+        "{instructions}\n{optlist}\n{state}\n结论是：",
+        // V6 选项逐行 + 答案是
+        "{instructions}\n{optlist}\n{state}\n答案是：",
+        // V7 系统头 + 收敛
+        "系统：你是一个严格按给定选项作答的判别器。\n{instructions}\n[ {options} ]\n{state}\n答案：",
+        // ---- 内容/措辞 ----
+        // V8 禁空格禁解释
+        "{instructions}\n[ {options} ]\n{state}\n请只输出一个选项，不要空格、标点或解释。答案：",
+        // V9 只输出标签不输出内容
+        "{instructions}\n[ {options} ]\n{state}\n只输出选项答案，不要输出标点或空格。答案：",
+        // V10 "请选出一个答案"
+        "{instructions}\n[ {options} ]\n{state}\n请选出一个答案：",
+        // V11 "你的选择是"
+        "{instructions}\n[ {options} ]\n{state}\n你的选择是：",
+        // ---- 少字钉子 ----
+        // V12 单个"答"
+        "{instructions}\n[ {options} ]\n{state}\n答：",
+        // V13 换行交互式
+        "{instructions}\n[ {options} ]\n{state}\n请回答：",
+        // V14 结论是 + 选项逐行 + state先行
+        "{state}\n{instructions}\n{optlist}\n结论是：",
+        // V15 few-shot 前置格式样板 + 结论是
+        "例：题干：某讯 → 答案：A\n{instructions}\n[ {options} ]\n{state}\n结论是：",
+        // V16 最简"答案是"(无标点)
+        "{instructions}\n[ {options} ]\n{state}\n答案是:",
     };
 
     std::fprintf(stderr, "model loaded: n_vocab=%d n_embd=%d\n\n", n_vocab, llama_model_n_embd(model));
 
     for (const char * trav : TEMPLATES) {
       const std::string tpl = trav;
+      int n_cand_argmax = 0, n_cases_run = 0;
       std::fprintf(stdout, "\n###### TEMPLATE: %s\n", trav);
       for (const auto & c : cases()) {
         std::string prompt = render_prompt(tpl, c.state, c.instr, c.opts, c.keys, {});
@@ -208,7 +233,7 @@ int main(int argc, char ** argv) {
             (void)top1_is_corr;
         }
 
-        // ::::: compact prompt-template debug: 各候选标签 logit vs 空格 logit / argmax :::::
+        // ::::: compact prompt-template debug: 各候选标签 logit vs 空格 logit / argmax / 首decode是否=候选 :::::
         {
             // 空格 token ' ' 的 id
             std::vector<llama_token> sp(8);
@@ -224,10 +249,16 @@ int main(int argc, char ** argv) {
                 cand_line += std::string(" ").c_str() + c.keys[k] + "=" + (lv < -1e29 ? "NA" : std::to_string(lv).substr(0,6));
                 if (lv > cand_best_lg) { cand_best_lg = lv; cand_best_idx = (int) k; }
             }
-            bool arg_is_cand = (cand_best_idx >= 0);
-            std::fprintf(stdout, "  [PTMPL] space='%s'(logit %.2f) argmax='%s' cand_best=%s(%.2f) | margin(cand_best-space)=%.2f\n",
+            // argmax 是否为任一候选 key 首token
+            llama_token argmax_tok = (llama_token) scored[0].first;
+            bool arg_is_cand = false; int arg_hit = -1;
+            for (size_t k = 0; k < key_first_tok.size(); ++k) if (key_first_tok[k] == (int) argmax_tok) { arg_is_cand = true; arg_hit = (int)k; break; }
+            if (arg_is_cand) n_cand_argmax++;
+            n_cases_run++;
+            std::fprintf(stdout, "  [PTMPL] space='%s'(logit %.2f) argmax='%s' cand_best=%s(%.2f) | margin(cand_best-space)=%.2f | %s\n",
                          detok(vocab, space_tok).c_str(), space_lg, arg_txt.c_str(),
-                         arg_is_cand ? c.keys[cand_best_idx].c_str() : "(none)", cand_best_lg, cand_best_lg - space_lg);
+                         arg_is_cand ? c.keys[arg_hit].c_str() : "(none)", cand_best_lg, cand_best_lg - space_lg,
+                         arg_is_cand ? "first-decode==CAND" : "first-decode!=cand");
             (void)cand_line;
         }
 
@@ -274,7 +305,9 @@ int main(int argc, char ** argv) {
         }
       } // for (cases())
 
-      // ---- TEMPLATE 级汇总(紧凑): 各候选标签 logit vs 空格 logit, argmax 是否为候选标签 ----
+      // ---- TEMPLATE 级汇总: 首decode==候选标签 频率 ----
+      std::fprintf(stdout, "--- [TEMPLATE-AGG] first-decode==CAND: %d/%d ---\n", n_cand_argmax, n_cases_run);
+      (void)(n_cand_argmax);
       std::fprintf(stdout, "--- [template-summary] rank of candidate-label among top, space-margin per case ---\n");
     }
 
