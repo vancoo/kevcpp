@@ -120,11 +120,34 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cpar);
     if (!ctx) { std::fprintf(stderr, "fail: init ctx\n"); return 1; }
 
-    const std::string tpl = "{instructions}\n[ {options} ]\n{state}\nAnswer:";
+    // 模板变体数组(任务: prompt 模板调试)。tpl0 为基线, 其余为"让答案候选标签贴近首位"的措辞变体。
+    const std::vector<const char *> TEMPLATES = {
+        // T0 基线(现状)
+        "{instructions}\n[ {options} ]\n{state}\nAnswer:",
+        // T1 中文指令, 禁空格/禁解释
+        "{instructions}\n[ {options} ]\n{state}\n请只输出一个选项，不要空格、标点或任何其他内容。\n答案:",
+        // T2 先列选项后问, 只输出序号
+        "{instructions}\n{state}\n请从以下选项中选择正确的一项（只输出序号）：\n[ {options} ]\n答案:",
+        // T3 收尾词换成"结论是"
+        "{instructions}\n[ {options} ]\n{state}\n结论是：",
+        // T4 少字强命令
+        "{instructions}\n{state}\n正确选项：",
+        // T5 few-shot(前置一个"答案是 X"的例子)
+        "例子：已知某题正确选项是 A。\n{instructions}\n[ {options} ]\n{state}\n答案是：",
+        // T6 括号限定候选集
+        "{instructions}\n[ {options} ]\n{state}\n请在下列括号内填一个选项字母：(A/B/C/D)\n答案：",
+        // T7 中文冒号收尾
+        "{instructions}\n[ {options} ]\n{state}\nAnswer：",
+        // T8 强命令"只输出字母"
+        "{instructions}\n[ {options} ]\n{state}\n只输出一个选项字母，不做任何解释。答案：",
+    };
 
     std::fprintf(stderr, "model loaded: n_vocab=%d n_embd=%d\n\n", n_vocab, llama_model_n_embd(model));
 
-    for (const auto & c : cases()) {
+    for (const char * trav : TEMPLATES) {
+      const std::string tpl = trav;
+      std::fprintf(stdout, "\n###### TEMPLATE: %s\n", trav);
+      for (const auto & c : cases()) {
         std::string prompt = render_prompt(tpl, c.state, c.instr, c.opts, c.keys, {});
         std::vector<llama_token> ids(n_ctx);
         ids.assign(n_ctx, (llama_token) 0); // 每 case 复原缓冲(容纳任意长度 prompt)
@@ -185,6 +208,29 @@ int main(int argc, char ** argv) {
             (void)top1_is_corr;
         }
 
+        // ::::: compact prompt-template debug: 各候选标签 logit vs 空格 logit / argmax :::::
+        {
+            // 空格 token ' ' 的 id
+            std::vector<llama_token> sp(8);
+            int sn = llama_tokenize(vocab, " ", 1, sp.data(), (int) sp.size(), false, false);
+            llama_token space_tok = sn > 0 ? sp[0] : (llama_token) 0;
+            std::string arg_txt = detok(vocab, (llama_token) scored[0].first);
+            double space_lg = lg[space_tok];
+            // 各候选 label 首 token 的 logit
+            std::string cand_line = "";
+            int cand_best_idx = -1; double cand_best_lg = -1e30;
+            for (size_t k = 0; k < key_first_tok.size(); ++k) {
+                double lv = key_first_tok[k] >= 0 ? (double) lg[key_first_tok[k]] : -1e30;
+                cand_line += std::string(" ").c_str() + c.keys[k] + "=" + (lv < -1e29 ? "NA" : std::to_string(lv).substr(0,6));
+                if (lv > cand_best_lg) { cand_best_lg = lv; cand_best_idx = (int) k; }
+            }
+            bool arg_is_cand = (cand_best_idx >= 0);
+            std::fprintf(stdout, "  [PTMPL] space='%s'(logit %.2f) argmax='%s' cand_best=%s(%.2f) | margin(cand_best-space)=%.2f\n",
+                         detok(vocab, space_tok).c_str(), space_lg, arg_txt.c_str(),
+                         arg_is_cand ? c.keys[cand_best_idx].c_str() : "(none)", cand_best_lg, cand_best_lg - space_lg);
+            (void)cand_line;
+        }
+
         // ---- 层次2: 贪心滚动前 N 步 ----
         std::fprintf(stdout, "greedy rollout (top1 each step, steps param=%d):\n", steps);
         std::vector<llama_token> seq = ids;
@@ -226,6 +272,10 @@ int main(int argc, char ** argv) {
             std::fprintf(stdout, "-> Lp-1 top1 is NOT any candidate key (it's a filler/other token): '%s'\n",
                          detok(vocab, (llama_token) top1).c_str());
         }
+      } // for (cases())
+
+      // ---- TEMPLATE 级汇总(紧凑): 各候选标签 logit vs 空格 logit, argmax 是否为候选标签 ----
+      std::fprintf(stdout, "--- [template-summary] rank of candidate-label among top, space-margin per case ---\n");
     }
 
     llama_free(ctx);
