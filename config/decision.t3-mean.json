@@ -1,0 +1,17 @@
+{
+  "_comment": "kevcpp 组合实验: T3 收尾词 '结论是：' + aggregation=mean(候选完整序列 log-prob)。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\n结论是：",
+    "aggregation": "mean",
+    "logits_type": ""
+  }
+}

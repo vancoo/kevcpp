@@ -1,0 +1,17 @@
+{
+  "_comment": "kevcpp prompt-template 调优实验: T7 = 默认模板改收尾词为 'Answer：' (中文冒号, 保留 [ {options} ])。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\nAnswer：",
+    "aggregation": "first",
+    "logits_type": ""
+  }
+}

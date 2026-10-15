@@ -32,5 +32,21 @@
 `build/bin/Release/token_position_probe.exe --model models\Qwen3.5-0.8B-Q8_0.gguf --steps 3`
 输出含每 (case×tpl) 的 `[PTMPL] ... margin(cand_best-space)=...` 行。
 
-## 5. 后续
-- 对最优模板（T4/T7/T3 类"少字强命令/结论是"）配 noul→`是/否`，跑完整 85 题量化正确率提升。
+## 5. 完整 85 题验证（0.8B / CPU / ctx2048）
+
+| 配置 | accuracy | score | noul | choice |
+|---|---|---|---|---|
+| 基线 first（T0） | 51.8% (44) | 40% | 60% | 45% |
+| mean（完整序列） | 54.1% (46) | 40% | 60% | 50% |
+| **T3 结论是：** | 55.3% (47) | 20% | **72.5%** | 42.5% |
+| T7 Answer： | 51.8% (44) | – | – | – |
+| **T3 + mean** | **60.0% (51)** | 20% | **72.5%** | **52.5%** |
+
+**结论**：
+- **T3 收尾词"结论是："把 noul 从 60%→72.5%**（否定/是否类 always-yes 大幅纠正），但略伤 choice。
+- **T3 + mean 组合 = 60.0%（+8.2pp over 基线）**，noul 72.5%、choice 52.5%。这是至今所有零训练实验最好结果，纯配置（模板+aggregation），零代码零训练。
+- 代价：score 掉到 20%（仅 5 题，噪声大；T3 收尾对数字标签不利）。
+- 配置文件：`config/decision.t3-mean.json`（推荐），`decision.prompt-t3.json`、`decision.prompt-t7.json`（变体）。
+
+## 6. 复现<br>
+`kevcpp.exe --model models\Qwen3.5-0.8B-Q8_0.gguf --decide-config config\decision.t3-mean.json --port <P>` 后跑 `correctness_harness.py`。
