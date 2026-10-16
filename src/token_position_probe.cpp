@@ -164,7 +164,14 @@ int main(int argc, char ** argv) {
         "例：题干：某讯 → 答案：A\n{instructions}\n[ {options} ]\n{state}\n结论是：",
         // V16 最简"答案是"(无标点)
         "{instructions}\n[ {options} ]\n{state}\n答案是:",
+        // V17 nothink: Qwen3.5 原生 ChatML + enable_thinking=false 的空思考块
+        //   (<|im_start|>assistant\n thinking\n\n</think>\n\n) —— 关闭思考, 让模型直接作答。
+        "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n\n",
     };
+    // 含 ChatML 特殊 token 的模板必须 parse_special=true, 否则 <|im_start|> 会被当普通文本。
+    auto is_chatml = [](const std::string & t) { return t.find("<|im_start|>") != std::string::npos; };
 
     std::fprintf(stderr, "model loaded: n_vocab=%d n_embd=%d\n\n", n_vocab, llama_model_n_embd(model));
 
@@ -176,7 +183,7 @@ int main(int argc, char ** argv) {
         std::string prompt = render_prompt(tpl, c.state, c.instr, c.opts, c.keys, {});
         std::vector<llama_token> ids(n_ctx);
         ids.assign(n_ctx, (llama_token) 0); // 每 case 复原缓冲(容纳任意长度 prompt)
-        int n_tok = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), ids.data(), (int) ids.size(), /*add_special=*/false, /*parse_special=*/false);
+        int n_tok = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), ids.data(), (int) ids.size(), /*add_special=*/false, /*parse_special=*/is_chatml(tpl));
         if (n_tok < 0) { n_tok = -n_tok; } // 需要的容量
         if (n_tok <= 0) { std::fprintf(stderr, "[%s] tokenize empty\n", c.name); continue; }
         if ((int) ids.size() > n_tok) ids.resize(n_tok); // 只保留真实 token, 避免 attr 全零长度污染贪心序列

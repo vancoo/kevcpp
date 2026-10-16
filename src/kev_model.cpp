@@ -270,6 +270,14 @@ KevModel::ProbsResult KevModel::probs(const KevRequest & req, std::string * err)
     if (m == "hidden" || m == "hidden_state") {
         return probs_hidden(req, m == "hidden_state", err);
     }
+    // 调研实验: 标签 token 打分 + 顺序轮换(KEV_LBL=abcd|yn, KEV_ROTATE=n)。默认 off。
+    const char * lb = std::getenv("KEV_LBL");
+    const std::string lmode = lb ? lb : "";
+    if (lmode == "abcd" || lmode == "yn") {
+        int rot = 1;
+        if (const char * rv = std::getenv("KEV_ROTATE")) { int r = std::atoi(rv); if (r >= 1) rot = r; }
+        return probs_label(req, lmode, rot, err);
+    }
     return probs_logits(req, err);
 }
 
@@ -357,11 +365,22 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
     // 仍保留 {instructions}/{options}/{state} 占位符, 使 render_prompt 与前缀缓存逻辑不变。
     std::string tpl_eff = decision_.prompt_template;
     const char * kev_tpl = std::getenv("KEV_TEMPLATE");
+    // 模板是否需要特殊 token 分词(parse_special=true)? 只有 ChatML 模板含 <|im_start|> 等需要。
+    bool tpl_special = false;
     if (kev_tpl && std::string(kev_tpl) == "chatml") {
         tpl_eff =
             "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，绝不输出任何思考或推理过程。<|im_end|>\n"
             "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
             "<|im_start|>assistant\n";
+        tpl_special = true;
+    } else if (kev_tpl && std::string(kev_tpl) == "nothink") {
+        // 重启思考:=false 空思考块结构 —— 关闭思考, 让模型在 response 后直接作答。
+        // 注意 chat_template(enable_thinking=false) 产出: '<|im_start|>assistant\n thinking\n\n response\n\n'
+        tpl_eff =
+            "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+            "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+            "<|im_start|>assistant\n thinking\n\n response\n\n";
+        tpl_special = true;
     }
     const std::string & tpl = tpl_eff;
     const std::string & agg = decision_.aggregation;
@@ -398,9 +417,10 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         ~SlotGuard() { if (active) m->release_scratch_slot(seq); }
     } slot_guard{batched, my_slot, this};
     // 分词(共享 llama_vocab 非线程安全, 短锁串行; 非批处理也已持 compute_mutex_ 无需此锁但无害)。
+    // ChatML/关闭思考模板(tpl_special)需 parse_special=true 以识别 <|im_start|> 等特殊 token。
     auto tok = [&](const std::string & t) {
         std::lock_guard<std::mutex> lk(tokenizer_mutex_);
-        return kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/false);
+        return kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/tpl_special);
     };
 
     for (int k = 0; k < Q; ++k) {
@@ -596,6 +616,115 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         // 上下文校准(KEV_CALIB=1): softmax 前减去该候选集的系统性先验偏置 z'[c]=z[c]-z_bias[c]。
         if (calibrate_) apply_calibration(q, z);
         softmax_scaled(z, decision_.temperature, probs[k]);
+        qms[k] = now_ms() - tq0;
+    }
+    res.t_rows_ms = 0.0; for (double x : qms) res.t_rows_ms += x;
+    res.probs = std::move(probs);
+    res.rows_ms_per_q = std::move(qms);
+    res.t_total_ms = now_ms() - t0;
+    return res;
+}
+
+// ---- 调研实验: 标签 token 打分 + 顺序轮换(零训练, KEV_LBL=abcd|yn + KEV_ROTATE=n) ----
+// 落实用户两条思路(合成)：
+//   思路A: 构造"答案可被直接输出"的约束 prompt —— 选项统一成可直接输出的标签 token
+//          (choice→A/B/C…, noul→否/是, score→1..L); 打分只读这些标签 token 的 logit,
+//          只对标签集 softmax。空格/thinking/解释 token 不在标签集内、不参与 softmax,
+//          = 在"打分层"完成约束(无需 grammar/受控解码)。
+//   思路B: 顺序轮换抵消字母/位置 bias(2308.11483 顺序可差 13–75%)——对 choice, 把
+//          "标签→选项" 映射轮换 r 次, 各打分一次, 对"原选项 key"累积概率, 再归一;
+//          使"标签位置造成的系统性偏好"轮流落到不同选项而被抵消。
+// 默认 off; 零训练、模型无关。串行路径(compute_mutex_ 保护, 简单可靠)。
+KevModel::ProbsResult KevModel::probs_label(const KevRequest & req, const std::string & mode,
+                                            int rotate, std::string * err) {
+    ProbsResult res;
+    double t0 = now_ms();
+    const int Q = (int) req.questions.size();
+    if (!backend_ || !backend_->ok()) { if (err && err->empty()) *err = "backend not initialized"; return res; }
+    if (Q == 0) { if (err && err->empty()) *err = "no questions"; return res; }
+    (void) mode; // abcd/yn 目前对 choice/noul/score 都采用同套标签(choice→字母, noul→否/是, score→数字)
+
+    const TokenFeeder tf = backend_->token_feeder();
+    std::lock_guard<std::mutex> lock(compute_mutex_);
+    auto tok = [&](const std::string & t) {
+        std::lock_guard<std::mutex> lk(tokenizer_mutex_);
+        return kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/false);
+    };
+
+    std::vector<std::vector<float>> probs(Q);
+    std::vector<double> qms(Q, 0.0);
+
+    for (int k = 0; k < Q; ++k) {
+        const KevQuestion & q = req.questions[k];
+        const int K = (int) q.keys.size();
+        if (K == 0) { if (err && err->empty()) *err = "question " + std::to_string(k) + ": no candidate keys"; return res; }
+        double tq0 = now_ms();
+
+        // 判定题型
+        const bool is_noul = (q.keys.size() == 2 && q.keys[0] == "false");
+        const bool is_score = (K >= 1 && q.keys[0] == "0" && q.keys.back() == std::to_string(K - 1));
+
+        // 标签 token 字符串
+        std::vector<std::string> label_strs(K);
+        if (is_noul) {
+            label_strs[0] = "否"; label_strs[1] = "是";   // 诊断证实模型心里是中文 否
+        } else if (is_score) {
+            for (int j = 0; j < K; ++j) label_strs[j] = std::to_string(j + 1);   // 1..L
+        } else {
+            for (int j = 0; j < K; ++j) label_strs[j] = std::string(1, (char) ('A' + j)); // A..Z
+        }
+
+        // 约束 prompt 模板(每题基础段: instructions + state)
+        std::string base = q.instr + "\n" + req.state + "\n请只回答下列选项的标签(只输出一个标签,不要其他任何内容或解释):\n";
+
+        // 顺序轮换: 对 choice(K>=3) 才轮换, 否则 rotate=1。
+        const int r_max = (rotate >= 1 && !is_noul && !is_score) ? rotate : 1;
+        std::vector<float> acc(K, 0.0f);   // 按"原选项 index"累积概率
+        // order[r][label] = 摆放该标签对应的原选项 index(标签=prompt 里的行序)
+        std::vector<std::vector<int>> order(r_max, std::vector<int>(K));
+        for (int r = 0; r < r_max; ++r)
+            for (int l = 0; l < K; ++l) order[r][l] = (l + r) % K;
+
+        for (int r = 0; r < r_max; ++r) {
+            // 组装带顺序的选项清单
+            std::string prompt = base;
+            for (int l = 0; l < K; ++l) {
+                prompt += label_strs[l] + ". " + q.options[order[r][l]] + "\n";
+            }
+            prompt += "标签:";
+            std::vector<int32_t> P = tok(prompt);
+            while (!P.empty() && P.back() < 0) P.pop_back();
+            if (P.empty()) { if (err && err->empty()) *err = "empty prompt"; return res; }
+            const int32_t Lp = (int32_t) P.size();
+
+            // 每个标签的首 token(单 token 标签, first 即可)
+            std::vector<int32_t> label_first(K, -1);
+            for (int j = 0; j < K; ++j) {
+                std::vector<int32_t> t = tok(label_strs[j]);
+                label_first[j] = t.empty() ? -1 : t[0];
+            }
+            std::vector<std::vector<int32_t>> one_cand(1, label_first);
+            std::vector<std::vector<float>> lg;
+            std::string e2;
+            if (!decode_one_to_logits(P, 0, scratch_seq_, -1, {Lp - 1}, one_cand, lg, &e2)) {
+                if (err && err->empty()) *err = e2; return res;
+            }
+            std::vector<float> z(K, 0.0f);
+            if (!lg.empty() && !lg[0].empty()) {
+                for (int j = 0; j < K; ++j) {
+                    if (label_first[j] < 0) { z[j] = 0.0f; continue; }
+                    z[j] = lg[0][j];
+                }
+            }
+            std::vector<float> p(K);
+            softmax_scaled(z, decision_.temperature, p);
+            // 标签 label l 的概率计入它本轮对应的原选项 index order[r][l]
+            for (int l = 0; l < K; ++l) acc[order[r][l]] += p[l];
+        }
+        // 归一化(取平均)
+        float ssum = 0; for (float x : acc) ssum += x;
+        if (ssum > 0) for (float & x : acc) x /= ssum;
+        probs[k] = std::move(acc);
         qms[k] = now_ms() - tq0;
     }
     res.t_rows_ms = 0.0; for (double x : qms) res.t_rows_ms += x;
