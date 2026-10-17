@@ -407,6 +407,9 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
     const std::string label_mode = kev_al ? kev_al : "";
     const bool label_num = (label_mode == "num");
     const bool label_yn  = (label_mode == "yn");
+    // ab: 把判断题(noul)改写成"A/B 二选一"的选择题(用户思路: 判断题=选项为是否的选择题),
+    // 候选 token 用单 token 的 'A'/'B'(读取更稳、天然多语言), probs 索引顺序不变 -> 无需重格式化。
+    const bool label_ab  = (label_mode == "ab");
 
     std::vector<std::vector<float>> probs(Q);
     std::vector<double> qms(Q, 0.0);
@@ -439,14 +442,19 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         std::string prompt = render_prompt(tpl, q, req, q.options);
         // ---- 标签化模式: 用编号/YesNo 重建 prompt + 把候选 token 换成稳定标签 ----
         std::vector<std::string> label_strs(K);   // 每个候选对应的打分标签文本
-        bool use_label = label_num || label_yn;
+        bool use_label = label_num || label_yn || label_ab;
         if (use_label) {
-            // 判断是否 noul(2 选项, key=="false")——仅 yn 模式限定 noul。
+            // 判断是否 noul(2 选项, key=="false")——仅 yn/ab 模式限定 noul。
             const bool is_noul = (K == 2) && (q.keys.size() == 2) && q.keys[0] == "false";
-            if (label_yn && !is_noul) use_label = false;   // yn 只对 noul 生效
+            if ((label_yn || label_ab) && !is_noul) use_label = false;   // yn/ab 只对 noul 生效
         }
         if (use_label) {
-            if (label_yn) {
+            if (label_ab) {
+                // 判断题 → A/B 选择题(用户思路)。保守映射保序: key0(false)="A"=不成立, key1(true)="B"=成立。
+                label_strs[0] = "A"; label_strs[1] = "B";
+                prompt = q.instr + "\n" + req.state +
+                         "\nA. 上述说法不成立\nB. 上述说法成立\n请只回答 A 或 B(不要输出其他任何内容或解释):\n答案:";
+            } else if (label_yn) {
                 label_strs[0] = "No"; label_strs[1] = "Yes";
                 prompt = q.instr + "\n" + req.state +
                          "\n请只回答 Yes 或 No(不要输出其他任何内容或解释):\n答案:";
@@ -465,7 +473,7 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         if (Lp == 0) { if (err && err->empty()) *err = "question " + std::to_string(k) + ": empty prompt"; return res; }
 
         double tq0 = now_ms();
-        bool keep = agg == "sum" || agg == "mean";
+        bool keep = agg == "sum" || agg == "mean" || agg == "combo";
         std::vector<std::vector<int32_t>> cand_tok(K);
         std::vector<int32_t> cand_first(K, -1);
         for (int j = 0; j < K; ++j) {
@@ -478,22 +486,46 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         std::vector<float> z(K, 0.0f);
         std::string err2;
 
-        // ===== 调研实验: aggregation="alias" — 多语言/同义别名池 + log-sum-exp =====
+        // ===== 调研实验: aggregation="alias"/"combo" — 多语言/同义别名池 + log-sum-exp =====
         // 动机(诊断结论): 模型在答案位可能说 否/假/no, 但选项 key 是 false —— 精确 token 匹配
         // 会错位。做法: 为每个选项构造"同义/多语言别名池", 把池内各词首 token 在 Lp-1 的 logit
         // 做 log-sum-exp 作为该选项得分 (任一别名被模型说出即投票给该选项)。零训练、天然多语言。
+        // "combo": noul/score 用别名池(修错位), choice 保留 sum/mean(保整词信息)。
         std::vector<std::vector<std::string>> alias_pool(K);
-        bool use_alias = (agg == "alias");
+        const bool is_combo = (agg == "combo");
+        const bool use_alias = (agg == "alias" || is_combo);
+        bool apply_alias_override = false;
         if (use_alias && !use_label) {
             const bool is_noul_al = (K == 2 && q.keys[0] == "false" && q.keys[1] == "true");
             const bool is_score_al = (K >= 1 && q.keys[0] == "0" && q.keys.back() == std::to_string(K - 1));
             if (is_noul_al) {
                 alias_pool[0] = {"false", "False", "否", "no", "No", "假", "不"};
                 alias_pool[1] = {"true", "True", "是", "yes", "Yes", "真"};
+                apply_alias_override = true;
             } else if (is_score_al) {
                 for (int j = 0; j < K; ++j) alias_pool[j] = { std::to_string(j), std::to_string(j + 1) };
+                apply_alias_override = true;
             } else {
-                for (int j = 0; j < K; ++j) alias_pool[j] = { q.keys[j] };
+                // choice: 别名池 = {key} + 选项描述词(key: 描述 中冒号后的部分)。
+                // 模型答案位可能想说完整描述(公司A)而非单字母 key(A), 匹配上任一即投票。
+                for (int j = 0; j < K; ++j) {
+                    std::vector<std::string> pool;
+                    pool.push_back(q.keys[j]);
+                    // 从 "key: desc" 提取 desc(如果存在)。
+                    const std::string & opt = (j < (int) q.options.size()) ? q.options[j] : std::string();
+                    size_t colon = opt.find(':');
+                    if (colon != std::string::npos) {
+                        std::string desc = opt.substr(colon + 1);
+                        while (!desc.empty() && (desc[0] == ' ' || desc[0] == '\t')) desc.erase(desc.begin());
+                        while (!desc.empty() && (desc.back() == ' ' || desc.back() == '\t')) desc.pop_back();
+                        if (!desc.empty() && desc != q.keys[j]) pool.push_back(desc);
+                    }
+                    alias_pool[j] = pool;
+                }
+                // combo: choice 是否用别名池? choice 也可用别名(描述)来匹配, 这里允许覆盖;
+                // 但为避免 combo 下 choice 丢失 mean 的整词优势, 保留 —— 实测后定: 默认暗含
+                // choice 也用别名池(描述别名), 只要不让它退化即可。这里 combo 也覆盖 choice。
+                apply_alias_override = true;
             }
         }
 
@@ -642,7 +674,7 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         }
 
         // 别名池模式: 覆盖 z —— 在 Lp-1 读所有别名 token 的 logit, 每个选项取池内 log-sum-exp。
-        if (use_alias) {
+        if (use_alias && apply_alias_override) {
             std::vector<int32_t> all_alias_tok;                 // 顺序 = 选项 j 的池
             std::vector<std::vector<int32_t>> pool_id(K);
             for (int j = 0; j < K; ++j) {

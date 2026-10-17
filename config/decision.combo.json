@@ -1,0 +1,17 @@
+{
+  "_comment": "kevcpp 分题型组合: combo — noul/score 用别名池(修 false/true↔否/是 错位), choice 用 mean(保整词信息)。模板 T3 结论是：。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\n结论是：",
+    "aggregation": "combo",
+    "logits_type": ""
+  }
+}
