@@ -169,6 +169,57 @@ int main(int argc, char ** argv) {
         "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
         "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
         "<|im_start|>assistant\n thinking\n\n</think>\n\n",
+        // ---- ChatML 收尾消融(验证首位空格是否由 ' response\n\n' 换行造成) ----
+        // N1: 少一个换行
+        "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n",
+        // N2: 不进 think/response, 直接 assistant 起始(老 chatml 收尾)
+        "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+        "<|im_start|>assistant\n",
+        // N3: assistant 后直接给"答案："
+        "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+        "<|im_start|>assistant\n答案：",
+        // N4: assistant + 强指令(禁空格/解释) + "答案："
+        "<|im_start|>system\n你是严格按给定选项作答的判别器。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+        "<|im_start|>assistant\n只输出一个选项，不要空格、标点或解释。答案：",
+        // N5: 空思考块 + 结尾不给换行, 直接跟"答案："钉子
+        "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n答案：",
+        // ---- 方案B: 纯提示词引导"模型该输出哪个词"(对齐 false/true 比对对象) ----
+        // 均基于 nothink2 修正收尾( response\n答案：, 首token=答案)。差异只在"要求用什么词作答"。
+        // B1: 要求用 false/true 作答(英文布尔)
+        "<|im_start|>system\n你是严格按给定选项作答的判别器。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}\n请只回答 true 或 false(不要输出其他任何内容):<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n答案：",
+        // B2: 要求用 True/False 作答(首字母大写)
+        "<|im_start|>system\n你是严格按给定选项作答的判别器。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}\n请从 True 或 False 中选择一个回答:<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n答案：",
+        // B3: 要求用 是/否 作答(中文布尔)
+        "<|im_start|>system\n你是严格按给定选项作答的判别器。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}\n请只回答 是 或 否(不要输出其他任何内容):<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n答案：",
+        // B4: 要求用 Yes/No 作答
+        "<|im_start|>system\n你是严格按给定选项作答的判别器。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}\n请只回答 Yes 或 No(不要输出其他任何内容):<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n答案：",
+        // B5: 直接给出"唯一允许的输出集"(true/false) 并禁用解释
+        "<|im_start|>system\n你只能输出 true 或 false 两个词之一，输出其他任何内容都是错误的。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\ntrue/false：",
+        // B6: 用"判断为真/假"的中文表述引导输出 真/假
+        "<|im_start|>system\n你是严格按给定选项作答的判别器。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}\n该陈述成立吗？请只回答 真 或 假:<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n答案：",
+        // B7: 回显候选集: 明确"从 [false, true] 中选一个原样输出"
+        "<|im_start|>system\n你是严格按给定选项作答的判别器，必须原样输出候选词之一。<|im_end|>\n"
+        "<|im_start|>user\n{instructions}\n可选答案只有两个: false, true。\n{state}\n请原样输出其中一个(不要翻译、不要解释):<|im_end|>\n"
+        "<|im_start|>assistant\n thinking\n\n</think>\n答案：",
     };
     // 含 ChatML 特殊 token 的模板必须 parse_special=true, 否则 <|im_start|> 会被当普通文本。
     auto is_chatml = [](const std::string & t) { return t.find("<|im_start|>") != std::string::npos; };
@@ -177,7 +228,7 @@ int main(int argc, char ** argv) {
 
     for (const char * trav : TEMPLATES) {
       const std::string tpl = trav;
-      int n_cand_argmax = 0, n_cases_run = 0;
+      int n_cand_argmax = 0, n_cases_run = 0, n_alias_correct = 0;
       std::fprintf(stdout, "\n###### TEMPLATE: %s\n", trav);
       for (const auto & c : cases()) {
         std::string prompt = render_prompt(tpl, c.state, c.instr, c.opts, c.keys, {});
@@ -269,6 +320,45 @@ int main(int argc, char ** argv) {
             (void)cand_line;
         }
 
+        // ::::: 不微调相似度/相关性: 多语言别名池 logit 聚合(路径2) :::::
+        // 对每个选项构造多语言/同义别名池, 选项得分 = logsumexp(该池内各 token 首token 的 logit)。
+        // 目的: 消除"模型说 否 但 key 是 false"的错位; 决策 argmax 是否=正确选项。
+        {
+            auto lse = [&](const std::vector<std::string> & pool) -> double {
+                std::vector<double> vs;
+                for (const auto & w : pool) {
+                    std::vector<llama_token> wt(16);
+                    int wn = llama_tokenize(vocab, w.c_str(), (int) w.size(), wt.data(), 16, false, false);
+                    if (wn <= 0) continue;
+                    vs.push_back((double) lg[wt[0]]);
+                }
+                if (vs.empty()) return -1e30;
+                double mx = *std::max_element(vs.begin(), vs.end());
+                double s = 0; for (double v : vs) s += std::exp(v - mx);
+                return mx + std::log(s);
+            };
+            // 每题的别名池: 依 qtype/key 构造(通用: key + 常见多语言/同义别名)。
+            const int Kpools = (int) c.keys.size();
+            std::vector<std::vector<std::string>> pools(Kpools);
+            if (std::string(c.qtype) == "noul") {
+                // keys = {false, true}
+                pools[0] = {"false", "False", "否", "no", "No", "假", "不"};
+                if (Kpools > 1) pools[1] = {"true", "True", "是", "yes", "Yes", "真"};
+            } else if (std::string(c.qtype) == "score") {
+                for (int j = 0; j < Kpools; ++j) pools[j] = { std::to_string(j), std::to_string(j + 1) };
+            } else {
+                for (int j = 0; j < Kpools; ++j) pools[j] = { c.keys[j] };
+            }
+            std::vector<double> z(Kpools, 0.0);
+            for (int j = 0; j < Kpools; ++j) z[j] = lse(pools[j]);
+            int best = (int)(std::max_element(z.begin(), z.end()) - z.begin());
+            bool alias_hit = (best == c.corr_idx);
+            if (alias_hit) n_alias_correct++;
+            std::fprintf(stdout, "  [ALIAS] qtype=%s alias-argmax=%s corr=%s -> %s\n",
+                         c.qtype, c.keys[best].c_str(), c.corr,
+                         alias_hit ? "ALIAS-CORRECT" : "alias-wrong");
+        }
+
         // ---- 层次2: 贪心滚动前 N 步 ----
         std::fprintf(stdout, "greedy rollout (top1 each step, steps param=%d):\n", steps);
         std::vector<llama_token> seq = ids;
@@ -314,6 +404,7 @@ int main(int argc, char ** argv) {
 
       // ---- TEMPLATE 级汇总: 首decode==候选标签 频率 ----
       std::fprintf(stdout, "--- [TEMPLATE-AGG] first-decode==CAND: %d/%d ---\n", n_cand_argmax, n_cases_run);
+      std::fprintf(stdout, "--- [TEMPLATE-AGG] alias-pool-argmax==CORRECT: %d/%d ---\n", n_alias_correct, n_cases_run);
       (void)(n_cand_argmax);
       std::fprintf(stdout, "--- [template-summary] rank of candidate-label among top, space-margin per case ---\n");
     }
