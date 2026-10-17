@@ -381,6 +381,15 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
             "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
             "<|im_start|>assistant\n thinking\n\n response\n\n";
         tpl_special = true;
+    } else if (kev_tpl && std::string(kev_tpl) == "nothink2") {
+        // 收尾消融实证(N5): 空思考块后把 ` response\n\n` 的**多余换行**去掉、直接跟"答案："钉子,
+        // 首位 token 从空格变成答案(probe 实测 c5=A*、noul=否、score=非常 均顶到第1位)。
+        // 注意: 不可直接"user 后给答案:"(会重进 thinking 段), 必须保留空思考块 + 修正收尾。
+        tpl_eff =
+            "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+            "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+            "<|im_start|>assistant\n thinking\n\n response\n答案：";
+        tpl_special = true;
     }
     const std::string & tpl = tpl_eff;
     const std::string & agg = decision_.aggregation;
@@ -468,6 +477,25 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         }
         std::vector<float> z(K, 0.0f);
         std::string err2;
+
+        // ===== 调研实验: aggregation="alias" — 多语言/同义别名池 + log-sum-exp =====
+        // 动机(诊断结论): 模型在答案位可能说 否/假/no, 但选项 key 是 false —— 精确 token 匹配
+        // 会错位。做法: 为每个选项构造"同义/多语言别名池", 把池内各词首 token 在 Lp-1 的 logit
+        // 做 log-sum-exp 作为该选项得分 (任一别名被模型说出即投票给该选项)。零训练、天然多语言。
+        std::vector<std::vector<std::string>> alias_pool(K);
+        bool use_alias = (agg == "alias");
+        if (use_alias && !use_label) {
+            const bool is_noul_al = (K == 2 && q.keys[0] == "false" && q.keys[1] == "true");
+            const bool is_score_al = (K >= 1 && q.keys[0] == "0" && q.keys.back() == std::to_string(K - 1));
+            if (is_noul_al) {
+                alias_pool[0] = {"false", "False", "否", "no", "No", "假", "不"};
+                alias_pool[1] = {"true", "True", "是", "yes", "Yes", "真"};
+            } else if (is_score_al) {
+                for (int j = 0; j < K; ++j) alias_pool[j] = { std::to_string(j), std::to_string(j + 1) };
+            } else {
+                for (int j = 0; j < K; ++j) alias_pool[j] = { q.keys[j] };
+            }
+        }
 
         // ===================== P2: 最长公共前缀(LCP)缓存 =====================
         // 默认模板 {instructions}\n[ {options} ]\n{state}\nAnswer: 中 {state} 在**末尾**。故
@@ -610,6 +638,43 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                 float s = 0;
                 for (int m = 0; m < M; ++m) s += (mlg[m].empty() ? 0.0f : mlg[m][0]);
                 z[j] = (agg == "mean") ? (s / (float) M) : s;
+            }
+        }
+
+        // 别名池模式: 覆盖 z —— 在 Lp-1 读所有别名 token 的 logit, 每个选项取池内 log-sum-exp。
+        if (use_alias) {
+            std::vector<int32_t> all_alias_tok;                 // 顺序 = 选项 j 的池
+            std::vector<std::vector<int32_t>> pool_id(K);
+            for (int j = 0; j < K; ++j) {
+                for (const std::string & w : alias_pool[j]) {
+                    std::vector<int32_t> tk = tok(w);
+                    if (tk.empty()) continue;
+                    pool_id[j].push_back(tk[0]);
+                    all_alias_tok.push_back(tk[0]);
+                }
+            }
+            if (!all_alias_tok.empty()) {
+                // 读 Lp-1 位置下这些别名 token 的 logit(一次 decode, 多候选 token)。
+                std::vector<std::vector<int32_t>> one_cand(1, all_alias_tok);
+                std::vector<std::vector<float>> lg;
+                bool ok = false;
+                if (use_prefix && Dp >= 0) {
+                    std::vector<int32_t> tail(P.begin() + Dp, P.end());
+                    ok = decode_one_to_logits(tail, Dp, my_slot, pseq, {Lp - 1 - Dp}, one_cand, lg, &err2);
+                }
+                if (!ok) ok = decode_one_to_logits(P, 0, my_slot, /*copy_src=*/-1, {Lp - 1}, one_cand, lg, &err2);
+                if (ok && !lg.empty() && !lg[0].empty()) {
+                    int idx = 0;
+                    for (int j = 0; j < K; ++j) {
+                        // log-sum-exp over pool
+                        double mx = -1e30;
+                        for (size_t p = 0; p < pool_id[j].size(); ++p) mx = std::max(mx, (double) lg[0][idx + p]);
+                        double s = 0;
+                        for (size_t p = 0; p < pool_id[j].size(); ++p) s += std::exp((double) lg[0][idx + p] - mx);
+                        z[j] = (float)(mx + std::log(s));
+                        idx += (int) pool_id[j].size();
+                    }
+                }
             }
         }
 
@@ -802,7 +867,26 @@ KevModel::ProbsResult KevModel::probs_hidden(const KevRequest & req, bool use_st
     if (Q == 0) { if (err && err->empty()) *err = "no questions"; return res; }
 
     const TokenFeeder tf = backend_->token_feeder();
-    const std::string & tpl = decision_.prompt_template;
+    // 路径1 实验: hidden 语义相似度匹配 + (可选)关闭思考/修正收尾模板。
+    // 当 KEV_TEMPLATE=nothink2 时, 让 hidden 通道也用 ChatML 修正收尾模板( response\n答案：),
+    // 使 Lp-1 位置的 hidden 对应"关闭思考后首 token=答案"的答案位, 且 parse_special=true。
+    std::string tpl = decision_.prompt_template;
+    bool tpl_special = false;
+    {
+        const char * kt = std::getenv("KEV_TEMPLATE");
+        const std::string ks = kt ? kt : "";
+        if (ks == "nothink2") {
+            tpl = "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+                  "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+                  "<|im_start|>assistant\n thinking\n\n</think>\n答案：";
+            tpl_special = true;
+        } else if (ks == "nothink") {
+            tpl = "<|im_start|>system\n你是严格按给定选项作答的判别器，只输出最终选项，不要任何思考或解释。<|im_end|>\n"
+                  "<|im_start|>user\n{instructions}\n[ {options} ]\n{state}<|im_end|>\n"
+                  "<|im_start|>assistant\n thinking\n\n</think>\n\n";
+            tpl_special = true;
+        }
+    }
     const int n_embd = backend_->model_n_embd();
     if (n_embd <= 0) { if (err && err->empty()) *err = "hidden channel unavailable (embeddings disabled)"; return res; }
 
@@ -810,7 +894,7 @@ KevModel::ProbsResult KevModel::probs_hidden(const KevRequest & req, bool use_st
     std::lock_guard<std::mutex> lock(compute_mutex_);
     auto tok = [&](const std::string & t) {
         std::lock_guard<std::mutex> lk(tokenizer_mutex_);
-        return kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/false);
+        return kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/tpl_special);
     };
 
     std::vector<std::vector<float>> probs(Q);

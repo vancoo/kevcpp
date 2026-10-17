@@ -156,6 +156,16 @@ private:
     //   score[c] = cos(query, h_cand[c]), query = h_decide 或 h_agg。零训练, 模型无关。
     ProbsResult probs_hidden(const KevRequest & req, bool use_state_agg, std::string * err);
 
+    // ---- 调研实验: 标签 token 打分 + 顺序轮换 (零训练, KEV_LBL=abcd|yn + KEV_ROTATE=n) ----
+    // 落实用户两条思路: (1) 构造约束 prompt 让答案 token 能被直接输出 —— 选项统一成可直接
+    // 输出的标签 token(A/B/C… | 否/是 | 1..L), 打分只读这些标签 token 的 logit、只对标签集
+    // softmax(空格/thinking/解释 token 不计入, 等于在打分层完成约束);(2) 顺序轮换抵消
+    // 字母/位置 bias(2308.11483 顺序可差 13–75%): 对 choice 把 标签→选项 的映射轮换 r 次,
+    // 各打分一次, 对"原选项 key"做概率平均(或多数), 抵消系统性标签位置偏置。
+    // 零训练、模型无关。默认 off(走 probs_logits)。
+    ProbsResult probs_label(const KevRequest & req, const std::string & mode, int rotate,
+                            std::string * err);
+
     // Decode `tokens` 续接在 seq, 在 out_pos 各位置读 hidden 向量(read_hidden), 返回
     // hidden[out][n_embd]。串行路径(调用方须已持 compute_mutex_)。copy_src>=0 表示从缓存
     // 前缀 continue。out_pos 使用与 decode_one_to_logits 相同的全局位置语义。

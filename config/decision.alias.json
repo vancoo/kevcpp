@@ -1,0 +1,17 @@
+{
+  "_comment": "kevcpp 别名池聚合实验: aggregation=alias — 每选项用多语言/同义别名池的 log-sum-exp 打分(零训练, 解决 noul 否/是 vs false/true 错位)。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\n结论是：",
+    "aggregation": "alias",
+    "logits_type": ""
+  }
+}
