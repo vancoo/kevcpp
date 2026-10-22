@@ -129,6 +129,8 @@ add_executable(token_position_probe
     src/token_position_probe.cpp
 )
 target_link_libraries(token_position_probe PRIVATE llama)
+target_include_directories(token_position_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
 target_compile_features(token_position_probe PRIVATE cxx_std_17)
 if (MSVC)
     target_compile_options(token_position_probe PRIVATE /utf-8)

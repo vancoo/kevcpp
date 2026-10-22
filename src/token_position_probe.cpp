@@ -16,8 +16,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -64,7 +66,7 @@ struct Case {
 
 std::vector<Case> cases() {
     // 覆盖: 否定/反义 always-yes 重灾(noul), choice, score, 日期。
-    return {
+    std::vector<Case> base = {
         {"c1n_noul", "noul", "A公司是否参与B公司的本轮增资？",
          "A公司宣布将不参与B公司的本轮增资。",
          {"false","true"}, {"no: 否", "yes: 是"}, "false", 0},
@@ -90,20 +92,73 @@ std::vector<Case> cases() {
          "原本A球在1号位，B球在2号位。A和B交换位置后。",
          {"A","B"}, {"A: A球", "B: B球"}, "B", 1},
     };
+
+    // env KEV_BENCH_CASES=1: 把 tests/bench-60cases.jsonl 的 85 题追加为 case(经 llama 循环
+    // 已有的贪心生成路径跑, 规避自写 decode 崩溃)。用于测"模型自由生成自答准确率"。
+    if (const char * bc = std::getenv("KEV_BENCH_CASES")) {
+        if (std::string(bc) == "1") {
+            const char * bp = std::getenv("KEV_BENCH");
+            std::string path = bp ? std::string(bp) : std::string("tests/bench-60cases.jsonl");
+            std::ifstream ifs(path);
+            std::string line;
+            std::vector<Case> extra;
+            static std::vector<std::string> holder;   // 保活所有动态字符串, 避免 const char* 悬垂
+            auto keep = [&](const std::string & s) { holder.push_back(s); return holder.back().c_str(); };
+            while (std::getline(ifs, line)) {
+                if (line.empty()) continue;
+                nlohmann::json rec; try { rec = nlohmann::json::parse(line); } catch (...) { continue; }
+                std::string state0 = rec["state"].get<std::string>();
+                auto & exp = rec["expected"];
+                auto & qs = rec["questions"];
+                for (auto it = qs.begin(); it != qs.end(); ++it) {
+                    const auto & q = it.value();
+                    std::string qtype = q["type"].get<std::string>();
+                    std::string instr0 = q.value("instructions", "");
+                    std::vector<std::string> keys, opts;
+                    std::string corr;
+                    nlohmann::json ev = exp[it.key()];
+                    int corr_idx = -1;
+                    if (qtype == "choice") {
+                        for (auto cit = q["criteria"].begin(); cit != q["criteria"].end(); ++cit) { keys.push_back(cit.key()); opts.push_back(cit.key() + ": " + cit.value().get<std::string>()); }
+                        corr = ev.get<std::string>();
+                        for (size_t j = 0; j < keys.size(); ++j) if (keys[j] == corr) corr_idx = (int) j;
+                    } else if (qtype == "noul") {
+                        keys = {"false", "true"}; opts = {"否", "是"};
+                        bool b = ev.get<bool>();
+                        corr = b ? "true" : "false"; corr_idx = b ? 1 : 0;
+                    } else {
+                        int ki = 0; for (auto & x : q["criteria"]) { keys.push_back(std::to_string(ki++)); opts.push_back(x.get<std::string>()); }
+                        int ei = ev.get<int>(); corr = std::to_string(ei); corr_idx = ei;
+                    }
+                    std::string nm = "b" + std::to_string(extra.size());
+                    extra.push_back({keep(nm), keep(qtype), keep(instr0), keep(state0), keys, opts, keep(corr), corr_idx});
+                }
+            }
+            return extra;
+        }
+    }
+    return base;
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
-    std::string model_path;
+    std::string model_path, freegen_path, tpl_arg;
     int steps = 10;
+    int max_gen = 8;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) model_path = argv[++i];
         else if (a == "--steps" && i + 1 < argc) steps = std::atoi(argv[++i]);
-        else { std::fprintf(stderr, "usage: token_position_probe --model <gguf> [--steps N]\n"); return 2; }
+        else if (a == "--freegen" && i + 1 < argc) freegen_path = argv[++i];
+        else if (a == "--template" && i + 1 < argc) tpl_arg = argv[++i];
+        else if (a == "--max-gen" && i + 1 < argc) max_gen = std::atoi(argv[++i]);
+        else { std::fprintf(stderr, "usage: token_position_probe --model <gguf> [--steps N] [--freegen out.txt]\n"); return 2; }
     }
     if (model_path.empty()) { std::fprintf(stderr, "usage: token_position_probe --model <gguf> [--steps N]\n"); return 2; }
+    const char * bench_env = std::getenv("KEV_BENCH");
+    const std::string BENCH_PATH = bench_env ? std::string(bench_env) : std::string("tests/bench-60cases.jsonl");
+    (void)tpl_arg;
 
     llama_backend_init();
     setvbuf(stdout, nullptr, _IONBF, 0); // 实时输出, 防异常退出时缓冲丢失
@@ -228,6 +283,12 @@ int main(int argc, char ** argv) {
 
     for (const char * trav : TEMPLATES) {
       const std::string tpl = trav;
+      // 只看单个模板时(KEV_TPL_ONLY=<index>, 0-based)跳过其余 —— 供 85 题 benchmark 快速跑。
+      if (const char * only = std::getenv("KEV_TPL_ONLY")) {
+          int idx = std::atoi(only);
+          static int tcount = 0;
+          if (tcount++ != idx) continue;
+      }
       int n_cand_argmax = 0, n_cases_run = 0, n_alias_correct = 0;
       std::fprintf(stdout, "\n###### TEMPLATE: %s\n", trav);
       for (const auto & c : cases()) {

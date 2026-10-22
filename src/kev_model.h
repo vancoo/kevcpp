@@ -156,6 +156,12 @@ private:
     //   score[c] = cos(query, h_cand[c]), query = h_decide 或 h_agg。零训练, 模型无关。
     ProbsResult probs_hidden(const KevRequest & req, bool use_state_agg, std::string * err);
 
+    // ---- 调研实验: kev 风格 system-one 读取(零训练, KEV_DECIDE=decide) ----
+    // 对标 kev PointerHead 的 _readout: 同一次 forward 读 "决定位 <decide> 的 hidden" 与每个
+    // 选项闭合位 <o_e> 的 hidden, 用零训练去质心余弦替代训过的 Wq/Wk 做 cross-match。
+    // score[j] = cos(h_decide - centroid, h_opts[j] - centroid)。模型无关, 不生成 token。
+    ProbsResult probs_decide(const KevRequest & req, std::string * err);
+
     // ---- 调研实验: 标签 token 打分 + 顺序轮换 (零训练, KEV_LBL=abcd|yn + KEV_ROTATE=n) ----
     // 落实用户两条思路: (1) 构造约束 prompt 让答案 token 能被直接输出 —— 选项统一成可直接
     // 输出的标签 token(A/B/C… | 否/是 | 1..L), 打分只读这些标签 token 的 logit、只对标签集

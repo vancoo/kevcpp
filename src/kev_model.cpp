@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <string>
 #include <thread>
 
@@ -269,6 +271,12 @@ KevModel::ProbsResult KevModel::probs(const KevRequest & req, std::string * err)
     std::string m = dec ? dec : "";
     if (m == "hidden" || m == "hidden_state") {
         return probs_hidden(req, m == "hidden_state", err);
+    }
+    // 调研实验: kev 风格 system-one 读取(KEV_DECIDE=decide)。用 prompt 内 <decide> 位置的
+    // hidden 与每个选项 </o> 位置的 hidden 做零训练 cross-match(för fired 点积/余弦),
+    // 替代训过的 PointerHead(Wq/Wk)。对标 kev 的 _readout: head(h[decide], h[opt_closes]).
+    if (m == "decide") {
+        return probs_decide(req, err);
     }
     // 调研实验: 标签 token 打分 + 顺序轮换(KEV_LBL=abcd|yn, KEV_ROTATE=n)。默认 off。
     const char * lb = std::getenv("KEV_LBL");
@@ -890,6 +898,430 @@ void hidden_state_span(const std::string & tpl, const KevQuestion & q, const Kev
     if (*state_end > (int) P.size()) { *state_end = (int) P.size(); if (*state_start > *state_end) *state_start = *state_end; }
 }
 } // namespace
+
+// ===== 调研实验: kev 风格 system-one 读取(零训练, KEV_DECIDE=decide) =====
+// 对标 kev.model.PointerHead 的 _readout(backbone hidden, no generation):
+//   z[k] = head(h[decide_idx], h[opt_idx])  即"决定位 hidden"与"各选项闭合位 hidden"的 cross-match。
+// kev 用训过的 Wq/Wk 投影(4B LoRA 达 ~90%)。本函数用零训练相似度替代 Wq/Wk:
+//   z[j] = cos( h_decide - centroid , h_opt[j] - centroid )   (去共同方向的 normalized 点积)
+// prompt 结构: instr [ opt1 | opt2 ] state <decide>(每个选项后跟 <o_e> 闭合标记)。
+KevModel::ProbsResult KevModel::probs_decide(const KevRequest & req, std::string * err) {
+    ProbsResult res;
+    double t0 = now_ms();
+    const int Q = (int) req.questions.size();
+    if (!backend_ || !backend_->ok()) { if (err && err->empty()) *err = "backend not initialized"; return res; }
+    if (Q == 0) { if (err && err->empty()) *err = "no questions"; return res; }
+    const TokenFeeder tf = backend_->token_feeder();
+    const int n_embd = backend_->model_n_embd();
+    if (n_embd <= 0) { if (err && err->empty()) *err = "decide channel needs embeddings (read_hidden)"; return res; }
+
+    std::lock_guard<std::mutex> lock(compute_mutex_);
+    auto tok = [&](const std::string & t) {
+        std::lock_guard<std::mutex> lk(tokenizer_mutex_);
+        return kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/false);
+    };
+    auto cos_ = [&](const std::vector<float> & a, const std::vector<float> & b) {
+        if (a.size() != b.size() || a.empty()) return 0.0f;
+        double na = 0, nb = 0, d = 0;
+        for (size_t i = 0; i < a.size(); ++i) { d += (double) a[i] * b[i]; na += (double) a[i] * a[i]; nb += (double) b[i] * b[i]; }
+        double den = std::sqrt(na) * std::sqrt(nb);
+        return (float)(den > 0 ? d / den : 0.0);
+    };
+
+    std::vector<std::vector<float>> probs(Q);
+    std::vector<double> qms(Q, 0.0);
+
+    for (int k = 0; k < Q; ++k) {
+        const KevQuestion & q = req.questions[k];
+        const int K = (int) q.keys.size();
+        if (K == 0) { if (err && err->empty()) *err = "question " + std::to_string(k) + ": no keys"; return res; }
+        double tq0 = now_ms();
+
+        // 构造 prompt: instr 换行选项 list,state, <decide>。选项用方括号包裹, 每个后跟 <o_e> 标记。
+        std::string prompt = q.instr + "\n[ ";
+        std::vector<std::string> opt_lines(K);
+        for (int j = 0; j < K; ++j) {
+            prompt += q.options[j];
+            if (j + 1 < K) prompt += " <o_e> ";
+        }
+        prompt += " ]\n" + req.state + "\n<decide>";
+
+        std::vector<int32_t> P = tok(prompt);
+        while (!P.empty() && P.back() < 0) P.pop_back();
+        const int32_t Lp = (int32_t) P.size();
+        if (Lp == 0) { if (err && err->empty()) *err = "empty prompt"; return res; }
+
+        // 定位 decide 位置(最后一个 token)与各选项 <o_e> 位置。
+        // <o_e> 分词后是单个或多 token; 简化: 用 " ]\n" 前的分隔或按 <o_e> 文本找。
+        // 更稳妥: 直接按字符位置反推 token 索引: 先找 "<decide>"/"<o_e>" 在 prompt 中的字符偏移,
+        // 再二分到 token。这里用近似: decide 位 = Lp-1; opt 位 = 每个 <o_e> 前的 token。
+        std::vector<int32_t> opt_pos(K, -1);
+        {
+            // 将 <o_e> 所在 token 找到: 把每个 <o_e> 替换为唯一标记 token 计位。
+            std::string probe = prompt;
+            int found = 0;
+            size_t at = 0;
+            while (found < K) {
+                size_t p = probe.find("<o_e>", at);
+                if (p == std::string::npos) break;
+                // <o_e> 左侧最近的 token 边界: 该字符 offset 属于哪个 token。
+                // 近似: 记 offset -> 由 " " 分隔近似(不精确, 选项含空格的会偏)。改用精确法: 逐 token 拼。
+                // 放弃近似, 用精确法重建。
+                at = p + 5; found++;
+            }
+        }
+
+        // 精确法: 逐片 tokenize, 记录每个选项闭合标记(<|box_end|>)与 decide(<|fim_suffix|>) 的绝对位置。
+        // 结构(对齐 kev encode): [<|fim_prefix|> state] 每问 [<|fim_middle|> instr
+        //   <|box_start|> opt0 <|box_end|> ... <|box_start|> optK-1 <|box_end|> <|fim_suffix|>]
+        // 用带 parse_special=true 的分词(识别 <|box_start|> 等特殊 token)。
+        auto toksp = [&](const std::string & t){
+            std::vector<int32_t> v;
+            v = kev::tokenize(tf, t, /*add_special=*/false, /*parse_special=*/true);
+            return v;
+        };
+        std::vector<int32_t> all;
+        std::vector<int32_t> opt_end_pos(K, -1);
+        auto app = [&](const std::string & t){ for (int x : toksp(t)) if (x >= 0) all.push_back(x); };
+        auto box_end_tok = [&](){ std::vector<int32_t> v = toksp("<|box_end|>"); return v.empty() ? -1 : v.back(); };
+        auto fim_sfx_tok = [&](){ std::vector<int32_t> v = toksp("<|fim_suffix|>"); return v.empty() ? -1 : v.back(); };
+        const int32_t be_tok = box_end_tok();
+        const int32_t sf_tok = fim_sfx_tok();
+        // [<|fim_prefix|>] state
+        app("<|fim_prefix|>"); app(req.state);
+        // [<|fim_middle|>] instr  <|box_start|> opt <|box_end|> ...  <|fim_suffix|>
+        app("<|fim_middle|>"); app(q.instr);
+        for (int j = 0; j < K; ++j) {
+            app("<|box_start|>");
+            // 选项文本: 用选项内容(kev 传的是描述), 而非 key
+            app(j < (int) q.options.size() ? q.options[j] : q.keys[j]);
+            int32_t before = (int32_t) all.size();
+            app("<|box_end|>");
+            // box_end 的自身位置 = before(它紧跟在选项后, 是 <|box_end|> 的首 token 位置)。
+            if (be_tok >= 0) { opt_end_pos[j] = before; }   // kev 读 <|box_end|> token 位置
+            (void)be_tok;
+        }
+        app("<|fim_suffix|>");
+        while (!all.empty() && all.back() < 0) all.pop_back();
+        int32_t decide_pos = -1;
+        if (sf_tok >= 0) {
+            // decide 位 = 最后一个 <|fim_suffix|> token 的位置
+            int idx = -1;
+            for (size_t i = 0; i < all.size(); ++i) if (all[i] == sf_tok) idx = (int)i;
+            decide_pos = idx;
+        }
+        if (decide_pos < 0) decide_pos = (int32_t) all.size() - 1;
+        const int32_t L2 = (int32_t) all.size();
+        if (L2 == 0) { if (err && err->empty()) *err = "empty built prompt"; return res; }
+        (void)L2;
+
+        // 读 decide 与各 opt 位置的 hidden(同一批 decode, 多个 out_pos)。
+        std::vector<int32_t> out_pos; out_pos.push_back(decide_pos);
+        for (int j = 0; j < K; ++j) if (opt_end_pos[j] >= 0) out_pos.push_back(opt_end_pos[j]);
+        std::vector<std::vector<float>> hh;
+        std::string e2;
+        if (!decode_one_to_hidden(all, 0, scratch_seq_, -1, out_pos, hh, &e2)) {
+            if (err && err->empty()) *err = e2; return res;
+        }
+        if ((int) hh.size() < 1 + K) { if (err && err->empty()) *err = "decide readout: not enough hidden rows"; return res; }
+        std::vector<float> h_decide = hh[0];
+        std::vector<std::vector<float>> h_opts(K);
+        for (int j = 0; j < K; ++j) h_opts[j] = hh[1 + j];
+        std::vector<float> lm_z(K, 0.0f);   // formula=="lm": LM head 读出的候选得分
+        std::vector<float> tf_z(K, -1e30f); // formula=="tf": 选项续写似然分
+        // 决策映射公式(零训练, KEV_FORMULA 选一个; 默认 decide-cos 与 kev PointerHead 对齐)。
+        // 若 KEV_HEAD=<path> 且 formula=="ph": 用 kev 训练出的 PointerHead(Wq/Wk) 打分(早期 kevcpp 逻辑)。
+        const char * kf = std::getenv("KEV_FORMULA");
+        const std::string formula = kf ? kf : "dc";
+
+        // formula=="lm": 在 kev 结构的 decide 位(<|fim_suffix|>)用**模型自带 LM head** 读候选 token 的
+        // logits(不训练任何参数)。验证 kev 自述"adapted backbone 经 LM head 读出 = pointer"。
+        // 候选 = 选项 key(+多语言别名池, 复用 alias 池构造), 逐候选首 token 取 logit 后 softmax。
+        if (formula == "lm") {
+            std::vector<int32_t> cand_toks;                    // 扁平化: [opt0 池..., opt1 池...]
+            std::vector<std::vector<int32_t>> pools(K);
+            const bool is_noul_lm = (K == 2 && q.keys[0] == "false" && q.keys[1] == "true");
+            const bool is_score_lm = (K >= 1 && q.keys[0] == "0" && q.keys.back() == std::to_string(K - 1));
+            for (int j = 0; j < K; ++j) {
+                std::vector<std::string> pool;
+                if (is_noul_lm) pool = (j == 0) ? std::vector<std::string>{"false","False","否","no","No","假","不"}
+                                                 : std::vector<std::string>{"true","True","是","yes","Yes","真"};
+                else if (is_score_lm) pool = { std::to_string(j), std::to_string(j + 1) };
+                else {
+                    pool.push_back(q.keys[j]);
+                    if (j < (int) q.options.size()) {
+                        const std::string & opt = q.options[j];
+                        size_t colon = opt.find(':');
+                        if (colon != std::string::npos) {
+                            std::string desc = opt.substr(colon + 1);
+                            while (!desc.empty() && (desc[0]==' '||desc[0]=='\t')) desc.erase(desc.begin());
+                            while (!desc.empty() && (desc.back()==' '||desc.back()=='\t')) desc.pop_back();
+                            if (!desc.empty() && desc != q.keys[j]) pool.push_back(desc);
+                        }
+                    }
+                }
+                for (const std::string & w : pool) {
+                    std::vector<int32_t> tk = tok(w);
+                    if (tk.empty()) continue;
+                    pools[j].push_back(tk[0]);
+                    cand_toks.push_back(tk[0]);
+                }
+            }
+            if (!cand_toks.empty()) {
+                std::vector<std::vector<int32_t>> one_cand(1, cand_toks);
+                std::vector<std::vector<float>> lg;
+                std::string e3;
+                bool ok = decode_one_to_logits(all, 0, scratch_seq_, -1, {decide_pos}, one_cand, lg, &e3);
+                if (ok && !lg.empty() && !lg[0].empty()) {
+                    int idx = 0;
+                    for (int j = 0; j < K; ++j) {
+                        double mx = -1e30; std::vector<double> vs;
+                        for (size_t p = 0; p < pools[j].size(); ++p) { double v = lg[0][idx + p]; vs.push_back(v); mx = std::max(mx, v); }
+                        double s = 0; for (double v : vs) s += std::exp(v - mx);
+                        lm_z[j] = (vs.empty() ? 0.0f : (float)(mx + std::log(s)));
+                        idx += (int) pools[j].size();
+                    }
+                } else { std::fprintf(stderr, "decide lm: logits read failed: %s\n", e3.c_str()); }
+            }
+        }
+
+        // ---- 监督反推用: 导出 hidden(KEV_DUMP_HIDDEN=<前缀>) ----
+        // 写 <前缀>.bin(每问: [h_decide(n_embd), h_opt0..h_optK-1 各 n_embd] float32)
+        // 与 <前缀>.jsonl(每行: qtype/keys/state/instr)。供 Python 侧用正确答案学映射头。
+        if (const char * dump = std::getenv("KEV_DUMP_HIDDEN")) {
+            std::string bp = dump; std::string jp = std::string(dump) + ".jsonl";
+            {
+                // decide 通道整体在 compute_mutex_ 下串行, 文件追加无并发竞争。
+                FILE * fb = std::fopen((bp + ".bin").c_str(), "ab");
+                if (fb) {
+                    std::fwrite(h_decide.data(), sizeof(float), h_decide.size(), fb);
+                    for (int j = 0; j < K; ++j) std::fwrite(h_opts[j].data(), sizeof(float), h_opts[j].size(), fb);
+                    std::fclose(fb);
+                }
+                FILE * fj = std::fopen(jp.c_str(), "a");
+                if (fj) {
+                    std::string line = "{\"qtype\":\"" + std::string(K == 2 && q.keys[0] == "false" ? "noul" : (q.keys[0] == "0" ? "score" : "choice")) +
+                        "\",\"n_embd\":" + std::to_string(n_embd) + ",\"K\":" + std::to_string(K) + ",\"keys\":[";
+                    for (int j = 0; j < K; ++j) { line += "\"" + q.keys[j] + "\""; if (j + 1 < K) line += ","; }
+                    line += "],\"opts\":[";
+                    for (int j = 0; j < K; ++j) {
+                        std::string o = (j < (int) q.options.size()) ? q.options[j] : "";
+                        std::string e; for (char ch : o) { if (ch == '"' || ch == '\\') e += '\\'; e += ch; }
+                        line += "\"" + e + "\""; if (j + 1 < K) line += ",";
+                    }
+                    line += "],\"instr\":\"";
+                    { std::string e; for (char ch : q.instr) { if (ch == '"' || ch == '\\') e += '\\'; e += ch; } line += e; }
+                    line += "\"}\n";
+                    std::fwrite(line.data(), 1, line.size(), fj);
+                    std::fclose(fj);
+                }
+            }
+        }
+
+        // 去共同方向(各候选句的通用残差流方向)再做 cos。
+        std::vector<float> centroid(n_embd, 0.0f);
+        int filled = 0;
+        for (int j = 0; j < K; ++j) if ((int) h_opts[j].size() == n_embd) { for (int i = 0; i < n_embd; ++i) centroid[i] += h_opts[j][i]; filled++; }
+        if (filled > 0) for (int i = 0; i < n_embd; ++i) centroid[i] /= (float) filled;
+
+        // formula=="tf": teacher-forced 选项似然(标准 multiple-choice 零训练读法)。
+        // 对每个选项: 把**选项文本**续写到 kev 结构的 decide 位之后, 读该续写各 token 位置的
+        // logit 并求和(长度归一可选) -> 该选项的似然分。这是"让模型用自己的语言模型给选项打分",
+        // 与 lm-eval-harness 的 acc/lik 口径一致, 完全不训练任何参数。
+        if (formula == "tf") {
+            const int32_t base_len = (int32_t) all.size();
+            for (int j = 0; j < K; ++j) {
+                std::string opt_text = (j < (int) q.options.size()) ? q.options[j] : q.keys[j];
+                // 选项文本可能带 "key: desc" 前缀, 两种都试不了 -> 去掉 "key: " 前缀只留描述
+                {
+                    size_t colon = opt_text.find(':');
+                    if (colon != std::string::npos) {
+                        std::string d = opt_text.substr(colon + 1);
+                        while (!d.empty() && (d[0] == ' ' || d[0] == '\t')) d.erase(d.begin());
+                        if (!d.empty()) opt_text = d;
+                    }
+                }
+                std::vector<int32_t> ot = tok(opt_text);
+                while (!ot.empty() && ot.back() < 0) ot.pop_back();
+                if (ot.empty()) { tf_z[j] = -1e30f; continue; }
+                const int M = (int) ot.size();
+                std::vector<int32_t> ids = all;
+                ids.insert(ids.end(), ot.begin(), ot.end());
+                // 读位置: base_len-1 .. base_len+M-2 上, 候选分别是 ot[0..M-1]
+                std::vector<int32_t> out_pos; std::vector<std::vector<int32_t>> cands;
+                for (int m = 0; m < M; ++m) { out_pos.push_back(base_len - 1 + m); cands.push_back({ ot[m] }); }
+                std::vector<std::vector<float>> mlg; std::string e4;
+                if (!decode_one_to_logits(ids, 0, scratch_seq_, -1, out_pos, cands, mlg, &e4)) {
+                    std::fprintf(stderr, "decide tf: decode failed: %s\n", e4.c_str());
+                    tf_z[j] = -1e30f; continue;
+                }
+                double s = 0; int cnt = 0;
+                for (int m = 0; m < M; ++m) if (m < (int) mlg.size() && !mlg[m].empty()) { s += mlg[m][0]; cnt++; }
+                if (cnt == 0) { tf_z[j] = -1e30f; continue; }
+                tf_z[j] = (float)(s / cnt);   // 长度归一(平均 logit)
+            }
+        }
+
+        // 决策映射公式(零训练, KEV_FORMULA 选一个) —— formula 已在上面声明。
+        // 若是 formula=="ph": 用 kev 训练出的 PointerHead(Wq/Wk) 打分(早期 kevcpp 逻辑)。
+        static std::vector<float> PH_Wq, PH_bq, PH_Wk, PH_bk; static int PH_din=0, PH_dproj=0; static float PH_scale=1.f;
+        static bool PH_tried=false;
+        if (formula == "ph" && !PH_tried) {
+            PH_tried = true;
+            const char * hp = std::getenv("KEV_HEAD");
+            if (hp && *hp) {
+                std::ifstream f(hp, std::ios::binary); char magic[4]={0,0,0,0};
+                if (f && f.read(magic,4) && std::memcmp(magic,"KEVH",4)==0) {
+                    auto r32=[&f](int32_t&v){f.read((char*)&v,4);return f.good();};
+                    auto rf32=[&f](float&v){f.read((char*)&v,4);return f.good();};
+                    auto rfn=[&f](float*p,size_t n){f.read((char*)p,(std::streamsize)(n*4));return f.good();};
+                    int32_t di=0,dp=0; float T=1.f;
+                    if (r32(di)&&r32(dp)&&rf32(T)&&di>0&&dp>0){
+                        PH_din=di; PH_dproj=dp; PH_scale=1.0f/std::sqrt((float)dp);
+                        PH_Wq.resize(dp*di); PH_bq.resize(dp); PH_Wk.resize(dp*di); PH_bk.resize(dp);
+                        bool ok = rfn(PH_Wq.data(),PH_Wq.size())&&rfn(PH_bq.data(),PH_bq.size())
+                               && rfn(PH_Wk.data(),PH_Wk.size())&&rfn(PH_bk.data(),PH_bk.size());
+                        std::fprintf(stderr,"kev_head: loaded %s din=%d dproj=%d ok=%d\n", hp,di,dp,(int)ok);
+                    } else std::fprintf(stderr,"kev_head: bad header\n");
+                    f.close();
+                }
+            }
+        }
+        auto dotp = [&](const std::vector<float> & a, const std::vector<float> & b){
+            if (a.size() != b.size()) return 0.0f; double s=0; for (size_t i=0;i<a.size();++i) s+=(double)a[i]*b[i]; return (float)s; };
+
+        std::vector<float> z(K, 0.0f);
+        if (formula == "lm") {
+            // 用 LM head 在 decide 位读出的候选 logit(别名池 LSE)作为得分。
+            for (int j = 0; j < K; ++j) z[j] = lm_z[j];
+        } else if (formula == "tf") {
+            // teacher-forced 选项续写似然(长度归一)
+            for (int j = 0; j < K; ++j) z[j] = tf_z[j];
+        } else if (formula == "dc") {
+            // decide-cos: cos(h_decide - c, h_opt[j] - c)  (kev 无训版)
+            for (int j = 0; j < K; ++j) {
+                if ((int) h_opts[j].size() != n_embd || (int) h_decide.size() != n_embd) { z[j] = 0.0f; continue; }
+                std::vector<float> qc(n_embd), kc(n_embd);
+                for (int i = 0; i < n_embd; ++i) { qc[i] = h_decide[i] - centroid[i]; kc[i] = h_opts[j][i] - centroid[i]; }
+                z[j] = cos_(qc, kc); if (std::isnan(z[j])) z[j] = 0.0f;
+            }
+        } else if (formula == "wc") {
+            // whitened-cosine (零训练, all-but-the-top 思想): 先去均值, 再投影掉选项集里
+            // 前 k 个主方向(用 KxK Gram 矩阵幂迭代, K 很小代价低), 再算余弦。
+            // 动机: 实测 4 种普通公式给出完全相同排序 ⇒ hidden 近乎共线, 少数通用方向主导相似度;
+            //   去掉这些方向应能恢复"谁更像答案"的差异。
+            const int ncomp = 1;   // 去掉 top-1 主方向(可用 env 调)
+            std::vector<std::vector<float>> X;   // 中心化后的选项向量 + decide 向量
+            for (int j = 0; j < K; ++j) {
+                if ((int) h_opts[j].size() != n_embd) continue;
+                std::vector<float> v(n_embd);
+                for (int i = 0; i < n_embd; ++i) v[i] = h_opts[j][i] - centroid[i];
+                X.push_back(v);
+            }
+            std::vector<float> qc0(n_embd);
+            for (int i = 0; i < n_embd && i < (int) h_decide.size(); ++i) qc0[i] = h_decide[i] - centroid[i];
+            if ((int) X.size() == K) {
+                // Gram 矩阵 G[a][b] = X_a·X_b ; 幂迭代取最大特征向量
+                std::vector<std::vector<double>> G(K, std::vector<double>(K, 0.0));
+                for (int a = 0; a < K; ++a) for (int b = 0; b < K; ++b) {
+                    double s = 0; for (int i = 0; i < n_embd; ++i) s += (double) X[a][i] * X[b][i];
+                    G[a][b] = s;
+                }
+                std::vector<std::vector<double>> dirs;   // 要投影掉的方向(在 R^n_embd)
+                for (int c = 0; c < ncomp; ++c) {
+                    std::vector<double> u(K, 1.0 / std::sqrt((double) K));
+                    double lam = 0;
+                    for (int it = 0; it < 64; ++it) {
+                        std::vector<double> w(K, 0.0);
+                        for (int a = 0; a < K; ++a) for (int b = 0; b < K; ++b) w[a] += G[a][b] * u[b];
+                        double nw = 0; for (double x : w) nw += x * x; nw = std::sqrt(nw);
+                        if (nw < 1e-12) break;
+                        for (int a = 0; a < K; ++a) u[a] = w[a] / nw;
+                        lam = 0; for (int a = 0; a < K; ++a) lam += u[a] * w[a];
+                    }
+                    // 特征方向 v = sum_a u[a] * X[a]
+                    std::vector<double> v(n_embd, 0.0);
+                    for (int a = 0; a < K; ++a) for (int i = 0; i < n_embd; ++i) v[i] += u[a] * X[a][i];
+                    double nv = 0; for (double x : v) nv += x * x; nv = std::sqrt(nv);
+                    if (nv < 1e-12) break;
+                    for (int i = 0; i < n_embd; ++i) v[i] /= nv;
+                    dirs.push_back(v);
+                    // deflate: G -= lambda * u u^T
+                    for (int a = 0; a < K; ++a) for (int b = 0; b < K; ++b) G[a][b] -= lam * u[a] * u[b];
+                }
+                auto proj = [&](std::vector<float> & v2) {
+                    for (auto & d : dirs) {
+                        double dot = 0; for (int i = 0; i < n_embd; ++i) dot += (double) d[i] * v2[i];
+                        for (int i = 0; i < n_embd; ++i) v2[i] -= (float)(dot * d[i]);
+                    }
+                };
+                proj(qc0);
+                for (int j = 0; j < K; ++j) { std::vector<float> kc = X[j]; proj(kc); z[j] = cos_(qc0, kc); if (std::isnan(z[j])) z[j] = 0.0f; }
+            }
+        } else if (formula == "dd") {
+            // decide-dot: 直接未去均值点积 h_decide·h_opt[j]
+            for (int j = 0; j < K; ++j) {
+                if ((int) h_opts[j].size() != n_embd || (int) h_decide.size() != n_embd) { z[j] = 0.0f; continue; }
+                z[j] = dotp(h_decide, h_opts[j]);
+            }
+        } else if (formula == "ad") {
+            // all-dot: 用"全选项 hidden 的质心"当作信号, 对各选项点积(重心式决策, 越像整体综合越靠前)
+            for (int j = 0; j < K; ++j) {
+                if ((int) h_opts[j].size() != n_embd) { z[j] = 0.0f; continue; }
+                z[j] = filled ? dotp(centroid, h_opts[j]) : 0.0f;
+            }
+        } else if (formula == "nz") {
+            // norm-signal: 决定向量 std/norm 与选项点积(去掉幅度, 留方向)
+            double nd = 0; for (int i=0;i<n_embd && i<(int)h_decide.size();++i) nd+=(double)h_decide[i]*h_decide[i];
+            float inv = nd>0 ? (float)(1.0/std::sqrt(nd)) : 0.0f;
+            for (int j = 0; j < K; ++j) {
+                if ((int) h_opts[j].size() != n_embd) { z[j] = 0.0f; continue; }
+                float d = dotp(h_decide, h_opts[j]) * inv;
+                z[j] = d;
+            }
+        }
+        else if (formula == "ph") {
+            // PointerHead(训过的 Wq/Wk): z[o] = (Wq·h_decide) · (Wk·h_opt[o]) * scale
+            if (!PH_Wq.empty() && PH_din == n_embd) {
+                std::vector<float> qv(PH_dproj, 0.0f);
+                for (int o = 0; o < PH_dproj; ++o) {
+                    float acc = PH_bq[o];
+                    const float * row = PH_Wq.data() + (size_t)o * n_embd;
+                    for (int i = 0; i < n_embd && i < (int)h_decide.size(); ++i) acc += row[i] * h_decide[i];
+                    qv[o] = acc;
+                }
+                for (int j = 0; j < K; ++j) {
+                    if ((int) h_opts[j].size() != n_embd) { z[j] = 0.0f; continue; }
+                    std::vector<float> kv(PH_dproj, 0.0f);
+                    for (int o = 0; o < PH_dproj; ++o) {
+                        float acc = PH_bk[o];
+                        const float * row = PH_Wk.data() + (size_t)o * n_embd;
+                        for (int i = 0; i < n_embd; ++i) acc += row[i] * h_opts[j][i];
+                        kv[o] = acc;
+                    }
+                    float acc = 0; for (int o = 0; o < PH_dproj; ++o) acc += kv[o] * qv[o];
+                    z[j] = acc * PH_scale;
+                }
+            } else { std::fprintf(stderr, "kev_head: head not loaded or dim mismatch (want %d, have %d)\n", PH_din, n_embd); }
+        } else {
+            // 默认退回 dc
+            for (int j = 0; j < K; ++j) {
+                if ((int) h_opts[j].size() != n_embd || (int) h_decide.size() != n_embd) { z[j] = 0.0f; continue; }
+                std::vector<float> qc(n_embd), kc(n_embd);
+                for (int i = 0; i < n_embd; ++i) { qc[i] = h_decide[i] - centroid[i]; kc[i] = h_opts[j][i] - centroid[i]; }
+                z[j] = cos_(qc, kc); if (std::isnan(z[j])) z[j] = 0.0f;
+            }
+        }
+
+        softmax_scaled(z, decision_.temperature, probs[k]);
+        qms[k] = now_ms() - tq0;
+    }
+    res.t_rows_ms = 0.0; for (double x : qms) res.t_rows_ms += x;
+    res.probs = std::move(probs);
+    res.rows_ms_per_q = std::move(qms);
+    res.t_total_ms = now_ms() - t0;
+    return res;
+}
 
 KevModel::ProbsResult KevModel::probs_hidden(const KevRequest & req, bool use_state_agg, std::string * err) {
     ProbsResult res;
