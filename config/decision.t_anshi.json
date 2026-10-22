@@ -1,0 +1,17 @@
+{
+  "_comment": "kevcpp 模板消融: 收尾词对照(单独跑, 用于判断多模板集成为何负收益)。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\n答案是：",
+    "aggregation": "combo",
+    "logits_type": ""
+  }
+}

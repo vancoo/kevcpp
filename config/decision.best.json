@@ -1,0 +1,17 @@
+{
+  "_comment": "kevcpp 最优配置(零微调): 收尾词 '答案：' (4B 收尾词消融 80.0% 最高, noul 90%) + combo 别名池聚合(noul/score 用多语言别名池, choice 用 key+描述别名池)。",
+  "markers": {
+    "state":        "<|fim_prefix|>",
+    "question":     "<|fim_middle|>",
+    "option_start": "<|box_start|>",
+    "option_end":   "<|box_end|>",
+    "decide":       "<|fim_suffix|>"
+  },
+  "temperature": 1.0,
+  "logits": {
+    "enable": true,
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\n答案：",
+    "aggregation": "combo",
+    "logits_type": ""
+  }
+}

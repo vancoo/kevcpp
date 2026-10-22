@@ -682,9 +682,9 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
         }
 
         // 别名池模式: 覆盖 z —— 在 Lp-1 读所有别名 token 的 logit, 每个选项取池内 log-sum-exp。
+        std::vector<int32_t> all_alias_tok;                 // 顺序 = 选项 j 的池
+        std::vector<std::vector<int32_t>> pool_id(K);
         if (use_alias && apply_alias_override) {
-            std::vector<int32_t> all_alias_tok;                 // 顺序 = 选项 j 的池
-            std::vector<std::vector<int32_t>> pool_id(K);
             for (int j = 0; j < K; ++j) {
                 for (const std::string & w : alias_pool[j]) {
                     std::vector<int32_t> tk = tok(w);
@@ -750,6 +750,56 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // ===== 多模板集成(零训练, 推理期): KEV_ENSEMBLE_TPL="tplA|||tplB|||tplC" =====
+        // 动机: 实测 35B 的 noul 错题**全部**落在低置信中间带(prob(true) 0.17~0.45), 正确题
+        // 要么 <0.16 要么 >0.51 —— 错的是"读数在边界"的题。对同一题用多个等价模板各读一次并
+        // 平均 z, 可摊平原读数的噪声, 把边界题推向正确一侧。纯推理期, 不训练任何参数。
+        // 模板用 '|||' 分隔; 每个模板的占位符约定同 prompt_template; 第一个模板与主模板一起参与平均。
+        if (use_alias && apply_alias_override && std::getenv("KEV_ENSEMBLE_TPL")) {
+            std::string ens = std::getenv("KEV_ENSEMBLE_TPL");
+            std::vector<std::string> tpls; tpls.push_back(tpl);   // 主模板
+            size_t p0 = 0;
+            while (p0 < ens.size()) {
+                size_t p1 = ens.find("|||", p0);
+                if (p1 == std::string::npos) p1 = ens.size();
+                std::string t2 = ens.substr(p0, p1 - p0);
+                // 把字面 "\n" 还原成换行(便于在 env 里写多行模板)
+                std::string fixed; for (size_t i = 0; i < t2.size(); ++i) {
+                    if (t2[i] == '\\' && i + 1 < t2.size() && t2[i + 1] == 'n') { fixed += '\n'; ++i; }
+                    else fixed += t2[i];
+                }
+                if (!fixed.empty()) tpls.push_back(fixed);
+                p0 = p1 + 3;
+            }
+            if (tpls.size() >= 2) {
+                std::vector<float> zsum(K, 0.0f);
+                int nread = 0;
+                for (size_t ti = 0; ti < tpls.size(); ++ti) {
+                    std::string pr2 = render_prompt(tpls[ti], q, req, q.options);
+                    std::vector<int32_t> P2 = tok(pr2);
+                    while (!P2.empty() && P2.back() < 0) P2.pop_back();
+                    if (P2.empty()) continue;
+                    std::vector<std::vector<int32_t>> one_cand2(1, all_alias_tok);
+                    std::vector<std::vector<float>> lg2; std::string e7;
+                    bool ok2 = decode_one_to_logits(P2, 0, my_slot, -1, { (int) P2.size() - 1 }, one_cand2, lg2, &e7);
+                    if (!ok2 || lg2.empty() || lg2[0].empty()) continue;
+                    int idx2 = 0;
+                    for (int j = 0; j < K; ++j) {
+                        double mx = -1e30;
+                        for (size_t q2 = 0; q2 < pool_id[j].size(); ++q2) mx = std::max(mx, (double) lg2[0][idx2 + q2]);
+                        double s = 0;
+                        for (size_t q2 = 0; q2 < pool_id[j].size(); ++q2) s += std::exp((double) lg2[0][idx2 + q2] - mx);
+                        zsum[j] += (float)(mx + std::log(s));
+                        idx2 += (int) pool_id[j].size();
+                    }
+                    ++nread;
+                }
+                if (nread >= 2) {
+                    for (int j = 0; j < K; ++j) z[j] = zsum[j] / (float) nread;
                 }
             }
         }

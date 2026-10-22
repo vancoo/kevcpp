@@ -7,6 +7,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace kev {
 
@@ -42,6 +43,11 @@ struct KevDecisionConfig {
     // 只续算变化的 state)。末尾 "Answer:" 提示续写候选答案 token。
     // **不要用"列出选项再让模型选 A/B"式 prompt**——实测会引入位置偏差。
     std::string prompt_template = "{instructions}\n[ {options} ]\n{state}\nAnswer:";
+    // 多模板集成(零训练, 推理期): 若非空, 对每个模板各跑一遍判别, 把各模板的选项概率**平均**。
+    // 动机: 实测 35B 的 noul 错误全部落在"低置信中间带"(prob(true) 0.17~0.45), 正确题要么<0.16
+    // 要么>0.51 —— 属"读数处在边界"的题, 多模板平均可把逐模板噪声摊平, 提升边界题的判定。
+    // 每项与 prompt_template 同样的占位符约定; 空 = 不用集成(单模板, 行为不变)。
+    std::vector<std::string> prompt_templates;
     // 多 token 候选的聚合策略:
     //   "first" = 只取该候选 key 的第一个 token 的 logit(与验证结果一致, 天然无位置偏置)
     //   "sum"   = 对候选 key 的全部 token 的 logit 求和
