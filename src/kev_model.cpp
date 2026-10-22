@@ -974,6 +974,9 @@ KevModel::ProbsResult KevModel::probs_decide(const KevRequest & req, std::string
         // 精确法: 逐片 tokenize, 记录每个选项闭合标记(<|box_end|>)与 decide(<|fim_suffix|>) 的绝对位置。
         // 结构(对齐 kev encode): [<|fim_prefix|> state] 每问 [<|fim_middle|> instr
         //   <|box_start|> opt0 <|box_end|> ... <|box_start|> optK-1 <|box_end|> <|fim_suffix|>]
+        // 决策映射公式(零训练, KEV_FORMULA 选一个) —— 提前声明, 供下面的读取分支使用。
+        const char * kf = std::getenv("KEV_FORMULA");
+        const std::string formula = kf ? kf : "dc";
         // 用带 parse_special=true 的分词(识别 <|box_start|> 等特殊 token)。
         auto toksp = [&](const std::string & t){
             std::vector<int32_t> v;
@@ -1027,12 +1030,27 @@ KevModel::ProbsResult KevModel::probs_decide(const KevRequest & req, std::string
         std::vector<float> h_decide = hh[0];
         std::vector<std::vector<float>> h_opts(K);
         for (int j = 0; j < K; ++j) h_opts[j] = hh[1 + j];
+        // formula=="iso": 逐选项隔离解码(近似 kev 的 option_isolation, 零训练结构红利)。
+        // 每个选项单独 decode: [<|fim_prefix|> state][<|fim_middle|> instr][<|box_start|> opt_j <|box_end|>]
+        //   → 读该 <|box_end|> 位置 hidden 作为 h_opt[j]。选项互不可见 => 置换不变、消除位置偏好。
+        if (formula == "iso" || formula == "isor2") {
+            for (int j = 0; j < K; ++j) {
+                std::vector<int32_t> seq;
+                auto ap2 = [&](const std::string & t){ for (int x : toksp(t)) if (x >= 0) seq.push_back(x); };
+                ap2("<|fim_prefix|>"); ap2(req.state);
+                ap2("<|fim_middle|>"); ap2(q.instr);
+                ap2("<|box_start|>");
+                ap2(j < (int) q.options.size() ? q.options[j] : q.keys[j]);
+                int32_t be_pos = (int32_t) seq.size();
+                ap2("<|box_end|>");
+                if (be_pos >= (int32_t) seq.size()) be_pos = (int32_t) seq.size() - 1;
+                std::vector<std::vector<float>> oh; std::string e5;
+                if (!decode_one_to_hidden(seq, 0, scratch_seq_, -1, {be_pos}, oh, &e5) || oh.empty()) continue;
+                h_opts[j] = oh[0];
+            }
+        }
         std::vector<float> lm_z(K, 0.0f);   // formula=="lm": LM head 读出的候选得分
         std::vector<float> tf_z(K, -1e30f); // formula=="tf": 选项续写似然分
-        // 决策映射公式(零训练, KEV_FORMULA 选一个; 默认 decide-cos 与 kev PointerHead 对齐)。
-        // 若 KEV_HEAD=<path> 且 formula=="ph": 用 kev 训练出的 PointerHead(Wq/Wk) 打分(早期 kevcpp 逻辑)。
-        const char * kf = std::getenv("KEV_FORMULA");
-        const std::string formula = kf ? kf : "dc";
 
         // formula=="lm": 在 kev 结构的 decide 位(<|fim_suffix|>)用**模型自带 LM head** 读候选 token 的
         // logits(不训练任何参数)。验证 kev 自述"adapted backbone 经 LM head 读出 = pointer"。
@@ -1257,6 +1275,70 @@ KevModel::ProbsResult KevModel::probs_decide(const KevRequest & req, std::string
                 };
                 proj(qc0);
                 for (int j = 0; j < K; ++j) { std::vector<float> kc = X[j]; proj(kc); z[j] = cos_(qc0, kc); if (std::isnan(z[j])) z[j] = 0.0f; }
+            }
+        } else if (formula == "r2") {
+            // R2 去污染 + 余弦(零训练)。依据:
+            //  - rogue dimensions 病态(arXiv:2109.04404): 1~3 个维度主导相似度 -> 我们的"四公式同序"就是它。
+            //  - R2(arXiv:2511.11041): 减去均值向量 μ 的**平行分量**(把 μ 方向投影掉), 零训练, 对分类友好。
+            //  - depth=1 ABT(arXiv:2104.07456): 再去 top-1 主方向(只去 1 个, 不用全白化; 文献明确全白化伤分类)。
+            // D = {h_decide, h_opt[0..K-1]}; 先求 μ, 去 μ 方向; 再去选项集 top-1 主方向; 最后余弦。
+            std::vector<std::vector<float>> D;
+            for (int j = 0; j < K; ++j) if ((int) h_opts[j].size() == n_embd) D.push_back(h_opts[j]);
+            if ((int) D.size() == K && (int) h_decide.size() == n_embd) {
+                // μ = mean(D)
+                std::vector<double> mu(n_embd, 0.0);
+                for (int j = 0; j < K; ++j) for (int i = 0; i < n_embd; ++i) mu[i] += D[j][i];
+                for (int i = 0; i < n_embd; ++i) mu[i] /= (double) K;
+                double mun = 0; for (int i = 0; i < n_embd; ++i) mun += mu[i] * mu[i];
+                mun = std::sqrt(mun);
+                std::vector<double> muhat(n_embd, 0.0);
+                if (mun > 1e-12) for (int i = 0; i < n_embd; ++i) muhat[i] = mu[i] / mun;
+                auto r2 = [&](std::vector<double> & v) {
+                    double dot = 0; for (int i = 0; i < n_embd; ++i) dot += v[i] * muhat[i];
+                    for (int i = 0; i < n_embd; ++i) v[i] -= dot * muhat[i];
+                };
+                std::vector<std::vector<double>> X;   // 中心化+R2 后的选项向量
+                for (int j = 0; j < K; ++j) {
+                    std::vector<double> v(n_embd);
+                    for (int i = 0; i < n_embd; ++i) v[i] = (double) D[j][i] - mu[i];
+                    r2(v); X.push_back(v);
+                }
+                std::vector<double> qv(n_embd);
+                for (int i = 0; i < n_embd; ++i) qv[i] = (double) h_decide[i] - mu[i];
+                r2(qv);
+                // depth=1 ABT: 去选项集 top-1 主方向(在 R2 后的 X 上用 KxK Gram 幂迭代)
+                std::vector<std::vector<double>> G(K, std::vector<double>(K, 0.0));
+                for (int a = 0; a < K; ++a) for (int b = 0; b < K; ++b) {
+                    double s = 0; for (int i = 0; i < n_embd; ++i) s += X[a][i] * X[b][i];
+                    G[a][b] = s;
+                }
+                std::vector<double> u(K, 1.0 / std::sqrt((double) K));
+                for (int it = 0; it < 64; ++it) {
+                    std::vector<double> w(K, 0.0);
+                    for (int a = 0; a < K; ++a) for (int b = 0; b < K; ++b) w[a] += G[a][b] * u[b];
+                    double nw = 0; for (double x : w) nw += x * x; nw = std::sqrt(nw);
+                    if (nw < 1e-12) break;
+                    for (int a = 0; a < K; ++a) u[a] = w[a] / nw;
+                }
+                std::vector<double> v1(n_embd, 0.0);
+                for (int a = 0; a < K; ++a) for (int i = 0; i < n_embd; ++i) v1[i] += u[a] * X[a][i];
+                double v1n = 0; for (double x : v1) v1n += x * x; v1n = std::sqrt(v1n);
+                if (v1n > 1e-12) {
+                    for (int i = 0; i < n_embd; ++i) v1[i] /= v1n;
+                    auto proj1 = [&](std::vector<double> & v) {
+                        double dot = 0; for (int i = 0; i < n_embd; ++i) dot += v[i] * v1[i];
+                        for (int i = 0; i < n_embd; ++i) v[i] -= dot * v1[i];
+                    };
+                    proj1(qv);
+                    for (int j = 0; j < K; ++j) proj1(X[j]);
+                }
+                auto cosd = [&](const std::vector<double> & a, const std::vector<double> & b) {
+                    double na = 0, nb = 0, dd = 0;
+                    for (int i = 0; i < n_embd; ++i) { dd += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+                    double den = std::sqrt(na) * std::sqrt(nb);
+                    return den > 0 ? (float)(dd / den) : 0.0f;
+                };
+                for (int j = 0; j < K; ++j) { z[j] = cosd(qv, X[j]); if (std::isnan(z[j])) z[j] = 0.0f; }
             }
         } else if (formula == "dd") {
             // decide-dot: 直接未去均值点积 h_decide·h_opt[j]
