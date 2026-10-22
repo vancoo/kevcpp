@@ -714,6 +714,42 @@ KevModel::ProbsResult KevModel::probs_logits(const KevRequest & req, std::string
                         z[j] = (float)(mx + std::log(s));
                         idx += (int) pool_id[j].size();
                     }
+                    // DC-PMI(arXiv:2104.08315): 减去每个候选的"内容无关先验"logit。
+                    // 先验 = 用中性 prompt(空 instructions + 空 state) 读同一批别名 token 的 logit。
+                    // 作用: 抵消 surface-form / 格式偏好(模型天然更想说 true/否/是 等), 让分数只反映
+                    // "与本题相关的证据", 直接针对"模型说否但 key 是 false"这类错位。
+                    if (std::getenv("KEV_PMI")) {
+                        std::string neutral = render_prompt(tpl, q, req, q.options);
+                        // 构造中性 prompt: 同模板但 instructions/state 置空
+                        {
+                            KevQuestion qn = q; qn.instr = "";
+                            std::string np = render_prompt(tpl, qn, req, q.options);
+                            // state 置空: render_prompt 用 req.state, 这里构造一个替身 request
+                            KevRequest rn = req; rn.state = "";
+                            np = render_prompt(tpl, qn, rn, q.options);
+                            neutral = np;
+                        }
+                        std::vector<int32_t> PN = tok(neutral);
+                        while (!PN.empty() && PN.back() < 0) PN.pop_back();
+                        if (!PN.empty()) {
+                            std::vector<std::vector<int32_t>> one_cand2(1, all_alias_tok);
+                            std::vector<std::vector<float>> lg2;
+                            std::string e6;
+                            if (decode_one_to_logits(PN, 0, scratch_seq_, -1, {Lp - 1}, one_cand2, lg2, &e6)
+                                && !lg2.empty() && !lg2[0].empty()) {
+                                int idx2 = 0;
+                                for (int j = 0; j < K; ++j) {
+                                    double mx = -1e30;
+                                    for (size_t p = 0; p < pool_id[j].size(); ++p) mx = std::max(mx, (double) lg2[0][idx2 + p]);
+                                    double s = 0;
+                                    for (size_t p = 0; p < pool_id[j].size(); ++p) s += std::exp((double) lg2[0][idx2 + p] - mx);
+                                    double prior = mx + std::log(s);
+                                    z[j] = (float)(z[j] - prior);
+                                    idx2 += (int) pool_id[j].size();
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
