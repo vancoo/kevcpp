@@ -1,5 +1,5 @@
 {
-  "_comment": "kevcpp 最优配置(零微调): 收尾词 '答案：' (4B 收尾词消融 80.0% 最高, noul 90%) + combo 别名池聚合(noul/score 用多语言别名池, choice 用 key+描述别名池)。",
+  "_comment": "kevcpp 最优零微调配置: 收尾词 '正确选项：' + combo 聚合。35B-A3B 实测 87.1% (noul 92.5% / choice 82.5% / score 80%)，为零微调路径最佳。关键要素: (1) 收尾词须为中文且含'正确/选项'语义(正确选项：87.1 > 正确答案：84.7 > 答案：81.2); (2) 冒号必须有(去掉后 81.2% -> 55.3%); (3) 收尾词后不要换行(81.2% -> 75.3%)。",
   "markers": {
     "state":        "<|fim_prefix|>",
     "question":     "<|fim_middle|>",
@@ -10,7 +10,7 @@
   "temperature": 1.0,
   "logits": {
     "enable": true,
-    "prompt_template": "{instructions}\n[ {options} ]\n{state}\n答案：",
+    "prompt_template": "{instructions}\n[ {options} ]\n{state}\n正确选项：",
     "aggregation": "combo",
     "logits_type": ""
   }
