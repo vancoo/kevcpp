@@ -54,6 +54,7 @@ bool decode_req_chunked(Backend * backend, const Backend::MultiSeqRequest & req,
         for (int32_t p : out_pos) outs.push_back({0, p});
         std::vector<int32_t> oi;
         if (!backend->decode_multi_seq(one, &err, outs, &oi)) return false;
+        if (oi.size() != out_pos.size()) { err = "decode: output index count mismatch"; return false; }
         for (size_t i = 0; i < oi.size(); ++i) out_idx[i] = oi[i];
         return true;
     }
@@ -89,6 +90,7 @@ bool decode_req_chunked(Backend * backend, const Backend::MultiSeqRequest & req,
     for (int32_t g : out_pos) { outs.push_back({0, g - tail_start}); local_pos.push_back(g - tail_start); }
     std::vector<int32_t> oi;
     if (!backend->decode_multi_seq(one, &err, outs, &oi)) return false;
+    if (oi.size() != out_pos.size()) { err = "decode: output index count mismatch"; return false; }
     for (size_t i = 0; i < oi.size(); ++i) out_idx[i] = oi[i];
     return true;
 }
@@ -199,22 +201,41 @@ void BatchScheduler::worker_loop() {
                     std::string e2;
                     if (decode_req_chunked(backend_, flatin[m].req, flatin[m].copy_src, n_batch_,
                                            out_pos, oi, e2)) {
+                        // 防护(2026-10-30): oi 的长度由 out_pos 决定, 正常情况下与下面的
+                        // 遍历范围一致。一旦后端回填的 oi 比预期短, oi[src_out] 就是越界读,
+                        // 会踩坏 std::vector 控制块并在 CRT 里触发 0xc0000409。这里显式校验。
+                        if (oi.size() != out_pos.size()) {
+                            job->err = "oversize decode: out_idx size " + std::to_string(oi.size())
+                                     + " != outputs " + std::to_string(out_pos.size());
+                            jlk.unlock();
+                            continue;
+                        }
                         // write logits for each output of this req
                         job->logits.resize(job->outs.size(), {});
                         int src_out = 0;
                         for (size_t o = 0; o < job->outs.size(); ++o) {
                             if (job->outs[o].first != flatin[m].r) continue;
+                            if (src_out >= (int) oi.size()) {
+                                job->err = "oversize decode: out_idx exhausted at output "
+                                         + std::to_string(o);
+                                break;
+                            }
                             job->logits[o].resize(job->out_cands[o].size());
                             std::string rd_err;
                             for (size_t c = 0; c < job->out_cands[o].size(); ++c) {
                                 float v = 0.0f;
-                                if (!backend_->read_logits(oi[src_out], job->out_cands[o][c], &v, &rd_err)) v = 0.0f;
+                                if (!backend_->read_logits(oi[src_out], job->out_cands[o][c], &v, &rd_err)) {
+                                    if (job->err.empty()) job->err = "read_logits failed at output "
+                                        + std::to_string(o) + " candidate " + std::to_string(c) + ": " + rd_err;
+                                    break;
+                                }
                                 job->logits[o][c] = v;
                             }
+                            if (!job->err.empty()) break;
                             ++src_out;
                         }
                     } else {
-                        job->err = e2;
+                        if (job->err.empty()) job->err = e2;
                     }
                     jlk.unlock();
                     continue;
@@ -230,7 +251,7 @@ void BatchScheduler::worker_loop() {
                     for (int m : chunk_members[ci]) {
                         auto & job = batch[flatin[m].job];
                         std::lock_guard<std::mutex> jlk(job->m);
-                        job->err = "seq prepare failed";
+                        if (job->err.empty()) job->err = "seq prepare failed";
                     }
                     continue;
                 }
@@ -268,7 +289,11 @@ void BatchScheduler::worker_loop() {
                         std::string rd_err;
                         for (size_t c = 0; c < job->out_cands[oi_].size(); ++c) {
                             float v = 0.0f;
-                            if (!backend_->read_logits(goi[i], job->out_cands[oi_][c], &v, &rd_err)) v = 0.0f;
+                            if (!backend_->read_logits(goi[i], job->out_cands[oi_][c], &v, &rd_err)) {
+                                if (job->err.empty()) job->err = "read_logits failed at output "
+                                    + std::to_string(oi_) + " candidate " + std::to_string(c) + ": " + rd_err;
+                                break;
+                            }
                             job->logits[oi_][c] = v;
                         }
                     }

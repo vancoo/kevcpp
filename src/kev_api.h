@@ -31,11 +31,12 @@ bool parse_systemone(const nlohmann::json & body, ParsedSystemOne & out, std::st
 
 // to_answers: probs[Q][K] + meta -> 每问答案 dict(见 api.py)。
 nlohmann::json to_answers(const std::vector<std::vector<float>> & probs,
-                          const std::vector<SystemOneMeta> & meta);
+                          const std::vector<SystemOneMeta> & meta,
+                          std::string * err = nullptr);
 
 // 一次 /v1/systemone 服务: 解析->probs->answers->响应 JSON。
 // t_model_ms 由调用方传入(记录模型耗时)。err 非空表示 422。
-nlohmann::json systemone_json(KevModel & model, const nlohmann::json & body,
+nlohmann::json systemone_json(KevModel & model, const nlohmann::ordered_json & body,
                               double * t_model_ms, std::string * err);
 
 // 仅供诊断/测试暴露的 render(flatten JSON 到文本)

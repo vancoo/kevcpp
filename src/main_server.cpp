@@ -80,7 +80,9 @@ int main(int argc, char ** argv) {
     std::string decision_config_file;   // 可选: 决策配置 JSON (模型无关 marker + 温度)
     std::string opt_end_override;       // 可选: 覆盖 option_end marker (--opt-end)
     std::string decide_token_override;  // 可选: 覆盖 decide marker (--decide-token)
-    int port = 8008, threads = 0, ctx = -1; float lora_scale = 1.0f, temperature = 0.0f;
+    int port = 8008, threads = 0, ctx = -1, max_concurrency = 8, prefix_capacity = 4;
+    float lora_scale = 1.0f, temperature = 0.0f;
+    int n_batch = 0, n_ubatch = 0;   // 0 = use backend defaults (512/256)
     bool quiet = false;
     // MoE 专家 offload / GPU 层数控制。--gpu-layers N: offload 到 GPU 的层数(负=全上设备,
     // 0=全 CPU); --moe-mode vram|ram: vram=专家全量进显存(跟随 --gpu-layers), ram=专家强制
@@ -98,6 +100,10 @@ int main(int argc, char ** argv) {
         else if (a == "--lora-scale") lora_scale = (float) std::atof(next().c_str());
         else if (a == "--threads" || a == "-t") threads = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
+        else if (a == "--max-concurrency") max_concurrency = std::atoi(next().c_str());
+        else if (a == "--prefix-capacity") prefix_capacity = std::atoi(next().c_str());
+        else if (a == "--n-batch") n_batch = std::atoi(next().c_str());
+        else if (a == "--n-ubatch") n_ubatch = std::atoi(next().c_str());
         else if (a == "--backend") backend = next();
         else if (a == "--gpu-layers") { gpu_layers = std::atoi(next().c_str()); gpu_layers_set = true; }
         else if (a == "--moe-mode") moe_mode = next();
@@ -116,7 +122,11 @@ int main(int argc, char ** argv) {
               "  --decide-token <token> 覆盖 decide marker (question 收尾; 覆盖 config)\n"
               "  --host ip  --port p listen address/port (default 127.0.0.1:8008)\n"
               "  --threads N / -t N  compute threads (0 or unset = auto detect cores, cap 32)\n"
-              "  --ctx N             context size (default 8192; 2048 typical for short states)\n"
+               "  --ctx N             context size (default 8192; 2048 typical for short states)\n"
+               "  --max-concurrency N concurrent sequence slots (default 8; lower values increase per-sequence context)\n"
+               "  --prefix-capacity N prefix cache slots (default 4)\n"
+              "  --n-batch N         llama n_batch (single llama_decode logical max, default 512)\n"
+              "  --n-ubatch N        llama n_ubatch (actual prefill block, default 256; must be <= n_batch)\n"
               "  --backend <name>    inference backend: 'cpu' (default). 'vulkan'(需对应 dll 构建).\n"
               "  --gpu-layers N      layers offloaded to GPU (neg=all, 0=none; default: neg for gpu backends).\n"
               "  --moe-mode <mode>   MoE expert placement: 'ram' (default, experts stay in host RAM to save\n"
@@ -150,6 +160,9 @@ int main(int argc, char ** argv) {
     kev::KevModelOptions opt;
     opt.model_path = model_path;
     opt.n_ctx = ctx > 0 ? ctx : 8192; opt.n_threads = threads; opt.backend = backend;
+    opt.max_concurrency = max_concurrency > 0 ? max_concurrency : 1;
+    opt.prefix_capacity = prefix_capacity > 0 ? prefix_capacity : 1;
+    opt.n_batch = n_batch; opt.n_ubatch = n_ubatch;
     // MoE 专家 offload / GPU 层数:
     //  - 后端为 CPU 时 n_gpu_layers 恒 0(全 CPU, legacy 行为; MoE offload 无意义)。
     //  - 后端为 GPU/Vulkan 时, 未显式给 --gpu-layers 则默认全层上设备(n_gpu_layers=-1);
@@ -185,6 +198,8 @@ int main(int argc, char ** argv) {
                  model.backend_name(), model.backend_device(), model.backend_version());
         std::fprintf(stderr, "kevcpp using %d threads %s (n_threads_batch=%d)\n",
                  model.threads_actual(), threads == 0 ? "(auto)" : "(set)", model.threads_batch_actual());
+        std::fprintf(stderr, "kevcpp batch config: n_batch=%d n_ubatch=%d\n",
+                 n_batch > 0 ? n_batch : 512, n_ubatch > 0 ? n_ubatch : 256);
     }
 
     // 启动预热建图(P0a): 在监听前做一次最小 dummy decode, 把 llama.cpp 进程一次性的
@@ -229,8 +244,8 @@ int main(int argc, char ** argv) {
         double tw = 0.0, t_parse = 0.0, t_sys = 0.0, t_dump = 0.0, t_http = 0.0;
         if (TR) tw = elapsed_ms();
         std::string err;
-        json body;
-        try { body = json::parse(req.body); }
+        nlohmann::ordered_json body;
+        try { body = nlohmann::ordered_json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content(R"({"detail":"invalid JSON body"})", "application/json");
                       if (!quiet) log_req("POST", "/v1/systemone", 400, elapsed_ms(), 0, 0); return; }
         if (TR) { t_parse = elapsed_ms() - tw; tw = elapsed_ms(); }

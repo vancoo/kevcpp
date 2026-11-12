@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 
 namespace kev {
 
@@ -57,9 +58,15 @@ PrefixMatch PrefixLRU::lookup(const std::vector<int32_t> & ids, int min_lcp) {
 }
 
 void PrefixLRU::register_(const std::vector<int32_t> & ids, int seq) {
-    // 防御: 若 entries_ 已含同 seq(latent 隐患), 原位刷新(设 ids + last_use)并返回, 不产生重复项。
+    // 防御: 若 entries_ 已含同 seq, 原位刷新并返回, 不产生重复项。
+    // 2026-10-30: 这里以前是静默刷新。同 seq 重复登记说明上面的分配逻辑出了问题
+    // (两条逻辑前缀指向同一个 KV 槽), 后者 prefill 会覆盖前者。改为告警, 让问题可见。
     for (auto & e : entries_) {
         if (e.seq == seq) {
+            std::fprintf(stderr,
+                "kev_prefix: WARN duplicate register for seq=%d "
+                "(existing len=%zu, new len=%zu) -- seq slot reuse, KV may be shared\n",
+                seq, e.ids.size(), ids.size());
             e.ids = ids; e.last_use = ++clock_;
             return;
         }

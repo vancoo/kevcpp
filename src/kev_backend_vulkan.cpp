@@ -167,6 +167,13 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     cparams.embeddings        = p->embeddings != 0;
     cparams.lm_head           = p->lm_head != 0;
     cparams.pooling_type      = LLAMA_POOLING_TYPE_NONE;
+    // 注意力类型: 决策模型(state 双向读取)需要 non-causal。d3-turbo 用 prefix_bidir 块掩码,
+    // 这里提供最接近的现成近似(全双向)。KEV_NONCAUSAL=1 时启用(默认 0 = 因果, 行为不变)。
+    {
+        const char * nc = std::getenv("KEV_NONCAUSAL");
+        cparams.attention_type = (nc && nc[0] == '1')
+            ? LLAMA_ATTENTION_TYPE_NON_CAUSAL : LLAMA_ATTENTION_TYPE_CAUSAL;
+    }
     cparams.n_threads         = (int32_t) threads;
     cparams.n_threads_batch   = (int32_t) threads;
     kb->ctx = llama_init_from_model(kb->model, cparams);
@@ -357,8 +364,7 @@ int op_seq_clear(kev_backend_t * b, int32_t seq) {
     KevVulkanBackend * kb = as_vulkan(b);
     if (!kb || !kb->ctx) return 1;
     llama_memory_t mem = llama_get_memory(kb->ctx);
-    llama_memory_seq_rm(mem, seq, 0, -1);
-    return 0;
+    return llama_memory_seq_rm(mem, seq, 0, -1) ? 0 : 1;
 }
 
 int op_seq_copy(kev_backend_t * b, int32_t src, int32_t dst) {

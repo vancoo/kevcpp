@@ -37,6 +37,10 @@ struct KevQuestion {
     // 由 API 层(parse_systemone)填充, 供「生成式 logits 判别」通道用作候选答案 token 来源;
     // 空时 logits 通道会按 options 推导。
     std::vector<std::string> keys;
+    // Optional LLM2Jev user messages, in the same order as keys (or one for bare noul).
+    std::vector<std::string> binary_messages;
+    bool binary_bare_noul = false;
+    bool binary_noul = false;
 };
 
 struct KevRequest {

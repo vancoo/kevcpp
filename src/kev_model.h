@@ -87,6 +87,7 @@ public:
         std::vector<double> rows_ms_per_q;      // [Q] 每问 decode+logits 耗时 ms
         double  t_rows_ms  = 0.0;   // 全部 question decode + logits
         double  t_total_ms  = 0.0;
+        int64_t input_tokens = 0;
     };
     ProbsResult probs(const KevRequest & req, std::string * err = nullptr);
 
@@ -131,6 +132,9 @@ private:
     // 生成式 logits 判别主通道(模型无关, 填空式 prompt + 候选答案 token logits + softmax)。
     // req 的 questions[].keys 提供每问候选答案 key; 见决策配置 enable_logits/prompt_template/aggregation。
     ProbsResult probs_logits(const KevRequest & req, std::string * err);
+
+    // Opt-in Qwen3.5 text-only LLM2Jev binary scorer.
+    ProbsResult probs_binary(const KevRequest & req, std::string * err);
 
     // 解码 token 序列(续接在 start_pos 之后,写入 seq)。经 backend。
     bool decode_seq(const std::vector<int32_t> & tokens, int start_pos, int seq,

@@ -275,6 +275,11 @@ int main(int argc, char ** argv) {
         "<|im_start|>system\n你是严格按给定选项作答的判别器，必须原样输出候选词之一。<|im_end|>\n"
         "<|im_start|>user\n{instructions}\n可选答案只有两个: false, true。\n{state}\n请原样输出其中一个(不要翻译、不要解释):<|im_end|>\n"
         "<|im_start|>assistant\n thinking\n\n</think>\n答案：",
+        // ---- 语言对照(机制诊断): 等形态、仅语言不同 ----
+        // 中文最简收尾(4B+combo 实测 80.0%, 当前最优)
+        "{instructions}\n[ {options} ]\n{state}\n答案：",
+        // 英文等长对照(3 字母 + 冒号, 形态与"答案："同构; 实测 58.8%)
+        "{instructions}\n[ {options} ]\n{state}\nAns:",
     };
     // 含 ChatML 特殊 token 的模板必须 parse_special=true, 否则 <|im_start|> 会被当普通文本。
     auto is_chatml = [](const std::string & t) { return t.find("<|im_start|>") != std::string::npos; };

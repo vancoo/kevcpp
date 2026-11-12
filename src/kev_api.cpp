@@ -131,7 +131,7 @@ bool parse_systemone(const json & body, ParsedSystemOne & out, std::string * err
         }
         if ((int) opts.size() < 1 || (int) opts.size() > MAX_OPTIONS)
             return errf(type + " '" + qid + "' needs 1.." + std::to_string(MAX_OPTIONS) + " options");
-        m.keys = question_keys(type, type == "score" ? q["criteria"] : q["criteria"]);
+        m.keys = question_keys(type, q.contains("criteria") ? q["criteria"] : json::object());
 
         KevQuestion kq; kq.instr = instr; kq.options = opts; kq.keys = m.keys;
         out.rec.questions.push_back(std::move(kq));
@@ -162,6 +162,12 @@ static double score_confidence(const std::vector<double> & p) {
     return std::max(0.0, 1.0 - e / D);
 }
 static double round_prob(double x) {
+    // 2026-11-12 修正(待修清单第1项): 非有限值(NaN/±Inf)不再静默传递。
+    // 之前 NaN 会穿过 copysign/floor/fmod 一路变 NaN，序列化成 JSON 的 null，
+    // 服务仍返回 HTTP 200，下游完全看不出来(实测 JevBench 231 题中 11 例)。
+    // 这里统一钳到 0.0，保证输出始终是合法数值；真正的错误由调用方
+    // to_answers 的 is_finite 检查上报(见下)。
+    if (!std::isfinite(x)) return 0.0;
     double s = std::copysign(1.0, x);
     x = std::fabs(x) * 1e4;
     double f = std::floor(x), diff = x - f;
@@ -171,11 +177,27 @@ static double round_prob(double x) {
 }
 
 json to_answers(const std::vector<std::vector<float>> & probs,
-                const std::vector<SystemOneMeta> & meta) {
+                const std::vector<SystemOneMeta> & meta,
+                std::string * err) {
     json answers = json::object();
     for (size_t q = 0; q < meta.size(); ++q) {
         const auto & M = meta[q];
+        if (q >= probs.size() || probs[q].size() != M.keys.size()) {
+            if (err) *err = "probability vector size mismatch for answer '" + M.id + "': got "
+                          + std::to_string(q < probs.size() ? probs[q].size() : 0)
+                          + ", expected " + std::to_string(M.keys.size());
+            return json(nullptr);
+        }
         std::vector<double> p; for (float x : probs[q]) p.push_back(x);
+        // 2026-11-12 修正(待修清单第1项): 概率向量含非有限值时直接报错返回空，
+        // 而不是把 null 写进 answers 让下游当成正常结果。
+        for (size_t i = 0; i < p.size(); ++i) {
+            if (!std::isfinite(p[i])) {
+                if (err) *err = "non-finite probability in answer '" + M.id + "' at index "
+                              + std::to_string(i) + " (type=" + M.type + ")";
+                return json(nullptr);
+            }
+        }
         if (M.type == "noul") {
             answers[M.id] = {{"type", "noul"}, {"noul", round_prob(p[1])}};
         } else if (M.type == "choice") {
@@ -188,18 +210,90 @@ json to_answers(const std::vector<std::vector<float>> & probs,
             json legend; for (size_t i = 0; i < M.legend.size(); ++i) legend[std::to_string(i)] = M.legend[i];
             json dist; for (size_t i = 0; i < p.size(); ++i) dist[std::to_string(i)] = round_prob(p[i]);
             answers[M.id] = {{"type", "score"}, {"score", round_prob(score)}, {"legend", std::move(legend)},
-                             {"probabilities", std::move(dist)}, {"confidence", round_prob(score_confidence(p))}};
+                             {"probabilities", std::move(dist)}, {"confidence", round_prob(
+                                 std::getenv("KEV_BINARY_SCORING") && std::string(std::getenv("KEV_BINARY_SCORING")) == "1"
+                                     ? choice_confidence(p) : score_confidence(p))}};
         }
     }
     return answers;
 }
 
-json systemone_json(KevModel & model, const json & body, double * t_model_ms, std::string * err) {
+json systemone_json(KevModel & model, const nlohmann::ordered_json & body, double * t_model_ms, std::string * err) {
     const bool TR = env_trace_enabled();
     double w = 0.0, t_parse_c = 0.0, t_enc_c = 0.0, t_probs_c = 0.0, t_ans_c = 0.0, t_ct_c = 0.0;
     if (TR) w = now_us();
     ParsedSystemOne ps;
-    if (!parse_systemone(body, ps, err)) return json(nullptr);
+    if (!parse_systemone(json(body), ps, err)) return json(nullptr);
+    const char * binary_env = std::getenv("KEV_BINARY_SCORING");
+    const bool binary = binary_env && std::string(binary_env) == "1";
+    if (binary) {
+        using ordered_json = nlohmann::ordered_json;
+        auto content = [](const ordered_json & value) {
+            return value.is_string() ? value.get<std::string>() : json(value).dump();
+        };
+        const std::string state = content(body["state"]);
+        const bool include_candidates = body.value("include_choice_candidates", true);
+        for (size_t i = 0; i < ps.meta.size(); ++i) {
+            auto & q = ps.rec.questions[i];
+            auto & m = ps.meta[i];
+            const auto & source = body["questions"][m.id];
+            const std::string objective = source.contains("instructions") && !source["instructions"].is_null()
+                ? content(source["instructions"]) : "Evaluate the candidate.";
+            const std::string base = "Context:\n" + state + "\n\nQuestion:\n" + objective;
+            q.binary_messages.clear();
+            if (m.type == "choice") {
+                std::vector<std::string> candidates;
+                m.keys.clear();
+                for (auto it = source["criteria"].begin(); it != source["criteria"].end(); ++it) {
+                    m.keys.push_back(it.key());
+                    candidates.push_back(it.value().is_null() ? it.key() : it.key() + ": " + content(it.value()));
+                }
+                q.keys = m.keys;
+                std::string comparison;
+                if (include_candidates) {
+                    comparison = "All candidates:\n";
+                    for (const auto & candidate : candidates) comparison += candidate + "\n";
+                }
+                for (const auto & candidate : candidates)
+                    q.binary_messages.push_back(base + "\n" + comparison + "Is this candidate \"" + candidate + "\" the best answer?");
+            } else if (m.type == "score") {
+                std::vector<std::string> levels;
+                std::string scale = "Rating scale, from lower to higher:\n";
+                for (const auto & value : source["criteria"]) levels.push_back(content(value));
+                for (size_t j = 0; j < levels.size(); ++j) {
+                    if (j) scale += "\n";
+                    scale += "- " + levels[j];
+                }
+                for (const auto & level : levels)
+                    q.binary_messages.push_back(base + "\n" + scale + "\nIs rating \"" + level + "\" the most appropriate rating?");
+            } else {
+                q.binary_noul = true;
+                const ordered_json criteria = source.contains("criteria") && source["criteria"].is_object()
+                    ? source["criteria"] : ordered_json::object();
+                if (criteria.empty()) {
+                    q.binary_bare_noul = true;
+                    q.binary_messages.push_back(base);
+                } else {
+                    std::string comparison = "All candidates:\n";
+                    bool first = true;
+                    for (const char * key : {"true", "false"}) {
+                        if (criteria.contains(key) && !criteria[key].is_null()) {
+                            if (!first) comparison += "\n";
+                            comparison += "- " + content(criteria[key]);
+                            first = false;
+                        }
+                    }
+                    // Internal noul order is false, true; L1 normalization is order-independent.
+                    for (const char * key : {"false", "true"}) {
+                        const bool present = criteria.contains(key) && !criteria[key].is_null();
+                        q.binary_messages.push_back(base + (present
+                            ? "\n" + comparison + "\nIs this candidate \"" + content(criteria[key]) + "\" the best answer?"
+                            : std::string("\nCandidate answer: ") + (std::string(key) == "true" ? "yes" : "no")));
+                    }
+                }
+            }
+        }
+    }
     if (TR) { t_parse_c = now_us() - w; w = now_us(); }
 
     // 生成式 logits 判别主通道(主线): 输入 token 数 = 各问中最长填空式 prompt 的 token 数。
@@ -211,7 +305,7 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
     // 取代原先 cryptic 的 {"detail":"could not answer request"}(由 "init_batch: failed to
     // prepare attention ubatches" 触发)。纯预检, 不触碰成功路径的 probs/数值。
     const int n_ctx_seq = model.n_ctx_seq_capacity();
-    if (n_ctx_seq > 0 && input_tokens > n_ctx_seq) {
+    if (!binary && n_ctx_seq > 0 && input_tokens > n_ctx_seq) {
         if (t_model_ms) *t_model_ms = 0.0;
         if (err && err->empty())
             *err = "request too long for context: " + std::to_string(input_tokens)
@@ -235,10 +329,12 @@ json systemone_json(KevModel & model, const json & body, double * t_model_ms, st
         if (err && err->empty() && !enc_err.empty()) *err = enc_err;
         return json(nullptr);
     }
+    if (binary) input_tokens = (int) res.input_tokens;
 
     std::string model_name = body.value("model", std::string("kev-latest"));
     if (TR) w = now_us();
-    auto answers = to_answers(res.probs, ps.meta);
+    auto answers = to_answers(res.probs, ps.meta, err);
+    if (answers.is_null()) return json(nullptr);
     std::string answers_str = answers.dump();
     if (TR) { t_ans_c = now_us() - w; w = now_us(); }
     int output_tokens = model.count_tokens(answers_str);
