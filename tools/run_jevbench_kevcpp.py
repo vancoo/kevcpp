@@ -22,6 +22,89 @@ from jevbench.tasks import Task
 ENDPOINT = os.environ.get("KEV_ENDPOINT", "http://127.0.0.1:18901/v1/systemone")
 TIMEOUT = float(os.environ.get("KEV_TIMEOUT", "3600"))
 
+# Prompt-variant switches used for accuracy experiments. Unset leaves the
+# server default (candidates included, original criteria order).
+INCLUDE_CANDIDATES = os.environ.get("KEV_INCLUDE_CANDIDATES")
+ORDER_ENSEMBLE = os.environ.get("KEV_ORDER_ENSEMBLE") == "1"
+REVERSE_CRITERIA = os.environ.get("KEV_REVERSE_CRITERIA") == "1"
+
+
+def order_criteria(criteria, reverse):
+    """Reverse candidate order while keeping the mapping labels -> text."""
+    if not reverse or criteria is None:
+        return criteria
+    if isinstance(criteria, dict):
+        return {k: criteria[k] for k in reversed(list(criteria))}
+    if isinstance(criteria, list):
+        return list(reversed(criteria))
+    return criteria
+
+
+def build_body(task, reverse=False):
+    question = task.question
+    criteria = order_criteria(question.get("criteria"), reverse)
+    body_question = {
+        "type": question["type"],
+        "instructions": question["instructions"],
+    }
+    if criteria is not None:
+        body_question["criteria"] = criteria
+    body = {"state": task.state, "questions": {"decision": body_question}}
+    if INCLUDE_CANDIDATES is not None:
+        body["include_choice_candidates"] = INCLUDE_CANDIDATES == "1"
+    return body
+
+
+def merge_responses(first, second, task):
+    """Average two answer probability maps keyed by label."""
+    answers = first["answers"]["decision"]
+    other = second["answers"]["decision"]
+    if task.question["type"] == "noul":
+        answers["noul"] = (answers["noul"] + other["noul"]) / 2.0
+        return
+    merged = {}
+    for label, value in answers["probabilities"].items():
+        merged[label] = (value + other["probabilities"][label]) / 2.0
+    total = sum(merged.values())
+    if total > 0:
+        merged = {k: v / total for k, v in merged.items()}
+    answers["probabilities"] = merged
+    if task.question["type"] == "choice":
+        answers["choice"] = max(merged, key=merged.get)
+        labels = list(merged)
+        count = len(labels)
+        answers["confidence"] = (
+            (count * merged[answers["choice"]] - 1) / (count - 1) if count > 1 else 1.0
+        )
+    else:
+        answers["score"] = sum(int(k) * v for k, v in merged.items())
+        count = len(merged)
+        answers["confidence"] = (
+            (count * max(merged.values()) - 1) / (count - 1) if count > 1 else 1.0
+        )
+
+
+def request_task(task):
+    """POST one task, optionally averaging over candidate orders."""
+    body = build_body(task)
+    raw, latency, error, status = post(body)
+    if not ORDER_ENSEMBLE or error or status != 200:
+        return raw, latency, error, status
+    raw2, latency2, error2, status2 = post(build_body(task, reverse=True))
+    if error2 or status2 != 200:
+        return raw, latency, error, status
+    try:
+        merged = parse_json(raw)
+        merge_responses(merged, parse_json(raw2), task)
+        return (
+            json.dumps(merged, ensure_ascii=False).encode("utf-8"),
+            latency + latency2,
+            None,
+            200,
+        )
+    except Exception as exc:
+        return None, latency + latency2, f"{type(exc).__name__}: {exc}", None
+
 
 def post(body):
     req = urllib.request.Request(
@@ -177,24 +260,20 @@ def main():
         raise SystemExit("usage: python run_jevbench_kevcpp.py DATASET.jsonl [...]")
     tasks, digest = load_tasks(paths)
     print(f"tasks={len(tasks)} hash={digest}", flush=True)
+    print(
+        f"variants: include_candidates={INCLUDE_CANDIDATES} "
+        f"order_ensemble={int(ORDER_ENSEMBLE)} reverse_criteria={int(REVERSE_CRITERIA)}",
+        flush=True,
+    )
     results_path = os.environ.get("KEV_RESULTS", "build/jevbench-kevcpp-results.json")
     results = []
     save_results(results_path, summarize(results, len(tasks), digest))
     for index, task in enumerate(tasks, 1):
-        question = task.question
-        body_question = {
-            "type": question["type"],
-            "instructions": question["instructions"],
-        }
-        if question.get("criteria") is not None:
-            body_question["criteria"] = question["criteria"]
-        raw, latency, error, status = post(
-            {"state": task.state, "questions": {"decision": body_question}}
-        )
+        raw, latency, error, status = request_task(task)
         row = {
             "id": task.id,
             "family": task.family,
-            "type": question["type"],
+            "type": task.question["type"],
             "expected": task.expected,
             "scorable": task.expected is not None
             and not task.provenance.get("exclude_reason"),
