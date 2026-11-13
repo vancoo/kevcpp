@@ -41,6 +41,9 @@ struct KevQuestion {
     std::vector<std::string> binary_messages;
     bool binary_bare_noul = false;
     bool binary_noul = false;
+    // KEV_BINARY_LETTER=1: choice 走字母 logit 模式 —— binary_messages 只有 1 条
+    // (Context/Choice/Question + 答字母指令), 打分读 A/B/C… 标签 token 的 logit。
+    bool letter_choice = false;
 };
 
 struct KevRequest {

@@ -232,6 +232,8 @@ json systemone_json(KevModel & model, const nlohmann::ordered_json & body, doubl
             return value.is_string() ? value.get<std::string>() : json(value).dump();
         };
         const std::string state = content(body["state"]);
+        const char * letter_env = std::getenv("KEV_BINARY_LETTER");
+        const bool letter_mode = letter_env && letter_env[0] == '1' && !letter_env[1];
         for (size_t i = 0; i < ps.meta.size(); ++i) {
             auto & q = ps.rec.questions[i];
             auto & m = ps.meta[i];
@@ -259,10 +261,19 @@ json systemone_json(KevModel & model, const nlohmann::ordered_json & body, doubl
                     if (j >= 26) labels[j] += std::to_string(j / 26);
                     choices_block += (j ? "\n" : "") + labels[j] + ": " + candidates[j];
                 }
+                if (letter_mode) {
+                    // 字母 logit 模式(2026-11-14): 每题一条 prompt, 直接读 A/B/C… 标签
+                    // token 的 logit 做候选对比, 需要完整 LM head(勿开 KEV_SELECTED_LM_HEAD)。
+                    q.letter_choice = true;
+                    q.binary_messages.push_back("Context:\n" + state + "\nChoice:\n" + choices_block +
+                                                "\nQuestion:\n" + objective +
+                                                "\nAnswer with the letter of the best choice.");
+                } else {
                 for (size_t j = 0; j < n; ++j)
                     q.binary_messages.push_back("Context:\n" + state + "\nChoice:\n" + choices_block +
                                                 "\nQuestion:\n" + objective +
                                                 "\nIs this candidate \"" + labels[j] + ": " + candidates[j] + "\" best?");
+                }
             } else if (m.type == "score") {
                 std::vector<std::string> levels;
                 std::string scale = "Rating scale, from lower to higher:\n";
