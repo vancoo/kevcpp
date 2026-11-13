@@ -25,8 +25,10 @@
 #include "kev_backend.h"
 
 #include "kev_backend_moe.h"
+#include "kev_chat_data.h"
 
 #include "llama.h"
+#include "../third_party/llama.cpp/src/llama-ext.h"
 
 #include <cstring>
 #include <cstdio>
@@ -40,11 +42,13 @@
 #  define KEVVK_GET_OPS    kev_backend_vulkan_get_ops
 #  define KEVVK_CREATE     kev_backend_vulkan_create
 #  define KEVVK_DESTROY    kev_backend_vulkan_destroy
+#  define KEVVK_CHAT_DATA  kev_backend_vulkan_get_chat_data
 #else
 #  define KEVVK_GET_META   kev_backend_get_meta
 #  define KEVVK_GET_OPS    kev_backend_get_ops
 #  define KEVVK_CREATE     kev_backend_create
 #  define KEVVK_DESTROY    kev_backend_destroy
+#  define KEVVK_CHAT_DATA  kev_backend_get_chat_data
 #endif
 
 namespace {
@@ -57,6 +61,11 @@ struct KevVulkanBackend {
     int32_t               n_embd = 0;
     int32_t               n_seq_max = 0;
     bool                  ok = false;
+    bool                  selected_lm_head = false;
+    bool                  selected_output_all = false;
+    llama_token           selected_tokens[2] = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
+    std::vector<float>    selected_rows[2];
+    std::vector<int8_t>   selected_outputs;
     // MoE expert offload: tensor_buft_overrides 数组须覆盖 model 生命周期。
     std::vector<llama_model_tensor_buft_override> moe_overrides_;
 };
@@ -67,6 +76,24 @@ KevVulkanBackend * as_vulkan(kev_backend_t * b) {
 
 void write_err(char * err, size_t cap, const std::string & msg) {
     if (err && cap) std::snprintf(err, cap, "%s", msg.c_str());
+}
+
+bool selected_output_valid(const KevVulkanBackend * kb, int32_t out_idx) {
+    if (out_idx >= 0) {
+        return (size_t) out_idx < kb->selected_outputs.size() && kb->selected_outputs[(size_t) out_idx] != 0;
+    }
+    int64_t count = 0;
+    for (int8_t output : kb->selected_outputs) count += output != 0;
+    return -(int64_t) out_idx <= count;
+}
+
+void selected_record_outputs(KevVulkanBackend * kb, const llama_batch & batch, int result) {
+    if (!kb->selected_lm_head) return;
+    kb->selected_outputs.clear();
+    if (result == 0) {
+        if (kb->selected_output_all) kb->selected_outputs.assign((size_t) batch.n_tokens, 1);
+        else kb->selected_outputs.assign(batch.logits, batch.logits + batch.n_tokens);
+    }
 }
 
 // llama.cpp/ggml log bridge (mirror of kev_backend_cpu.cpp): host is llama-free,
@@ -102,6 +129,34 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     if (!kb) { write_err(err, err_cap, "null backend"); return 1; }
     if (kb->ctx || kb->model) { write_err(err, err_cap, "backend already initialized"); return 1; }
     if (!p || !p->model_path) { write_err(err, err_cap, "model_path required"); return 1; }
+
+    const char * selected = std::getenv("KEV_SELECTED_LM_HEAD");
+    kb->selected_lm_head = selected && std::strcmp(selected, "1") == 0;
+    if (kb->selected_lm_head) {
+        if (!p->lm_head) {
+            write_err(err, err_cap, "selected LM head requires logits output");
+            return 1;
+        }
+        const char * binary = std::getenv("KEV_BINARY_SCORING");
+        const char * two_pos = std::getenv("KEV_BINARY_TWO_POS");
+        const char * decide = std::getenv("KEV_DECIDE");
+        const char * label = std::getenv("KEV_LBL");
+        if (!binary || std::strcmp(binary, "1") != 0 ||
+            (two_pos && std::strcmp(two_pos, "1") == 0)) {
+            write_err(err, err_cap, "selected LM head requires KEV_BINARY_SCORING=1 and rejects KEV_BINARY_TWO_POS=1");
+            return 1;
+        }
+        if ((decide && (std::strcmp(decide, "hidden") == 0 || std::strcmp(decide, "hidden_state") == 0 ||
+                        std::strcmp(decide, "decide") == 0)) ||
+            (label && (std::strcmp(label, "abcd") == 0 || std::strcmp(label, "yn") == 0))) {
+            write_err(err, err_cap, "selected LM head requires the binary scoring path");
+            return 1;
+        }
+        if (p->lora_path && p->lora_path[0] != '\0' && !p->lora_premerged) {
+            write_err(err, err_cap, "selected LM head does not support dynamic LoRA");
+            return 1;
+        }
+    }
 
     llama_backend_init();
 
@@ -154,6 +209,44 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     kb->vocab = llama_model_get_vocab(kb->model);
     kb->n_embd = llama_model_n_embd(kb->model);
 
+    if (kb->selected_lm_head) {
+        char arch[32] = {};
+        const int32_t arch_len = llama_model_meta_val_str(kb->model, "general.architecture", arch, sizeof(arch));
+        if (arch_len != 6 || std::strcmp(arch, "qwen35") != 0) {
+            write_err(err, err_cap, "selected LM head supports only the qwen35 dense architecture");
+            return 1;
+        }
+        if (!kb->vocab || kb->n_embd <= 0 || llama_model_n_embd_out(kb->model) != kb->n_embd) {
+            write_err(err, err_cap, "selected LM head requires a valid vocabulary and matching embedding dimensions");
+            return 1;
+        }
+        const char * labels[2] = { "no", "yes" };
+        for (int i = 0; i < 2; ++i) {
+            llama_token token = LLAMA_TOKEN_NULL;
+            const int32_t n = llama_tokenize(kb->vocab, labels[i], (int32_t) std::strlen(labels[i]),
+                                             &token, 1, /*add_special=*/false, /*parse_special=*/false);
+            if (n != 1 || token < 0 || token >= llama_vocab_n_tokens(kb->vocab)) {
+                write_err(err, err_cap, "selected LM head requires distinct single-token no/yes labels");
+                return 1;
+            }
+            kb->selected_tokens[i] = token;
+        }
+        std::fprintf(stderr, "[kev] selected LM head enabled: no=%d yes=%d, rows=%d F32 values\n",
+                     kb->selected_tokens[0], kb->selected_tokens[1], kb->n_embd);
+        if (kb->selected_tokens[0] == kb->selected_tokens[1]) {
+            write_err(err, err_cap, "selected LM head requires distinct single-token no/yes labels");
+            return 1;
+        }
+        for (int i = 0; i < 2; ++i) {
+            kb->selected_rows[i].resize((size_t) kb->n_embd);
+            if (llama_model_get_output_row(kb->model, kb->selected_tokens[i],
+                                           kb->selected_rows[i].data(), kb->selected_rows[i].size()) != 0) {
+                write_err(err, err_cap, "selected LM head could not extract output weight row for " + std::string(labels[i]));
+                return 1;
+            }
+        }
+    }
+
     const int n_ctx   = p->n_ctx > 0 ? p->n_ctx : 2048;
     kb->n_seq_max     = p->n_seq_max > 0 ? p->n_seq_max : 4;
     const int threads = p->n_threads > 0 ? p->n_threads : (int) std::thread::hardware_concurrency();
@@ -165,7 +258,8 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     cparams.n_seq_max         = (uint32_t) kb->n_seq_max;
     cparams.n_outputs_max_per_seq = (uint32_t) (p->n_outputs_max_per_seq > 0 ? p->n_outputs_max_per_seq : 128);
     cparams.embeddings        = p->embeddings != 0;
-    cparams.lm_head           = p->lm_head != 0;
+    kb->selected_output_all   = cparams.embeddings;
+    cparams.lm_head           = !kb->selected_lm_head && p->lm_head != 0;
     cparams.pooling_type      = LLAMA_POOLING_TYPE_NONE;
     // 注意力类型: 决策模型(state 双向读取)需要 non-causal。d3-turbo 用 prefix_bidir 块掩码,
     // 这里提供最接近的现成近似(全双向)。KEV_NONCAUSAL=1 时启用(默认 0 = 因果, 行为不变)。
@@ -178,6 +272,7 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     cparams.n_threads_batch   = (int32_t) threads;
     kb->ctx = llama_init_from_model(kb->model, cparams);
     if (!kb->ctx) { write_err(err, err_cap, "failed to init context"); return 1; }
+    if (kb->selected_lm_head) llama_set_embeddings_nextn(kb->ctx, true, true);
 
     // Optional LoRA adapter (only when not already folded into the weights).
     if (p->lora_path && p->lora_path[0] != '\0' && !p->lora_premerged) {
@@ -216,6 +311,7 @@ int op_decode_seq(kev_backend_t * b, const kev_backend_decode_seq * d, char * er
     batch.n_tokens = n;
 
     const int r = llama_decode(kb->ctx, batch);
+    selected_record_outputs(kb, batch, r);
     llama_batch_free(batch);
     if (r != 0) { write_err(err, err_cap, "decode failed ret=" + std::to_string(r)); return 1; }
     return 0;
@@ -254,6 +350,7 @@ int op_decode_batch(kev_backend_t * b, const kev_backend_decode_branch * rows, i
     batch.n_tokens = n;
 
     const int r = llama_decode(kb->ctx, batch);
+    selected_record_outputs(kb, batch, r);
     llama_batch_free(batch);
     if (r != 0) { write_err(err, err_cap, "batch decode failed ret=" + std::to_string(r)); return 1; }
     return 0;
@@ -320,6 +417,7 @@ int op_decode_multi_seq(kev_backend_t * b, const int32_t * tokens,
     batch.n_tokens = (int32_t) total;
 
     const int r = llama_decode(kb->ctx, batch);
+    selected_record_outputs(kb, batch, r);
     if (r != 0) { write_err(err, err_cap, "multi-seq decode failed ret=" + std::to_string(r)); llama_batch_free(batch); return 1; }
 
     // Host reads each requested output via read_logits(out_idx, token, &lt), and
@@ -347,6 +445,20 @@ int op_read_hidden(kev_backend_t * b, int32_t out_idx, float * out, size_t out_c
 int op_read_logits(kev_backend_t * b, int32_t out_idx, int32_t token_id, float * out) {
     KevVulkanBackend * kb = as_vulkan(b);
     if (!kb || !kb->ctx || !out || !kb->vocab) return 1;
+    if (kb->selected_lm_head) {
+        int selected = -1;
+        if (token_id == kb->selected_tokens[0]) selected = 0;
+        else if (token_id == kb->selected_tokens[1]) selected = 1;
+        if (selected < 0 || !selected_output_valid(kb, out_idx)) return 1;
+        const float * hidden = llama_get_embeddings_nextn_ith(kb->ctx, out_idx);
+        if (!hidden) return 1;
+        float logit = 0.0f;
+        for (int32_t i = 0; i < kb->n_embd; ++i) {
+            logit += hidden[i] * kb->selected_rows[selected][(size_t) i];
+        }
+        *out = logit;
+        return 0;
+    }
     float * lt = llama_get_logits_ith(kb->ctx, out_idx);
     if (!lt) return 1;   // position not marked for output / logits disabled
     const int nv = llama_vocab_n_tokens(kb->vocab);
@@ -458,6 +570,12 @@ kev_backend_ops g_ops = {};
 // ---- exported factory ----
 
 extern "C" {
+
+KEV_BACKEND_API int KEVVK_CHAT_DATA(kev_backend_t * b, int kind, char * out,
+                                    size_t cap, size_t * needed, char * err, size_t err_cap) {
+    const auto * kb = as_vulkan(b);
+    return kev_get_chat_data(kb ? kb->model : nullptr, kind, out, cap, needed, err, err_cap);
+}
 
 KEV_BACKEND_API kev_backend_meta KEVVK_GET_META(void) {
     kev_backend_meta m{};

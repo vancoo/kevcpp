@@ -55,6 +55,26 @@ set(GGML_LLAMAFILE OFF CACHE BOOL "ggml: use LLAMAFILE sgemm" FORCE)
 
 add_subdirectory(third_party/llama.cpp)
 
+# Pinned llama.cpp common Jinja runtime. This target deliberately does not
+# link llama/ggml, preserving the plugin host's single-llama rule.
+add_library(kev-jinja STATIC
+    third_party/llama-jinja/jinja/lexer.cpp
+    third_party/llama-jinja/jinja/parser.cpp
+    third_party/llama-jinja/jinja/runtime.cpp
+    third_party/llama-jinja/jinja/string.cpp
+    third_party/llama-jinja/jinja/value.cpp
+    third_party/llama-jinja/json.cpp
+    third_party/llama-jinja/unicode.cpp
+)
+target_include_directories(kev-jinja PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kev_jinja_compat
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-jinja
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+target_compile_features(kev-jinja PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(kev-jinja PRIVATE /utf-8)
+endif()
+
 # ---- NMake + clang/HIP portability (Stage 1): ----
 if (KEV_BUILD_BACKEND_GPU AND TARGET ggml-hip)
     target_compile_options(ggml-hip PRIVATE -UGGML_CUDA_FA_QUANTS)
@@ -88,9 +108,12 @@ add_executable(main_server
     src/kev_prefix.cpp
     src/kev_encode.cpp
     src/kev_backend_factory.cpp
+    src/kev_chat_template.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib/httplib.cpp
 )
 # No target_link_libraries(main_server llama): llama is not linked here.
+target_link_libraries(main_server PRIVATE kev-jinja)
+target_include_directories(main_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-jinja)
 target_compile_definitions(main_server PRIVATE KEV_BACKEND_USE_DLL)
 target_include_directories(main_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
@@ -164,11 +187,64 @@ endif()
 add_executable(b1_multi_seq_probe
     src/b1_multi_seq_probe.cpp
     src/kev_backend_factory.cpp
+    src/kev_chat_template.cpp
     src/kev_backend_cpu.cpp
     src/kev_encode.cpp
 )
-target_link_libraries(b1_multi_seq_probe PRIVATE llama)
+target_link_libraries(b1_multi_seq_probe PRIVATE llama kev-jinja)
+target_include_directories(b1_multi_seq_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-jinja)
 target_compile_features(b1_multi_seq_probe PRIVATE cxx_std_17)
+
+# Standalone metadata extension smoke test. Like main_server, this host does
+# not link llama and loads the CPU plugin dynamically.
+add_executable(kev_chat_data_probe
+    src/kev_chat_data_probe.cpp
+    src/kev_backend_factory.cpp
+    src/kev_chat_template.cpp
+)
+target_link_libraries(kev_chat_data_probe PRIVATE kev-jinja)
+target_include_directories(kev_chat_data_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-jinja)
+target_compile_definitions(kev_chat_data_probe PRIVATE KEV_BACKEND_USE_DLL)
+target_compile_features(kev_chat_data_probe PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(kev_chat_data_probe PRIVATE /utf-8)
+endif()
+
+add_executable(kev_encode_probe src/kev_encode_probe.cpp src/kev_encode.cpp)
+target_compile_features(kev_encode_probe PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(kev_encode_probe PRIVATE /utf-8)
+endif()
+
+# Offline llama-free selected LM-head parity probe; loads the Vulkan plugin.
+add_executable(kev_selected_head_probe
+    src/kev_selected_head_probe.cpp
+    src/kev_backend_factory.cpp
+    src/kev_chat_template.cpp
+    src/kev_encode.cpp
+)
+target_link_libraries(kev_selected_head_probe PRIVATE kev-jinja ${CMAKE_DL_LIBS})
+target_include_directories(kev_selected_head_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-jinja)
+target_compile_definitions(kev_selected_head_probe PRIVATE KEV_BACKEND_USE_DLL)
+target_compile_features(kev_selected_head_probe PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(kev_selected_head_probe PRIVATE /utf-8)
+endif()
+
+# Offline backend prefix-reuse comparison; loads the Vulkan plugin at runtime.
+add_executable(kev_binary_prefix_probe
+    src/kev_binary_prefix_probe.cpp
+    src/kev_backend_factory.cpp
+    src/kev_chat_template.cpp
+    src/kev_encode.cpp
+)
+target_link_libraries(kev_binary_prefix_probe PRIVATE kev-jinja ${CMAKE_DL_LIBS})
+target_include_directories(kev_binary_prefix_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama-jinja)
+target_compile_definitions(kev_binary_prefix_probe PRIVATE KEV_BACKEND_USE_DLL)
+target_compile_features(kev_binary_prefix_probe PRIVATE cxx_std_17)
+if (MSVC)
+    target_compile_options(kev_binary_prefix_probe PRIVATE /utf-8)
+endif()
 # In-process static build (no KEV_BACKEND_USE_DLL): kev_backend_cpu.cpp's exported
 # factory symbols must be __declspec(dllexport) (not dllimport) so they are real
 # definitions in this binary, resolving wrap_loaded() in the factory.

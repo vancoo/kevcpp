@@ -239,6 +239,22 @@ KEV_BACKEND_API kev_backend_ops      kev_backend_get_ops(void);
 KEV_BACKEND_API kev_backend_t *      kev_backend_create(void);
 KEV_BACKEND_API void                 kev_backend_destroy(kev_backend_t * b);
 
+// Optional extension, resolved independently of the by-value ops table. Data
+// belongs to the currently loaded model. A NULL BOS/EOS token yields "".
+// `needed` receives the size including the NUL; a NULL or undersized buffer
+// returns 2, success returns 0, and other errors return 1 with an error message.
+enum kev_backend_chat_data_kind {
+    KEV_BACKEND_CHAT_TEMPLATE = 0,
+    KEV_BACKEND_CHAT_BOS = 1,
+    KEV_BACKEND_CHAT_EOS = 2,
+};
+typedef int (*kev_backend_chat_data_fn)(kev_backend_t * b, int kind,
+                                        char * out, size_t cap, size_t * needed,
+                                        char * err, size_t err_cap);
+KEV_BACKEND_API int kev_backend_get_chat_data(kev_backend_t * b, int kind,
+                                             char * out, size_t cap, size_t * needed,
+                                             char * err, size_t err_cap);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -1,5 +1,6 @@
 // kev_backend_factory.cpp — Backend RAII wrapper + plugin factory.
 #include "kev_backend_factory.h"
+#include "kev_chat_template.h"
 
 #include <cstdio>
 #include <cstring>
@@ -25,6 +26,8 @@ Backend & Backend::operator=(Backend && other) noexcept {
         std::memcpy(&ops_, &other.ops_, sizeof(ops_));
         handle_ = other.handle_;
         meta_   = other.meta_;
+        chat_data_ = other.chat_data_;
+        other.chat_data_ = nullptr;
         std::memset(&other.ops_, 0, sizeof(other.ops_));
         other.handle_ = nullptr;
         std::memset(&other.meta_, 0, sizeof(other.meta_));
@@ -37,6 +40,7 @@ void Backend::close() {
     handle_ = nullptr;
     std::memset(&ops_, 0, sizeof(ops_));
     std::memset(&meta_, 0, sizeof(meta_));
+    chat_data_ = nullptr;
 }
 
 namespace {
@@ -235,11 +239,64 @@ TokenFeeder Backend::token_feeder() const {
     return tf;
 }
 
+bool Backend::chat_template_data(std::string * source, std::string * bos,
+                                 std::string * eos, std::string * err) const {
+    if (err) err->clear();
+    if (!source || !bos || !eos) { set_err(err, "null chat template output"); return false; }
+    if (!handle_ || !chat_data_) {
+        set_err(err, "backend does not support GGUF chat template metadata");
+        return false;
+    }
+    std::string values[3];
+    for (int kind = 0; kind < 3; ++kind) {
+        size_t needed = 0;
+        char ebuf[1024] = {};
+        int rc = chat_data_(handle_, kind, nullptr, 0, &needed, ebuf, sizeof(ebuf));
+        if (rc != 2 || needed == 0 || needed > 16 * 1024 * 1024) {
+            set_err(err, ebuf[0] ? ebuf : "invalid chat metadata size or plugin response");
+            return false;
+        }
+        std::vector<char> buf(needed);
+        size_t actual = 0;
+        rc = chat_data_(handle_, kind, buf.data(), buf.size(), &actual, ebuf, sizeof(ebuf));
+        if (rc != 0 || actual != needed || buf.back() != '\0' ||
+            std::memchr(buf.data(), '\0', buf.size() - 1) != nullptr) {
+            set_err(err, ebuf[0] ? ebuf : "invalid chat metadata plugin response");
+            return false;
+        }
+        values[kind].assign(buf.data(), buf.size() - 1);
+    }
+    *source = std::move(values[0]);
+    *bos = std::move(values[1]);
+    *eos = std::move(values[2]);
+    return true;
+}
+
+bool Backend::render_chat(const std::string & system, const std::string & user,
+                          std::string * output, std::string * err) const {
+    if (output == err && output) return false;
+    if (!output) { set_err(err, "invalid chat output"); return false; }
+    try {
+        if (err) err->clear();
+        std::string source, bos, eos;
+        if (!chat_template_data(&source, &bos, &eos, err)) return false;
+        std::string rendered = render_gguf_chat_template(source, bos, eos, system, user);
+        *output = std::move(rendered);
+        return true;
+    } catch (const std::exception & e) {
+        set_err(err, std::string("GGUF chat template render failed: ") + e.what());
+    } catch (...) {
+        set_err(err, "GGUF chat template render failed: unknown error");
+    }
+    return false;
+}
+
 // Definition of the friend free function declared in kev_backend_factory.h.
 std::unique_ptr<Backend> Backend_wrap(kev_backend_ops ops, kev_backend_meta meta,
-                                      kev_backend_t * handle) {
+                                      kev_backend_t * handle, kev_backend_chat_data_fn chat_data) {
     auto b = std::unique_ptr<Backend>(new Backend());
     b->adopt(ops, meta, handle);
+    b->chat_data_ = chat_data;
     return b;
 }
 
@@ -270,6 +327,7 @@ static std::unique_ptr<Backend> wrap_loaded(
         kev_backend_meta (*meta_fn)(void),
         kev_backend_ops  (*ops_fn)(void),
         kev_backend_t  * (*create_fn)(void),
+        kev_backend_chat_data_fn chat_data,
         std::string * err) {
     if (!meta_fn || !ops_fn || !create_fn) {
         set_err(err, "backend plugin missing required symbols (kev_backend_get_meta/get_ops/create/destroy)");
@@ -292,7 +350,7 @@ static std::unique_ptr<Backend> wrap_loaded(
     }
     kev_backend_t * handle = create_fn();
     if (!handle) { set_err(err, "backend create failed"); return nullptr; }
-    return Backend_wrap(ops, meta, handle);
+    return Backend_wrap(ops, meta, handle, chat_data);
 }
 
 // In-process CPU backend (single-module static build). Links the exported C
@@ -303,7 +361,7 @@ static std::unique_ptr<Backend> wrap_loaded(
 // so these symbols do not exist there.
 #ifndef KEV_BACKEND_USE_DLL
 std::unique_ptr<Backend> load_cpu_inprocess(std::string * err) {
-    return wrap_loaded(&kev_backend_get_meta, &kev_backend_get_ops, &kev_backend_create, err);
+    return wrap_loaded(&kev_backend_get_meta, &kev_backend_get_ops, &kev_backend_create, &kev_backend_get_chat_data, err);
 }
 #endif
 
@@ -317,9 +375,10 @@ extern "C" {
     kev_backend_meta kev_backend_gpu_get_meta(void);
     kev_backend_ops  kev_backend_gpu_get_ops(void);
     kev_backend_t  * kev_backend_gpu_create(void);
+    int kev_backend_gpu_get_chat_data(kev_backend_t *, int, char *, size_t, size_t *, char *, size_t);
 }
 std::unique_ptr<Backend> load_gpu_inprocess(std::string * err) {
-    return wrap_loaded(&kev_backend_gpu_get_meta, &kev_backend_gpu_get_ops, &kev_backend_gpu_create, err);
+    return wrap_loaded(&kev_backend_gpu_get_meta, &kev_backend_gpu_get_ops, &kev_backend_gpu_create, &kev_backend_gpu_get_chat_data, err);
 }
 #endif
 
@@ -347,10 +406,14 @@ static std::unique_ptr<Backend> load_plugin_dll(const std::string & dll_base, st
         unload_plugin(h);
         return nullptr;
     }
+    void * chat_data_f = nullptr;
+    load_symbol(h, "kev_backend_get_chat_data", &chat_data_f);
     auto b = wrap_loaded((kev_backend_meta(*)(void))(meta_f),
                          (kev_backend_ops (*)(void))(ops_f),
                          (kev_backend_t *(*)(void))(create_f),
+                         (kev_backend_chat_data_fn)(chat_data_f),
                          err);
+    if (!b) unload_plugin(h);
     return b;
 }
 #else

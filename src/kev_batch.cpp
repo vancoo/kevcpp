@@ -59,7 +59,7 @@ bool decode_req_chunked(Backend * backend, const Backend::MultiSeqRequest & req,
         return true;
     }
     // Chunk: outputs must be in the last chunk.
-    const int32_t first_out = out_pos.empty() ? 0 : *std::min_element(out_pos.begin(), out_pos.end());
+    const int32_t first_out = out_pos.empty() ? L : *std::min_element(out_pos.begin(), out_pos.end());
     if (L - first_out > n_batch) { err = "batched regex outputs span beyond one chunk"; return false; }
     // Prepare the seq once: clear, and copy the cached prefix when this is a tail
     // continuation (KV must exist at positions [0, Dp) before any tail token at >= Dp).
@@ -78,6 +78,7 @@ bool decode_req_chunked(Backend * backend, const Backend::MultiSeqRequest & req,
         if (!backend->decode_multi_seq(one, &e2, {}, nullptr)) { err = "head chunk decode failed: " + e2; return false; }
         pos = end;
     }
+    if (first_out == L) return true;
     // tail chunk: outputs
     const int32_t tail_start = first_out;
     Backend::MultiSeqRequest seg;

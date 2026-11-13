@@ -232,7 +232,6 @@ json systemone_json(KevModel & model, const nlohmann::ordered_json & body, doubl
             return value.is_string() ? value.get<std::string>() : json(value).dump();
         };
         const std::string state = content(body["state"]);
-        const bool include_candidates = body.value("include_choice_candidates", true);
         for (size_t i = 0; i < ps.meta.size(); ++i) {
             auto & q = ps.rec.questions[i];
             auto & m = ps.meta[i];
@@ -249,13 +248,21 @@ json systemone_json(KevModel & model, const nlohmann::ordered_json & body, doubl
                     candidates.push_back(it.value().is_null() ? it.key() : it.key() + ": " + content(it.value()));
                 }
                 q.keys = m.keys;
-                std::string comparison;
-                if (include_candidates) {
-                    comparison = "All candidates:\n";
-                    for (const auto & candidate : candidates) comparison += candidate + "\n";
+                // Choice 模板(2026-11-13): 所有候选用 A/B/C… 标签列在 Choice 块中,
+                // 每个二元任务问 "Is this candidate \"<label>: <内容>\" best?"。
+                // 候选间仅标签行不同, Context/Choice/Question 为公共前缀, 可被前缀复用。
+                const size_t n = candidates.size();
+                std::vector<std::string> labels(n);
+                std::string choices_block;
+                for (size_t j = 0; j < n; ++j) {
+                    labels[j] = std::string(1, (char) ('A' + (j % 26)));
+                    if (j >= 26) labels[j] += std::to_string(j / 26);
+                    choices_block += (j ? "\n" : "") + labels[j] + ": " + candidates[j];
                 }
-                for (const auto & candidate : candidates)
-                    q.binary_messages.push_back(base + "\n" + comparison + "Is this candidate \"" + candidate + "\" the best answer?");
+                for (size_t j = 0; j < n; ++j)
+                    q.binary_messages.push_back("Context:\n" + state + "\nChoice:\n" + choices_block +
+                                                "\nQuestion:\n" + objective +
+                                                "\nIs this candidate \"" + labels[j] + ": " + candidates[j] + "\" best?");
             } else if (m.type == "score") {
                 std::vector<std::string> levels;
                 std::string scale = "Rating scale, from lower to higher:\n";

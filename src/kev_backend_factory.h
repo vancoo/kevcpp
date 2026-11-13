@@ -116,6 +116,19 @@ public:
     // instead of casting vocab_opaque() to const llama_vocab*.
     TokenFeeder token_feeder() const;
 
+    // Read the loaded model's unmodified default GGUF template and token pieces.
+    // Fails explicitly if the plugin predates the optional extension or the
+    // model has no default template. No template is synthesized.
+    bool chat_template_data(std::string * source, std::string * bos,
+                            std::string * eos, std::string * err = nullptr) const;
+
+    // Render two text messages with this model's default GGUF template.
+    // System is always present, including when empty. No fallback is used.
+    // On failure output is unchanged and err, if supplied, describes the error.
+    // If output and err alias, the call fails without modifying either.
+    bool render_chat(const std::string & system, const std::string & user,
+                     std::string * output, std::string * err = nullptr) const;
+
     const char * name() const { return meta_.name; }
     const char * device() const { return meta_.device; }
     const char * version() const { return meta_.version; }
@@ -126,7 +139,7 @@ public:
     void close();
 
 private:
-    friend std::unique_ptr<Backend> Backend_wrap(kev_backend_ops, kev_backend_meta, kev_backend_t *);
+    friend std::unique_ptr<Backend> Backend_wrap(kev_backend_ops, kev_backend_meta, kev_backend_t *, kev_backend_chat_data_fn);
 
     // factory-internal: adopt a freshly created backend (used by the factory).
     void adopt(kev_backend_ops ops, kev_backend_meta meta, kev_backend_t * handle) {
@@ -139,6 +152,7 @@ private:
     kev_backend_ops ops_{};
     kev_backend_t  * handle_ = nullptr;
     kev_backend_meta meta_{};
+    kev_backend_chat_data_fn chat_data_ = nullptr;
 };
 
 // Loads a backend by name from a plugin dll (LoadLibrary/dlopen) or, in the
@@ -150,6 +164,6 @@ std::unique_ptr<Backend> BackendFactory_load(const std::string & name,
 // Internal: wraps a freshly-created backend + ops table + meta into a Backend.
 // Only BackendFactory_load uses this; declared here so Backend can grant friendship.
 std::unique_ptr<Backend> Backend_wrap(kev_backend_ops ops, kev_backend_meta meta,
-                                      kev_backend_t * handle);
+                                      kev_backend_t * handle, kev_backend_chat_data_fn chat_data = nullptr);
 
 } // namespace kev

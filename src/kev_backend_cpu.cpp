@@ -24,6 +24,7 @@
 #include "kev_backend.h"
 
 #include "kev_backend_moe.h"
+#include "kev_chat_data.h"
 
 #include "llama.h"
 
@@ -431,6 +432,12 @@ kev_backend_ops g_ops = {};
 // ---- exported factory ----
 
 extern "C" {
+
+KEV_BACKEND_API int kev_backend_get_chat_data(kev_backend_t * b, int kind, char * out,
+                                              size_t cap, size_t * needed, char * err, size_t err_cap) {
+    const auto * kb = as_cpu(b);
+    return kev_get_chat_data(kb ? kb->model : nullptr, kind, out, cap, needed, err, err_cap);
+}
 
 KEV_BACKEND_API kev_backend_meta kev_backend_get_meta(void) {
     kev_backend_meta m{};

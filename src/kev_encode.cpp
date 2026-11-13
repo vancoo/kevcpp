@@ -5,6 +5,7 @@
 #include "kev_encode.h"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -13,16 +14,25 @@ namespace kev {
 std::vector<int32_t> tokenize(const TokenFeeder & tf, const std::string & text,
                               bool add_special, bool parse_special) {
     if (!tf.tokenize) return {};
-    // size by a call, then fill: tokenize returns count, or -required on overflow.
-    int32_t cap = (int32_t) text.size() * 4 + 16;
-    for (;;) {
+    // Tokenizer errors also use negative return values; only retry if the
+    // reported required capacity actually exceeds the buffer we supplied.
+    constexpr auto max = std::numeric_limits<int32_t>::max();
+    if (text.size() > static_cast<size_t>((max - 16) / 4)) return {};
+    int32_t cap = static_cast<int32_t>(text.size() * 4 + 16);
+    for (int attempt = 0; attempt < 2; ++attempt) {
         if (cap <= 0) return {};
         std::vector<int32_t> buf((size_t) cap);
         const int32_t n = tf.tokenize(tf.ud, text.c_str(), (int32_t) text.size(),
                                       add_special, parse_special, buf.data(), cap);
-        if (n >= 0) { buf.resize((size_t) n); return buf; }
-        cap = -n;   // exact capacity required by the tokenizer
+        if (n >= 0) {
+            if (n > cap) return {};
+            buf.resize((size_t) n);
+            return buf;
+        }
+        if (n == std::numeric_limits<int32_t>::min() || -n <= cap) return {};
+        cap = -n;
     }
+    return {};
 }
 
 int32_t special_token_id(const TokenFeeder & tf, const char * special) {
