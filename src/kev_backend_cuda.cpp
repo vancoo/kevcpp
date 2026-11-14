@@ -1,0 +1,619 @@
+// kev_backend_cuda.cpp — CUDA (GGML_CUDA) backend plugin implementing the portable C ABI.
+//
+// This module implements the kev_backend C ABI from kev_backend.h over the
+// vendored llama.cpp / ggml built WITH GGML_CUDA (NVIDIA CUDA toolkit + driver).
+// It is a drop-in mirror of kev_backend_vulkan.cpp whose only semantic
+// differences are:
+//   * it offloads all layers to the CUDA device (n_gpu_layers < 0), and
+//   * it reports meta.device = "cuda", meta.name = "cuda".
+//
+// This backend is built on a host with an NVIDIA GPU and the CUDA toolkit
+// (nvcc on PATH); it is NOT compiled by the default CPU / Vulkan build dirs.
+//
+// Single-llama rule: like the CPU backend, this module is a standalone SHARED
+// library that is the ONLY module linking this llama/ggml copy. main_server (the
+// llama-free host, KEV_BACKEND_USE_DLL) loads it via load_plugin_dll() and never
+// links llama itself. The exported factory entry points use the canonical names
+// (KEV_BACKEND_CUDA_SINGLE_LLAMA is left undefined in this isolated build); if a
+// future build co-links it with the CPU backend in one binary, define that macro
+// to prefix them to kev_backend_cuda_*.
+#include "kev_backend.h"
+
+#include "kev_backend_moe.h"
+#include "kev_chat_data.h"
+
+#include "llama.h"
+#include "../third_party/llama.cpp/src/llama-ext.h"
+
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef KEV_BACKEND_CUDA_SINGLE_LLAMA
+#  define KEVCUDA_GET_META   kev_backend_cuda_get_meta
+#  define KEVCUDA_GET_OPS    kev_backend_cuda_get_ops
+#  define KEVCUDA_CREATE     kev_backend_cuda_create
+#  define KEVCUDA_DESTROY    kev_backend_cuda_destroy
+#  define KEVCUDA_CHAT_DATA  kev_backend_cuda_get_chat_data
+#else
+#  define KEVCUDA_GET_META   kev_backend_get_meta
+#  define KEVCUDA_GET_OPS    kev_backend_get_ops
+#  define KEVCUDA_CREATE     kev_backend_create
+#  define KEVCUDA_DESTROY    kev_backend_destroy
+#  define KEVCUDA_CHAT_DATA  kev_backend_get_chat_data
+#endif
+
+namespace {
+
+struct KevCudaBackend {
+    llama_model          * model = nullptr;
+    llama_context        * ctx   = nullptr;
+    llama_adapter_lora   * lora  = nullptr;
+    const llama_vocab    * vocab = nullptr;
+    int32_t               n_embd = 0;
+    int32_t               n_seq_max = 0;
+    bool                  ok = false;
+    bool                  selected_lm_head = false;
+    bool                  selected_output_all = false;
+    llama_token           selected_tokens[2] = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
+    std::vector<float>    selected_rows[2];
+    std::vector<int8_t>   selected_outputs;
+    // MoE expert offload: tensor_buft_overrides 数组须覆盖 model 生命周期。
+    std::vector<llama_model_tensor_buft_override> moe_overrides_;
+};
+
+KevCudaBackend * as_cuda(kev_backend_t * b) {
+    return reinterpret_cast<KevCudaBackend *>(b);
+}
+
+void write_err(char * err, size_t cap, const std::string & msg) {
+    if (err && cap) std::snprintf(err, cap, "%s", msg.c_str());
+}
+
+bool selected_output_valid(const KevCudaBackend * kb, int32_t out_idx) {
+    if (out_idx >= 0) {
+        return (size_t) out_idx < kb->selected_outputs.size() && kb->selected_outputs[(size_t) out_idx] != 0;
+    }
+    int64_t count = 0;
+    for (int8_t output : kb->selected_outputs) count += output != 0;
+    return -(int64_t) out_idx <= count;
+}
+
+void selected_record_outputs(KevCudaBackend * kb, const llama_batch & batch, int result) {
+    if (!kb->selected_lm_head) return;
+    kb->selected_outputs.clear();
+    if (result == 0) {
+        if (kb->selected_output_all) kb->selected_outputs.assign((size_t) batch.n_tokens, 1);
+        else kb->selected_outputs.assign(batch.logits, batch.logits + batch.n_tokens);
+    }
+}
+
+// llama.cpp/ggml log bridge (mirror of kev_backend_cpu.cpp): host is llama-free,
+// so the ERROR-only filter is installed inside this llama-linking module.
+static void kev_cuda_log_filter(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) user_data;
+    if (level >= GGML_LOG_LEVEL_ERROR) {
+        std::fputs(text, stderr);
+    }
+}
+
+// ---- lifecycle ----
+
+int op_create(kev_backend_t ** out) {
+    if (!out) return 1;
+    *out = reinterpret_cast<kev_backend_t *>(new KevCudaBackend());
+    return 0;
+}
+
+void op_destroy(kev_backend_t * b) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb) return;
+    if (kb->lora)  { llama_adapter_lora_free(kb->lora);  kb->lora  = nullptr; }
+    if (kb->ctx)   { llama_free(kb->ctx);                kb->ctx   = nullptr; }
+    if (kb->model) { llama_model_free(kb->model);        kb->model = nullptr; }
+    if (kb->ctx || kb->model) llama_backend_free();
+    kb->vocab = nullptr; kb->ok = false;
+    delete kb;
+}
+
+int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t err_cap) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb) { write_err(err, err_cap, "null backend"); return 1; }
+    if (kb->ctx || kb->model) { write_err(err, err_cap, "backend already initialized"); return 1; }
+    if (!p || !p->model_path) { write_err(err, err_cap, "model_path required"); return 1; }
+
+    const char * selected = std::getenv("KEV_SELECTED_LM_HEAD");
+    kb->selected_lm_head = selected && std::strcmp(selected, "1") == 0;
+    if (kb->selected_lm_head) {
+        if (!p->lm_head) {
+            write_err(err, err_cap, "selected LM head requires logits output");
+            return 1;
+        }
+        const char * binary = std::getenv("KEV_BINARY_SCORING");
+        const char * two_pos = std::getenv("KEV_BINARY_TWO_POS");
+        const char * decide = std::getenv("KEV_DECIDE");
+        const char * label = std::getenv("KEV_LBL");
+        if (!binary || std::strcmp(binary, "1") != 0 ||
+            (two_pos && std::strcmp(two_pos, "1") == 0)) {
+            write_err(err, err_cap, "selected LM head requires KEV_BINARY_SCORING=1 and rejects KEV_BINARY_TWO_POS=1");
+            return 1;
+        }
+        if ((decide && (std::strcmp(decide, "hidden") == 0 || std::strcmp(decide, "hidden_state") == 0 ||
+                        std::strcmp(decide, "decide") == 0)) ||
+            (label && (std::strcmp(label, "abcd") == 0 || std::strcmp(label, "yn") == 0))) {
+            write_err(err, err_cap, "selected LM head requires the binary scoring path");
+            return 1;
+        }
+        if (p->lora_path && p->lora_path[0] != '\0' && !p->lora_premerged) {
+            write_err(err, err_cap, "selected LM head does not support dynamic LoRA");
+            return 1;
+        }
+    }
+
+    llama_backend_init();
+
+    // Host is llama-free; log filter installed here inside the single-llama module.
+    llama_log_set(kev_cuda_log_filter, nullptr);
+
+    // CUDA backend: offload 层数由参数决定(默认 -1 = all layers to GPU, 与 legacy 一致)。
+    // Under a GGML_CUDA build, n_gpu_layers < 0 steers the whole model onto the
+    // CUDA device (ggml-cuda selected by ggml_backend_load_all / GPU mask).
+    llama_model_params mparams = llama_model_default_params();
+    int ng = p->n_gpu_layers;
+    if (ng == 0 && p->moe_offload) ng = -1;   // 显式要求省显存但未给层数时, 默认除专家外全上设备
+    mparams.n_gpu_layers = ng;
+    // MoE 专家 offload(实验性): 用 tensor_buft_overrides 把专家张量留 host RAM 以省显存。
+    //
+    // 保守默认: Vulkan 后端在 UMA 设备上实测该 override 会原生崩溃(见 kev_backend_vulkan.cpp),
+    // CUDA 后端沿用同一门槛 —— 默认不启用, 专家留在设备; 若显式用 KEV_GPU_MOE_OVERRIDE=1
+    // 强制放开, 则真正对专家设置 tensor_buft_overrides。离散 NVIDIA GPU 上该机制与 llama.cpp
+    // 官方 --n-cpu-moe 相同, 可在目标机器验证后再考虑放开默认。
+    if (p->moe_offload && ng != 0 && kev_backend_moe::model_has_expert_tensors(p->model_path)) {
+        const bool force_override = std::getenv("KEV_GPU_MOE_OVERRIDE") != nullptr;
+        if (!force_override) {
+            std::fprintf(stderr,
+                "[kev] WARN: --moe-mode ram (MoE experts to host RAM) is not applied by default on the CUDA "
+                "backend (conservative default inherited from the UMA Vulkan crash; see kev_backend_vulkan.cpp). "
+                "Experts stay on-device. Set KEV_GPU_MOE_OVERRIDE=1 to force-enable for validation. "
+                "Or use the cpu backend (--backend cpu) for host-RAM expert offload.\n");
+        } else {
+            kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng, p->model_path);
+            if (!kb->moe_overrides_.empty()) {
+                mparams.tensor_buft_overrides = kb->moe_overrides_.data();
+                std::fprintf(stderr,
+                    "[kev] --moe-mode ram FORCE-ENABLED (KEV_GPU_MOE_OVERRIDE=1): MoE experts routed "
+                    "to host RAM via tensor_buft_overrides.\n");
+            }
+        }
+    } else {
+        kb->moe_overrides_ = kev_backend_moe::build_moe_overrides(p->moe_offload, ng, p->model_path);
+        if (!kb->moe_overrides_.empty()) {
+            mparams.tensor_buft_overrides = kb->moe_overrides_.data();
+        }
+    }
+    kb->model = llama_model_load_from_file(p->model_path, mparams);
+    if (!kb->model) { write_err(err, err_cap, "failed to load model: " + std::string(p->model_path)); return 1; }
+    kb->vocab = llama_model_get_vocab(kb->model);
+    kb->n_embd = llama_model_n_embd(kb->model);
+
+    if (kb->selected_lm_head) {
+        char arch[32] = {};
+        const int32_t arch_len = llama_model_meta_val_str(kb->model, "general.architecture", arch, sizeof(arch));
+        if (arch_len != 6 || std::strcmp(arch, "qwen35") != 0) {
+            write_err(err, err_cap, "selected LM head supports only the qwen35 dense architecture");
+            return 1;
+        }
+        if (!kb->vocab || kb->n_embd <= 0 || llama_model_n_embd_out(kb->model) != kb->n_embd) {
+            write_err(err, err_cap, "selected LM head requires a valid vocabulary and matching embedding dimensions");
+            return 1;
+        }
+        const char * labels[2] = { "no", "yes" };
+        for (int i = 0; i < 2; ++i) {
+            llama_token token = LLAMA_TOKEN_NULL;
+            const int32_t n = llama_tokenize(kb->vocab, labels[i], (int32_t) std::strlen(labels[i]),
+                                             &token, 1, /*add_special=*/false, /*parse_special=*/false);
+            if (n != 1 || token < 0 || token >= llama_vocab_n_tokens(kb->vocab)) {
+                write_err(err, err_cap, "selected LM head requires distinct single-token no/yes labels");
+                return 1;
+            }
+            kb->selected_tokens[i] = token;
+        }
+        std::fprintf(stderr, "[kev] selected LM head enabled: no=%d yes=%d, rows=%d F32 values\n",
+                     kb->selected_tokens[0], kb->selected_tokens[1], kb->n_embd);
+        if (kb->selected_tokens[0] == kb->selected_tokens[1]) {
+            write_err(err, err_cap, "selected LM head requires distinct single-token no/yes labels");
+            return 1;
+        }
+        for (int i = 0; i < 2; ++i) {
+            kb->selected_rows[i].resize((size_t) kb->n_embd);
+            if (llama_model_get_output_row(kb->model, kb->selected_tokens[i],
+                                           kb->selected_rows[i].data(), kb->selected_rows[i].size()) != 0) {
+                write_err(err, err_cap, "selected LM head could not extract output weight row for " + std::string(labels[i]));
+                return 1;
+            }
+        }
+    }
+
+    const int n_ctx   = p->n_ctx > 0 ? p->n_ctx : 2048;
+    kb->n_seq_max     = p->n_seq_max > 0 ? p->n_seq_max : 4;
+    const int threads = p->n_threads > 0 ? p->n_threads : (int) std::thread::hardware_concurrency();
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx             = (uint32_t) n_ctx;
+    cparams.n_batch           = (uint32_t) (p->n_batch > 0 ? p->n_batch : 512);
+    cparams.n_ubatch          = (uint32_t) (p->n_ubatch > 0 ? p->n_ubatch : 256);
+    cparams.n_seq_max         = (uint32_t) kb->n_seq_max;
+    cparams.n_outputs_max_per_seq = (uint32_t) (p->n_outputs_max_per_seq > 0 ? p->n_outputs_max_per_seq : 128);
+    cparams.embeddings        = p->embeddings != 0;
+    kb->selected_output_all   = cparams.embeddings;
+    cparams.lm_head           = !kb->selected_lm_head && p->lm_head != 0;
+    cparams.pooling_type      = LLAMA_POOLING_TYPE_NONE;
+    // 注意力类型: 决策模型(state 双向读取)需要 non-causal。d3-turbo 用 prefix_bidir 块掩码,
+    // 这里提供最接近的现成近似(全双向)。KEV_NONCAUSAL=1 时启用(默认 0 = 因果, 行为不变)。
+    {
+        const char * nc = std::getenv("KEV_NONCAUSAL");
+        cparams.attention_type = (nc && nc[0] == '1')
+            ? LLAMA_ATTENTION_TYPE_NON_CAUSAL : LLAMA_ATTENTION_TYPE_CAUSAL;
+    }
+    cparams.n_threads         = (int32_t) threads;
+    cparams.n_threads_batch   = (int32_t) threads;
+    kb->ctx = llama_init_from_model(kb->model, cparams);
+    if (!kb->ctx) { write_err(err, err_cap, "failed to init context"); return 1; }
+    if (kb->selected_lm_head) llama_set_embeddings_nextn(kb->ctx, true, true);
+
+    // Optional LoRA adapter (only when not already folded into the weights).
+    if (p->lora_path && p->lora_path[0] != '\0' && !p->lora_premerged) {
+        kb->lora = llama_adapter_lora_init(kb->model, p->lora_path);
+        if (!kb->lora) { write_err(err, err_cap, "failed to load lora adapter: " + std::string(p->lora_path)); return 1; }
+        float scale = p->lora_scale;
+        if (llama_set_adapters_lora(kb->ctx, &kb->lora, 1, &scale) != 0) {
+            write_err(err, err_cap, "failed to set lora adapters"); return 1;
+        }
+    }
+
+    kb->ok = true;
+    return 0;
+}
+
+// ---- decode ----  (identical graphs to CPU; the difference is the offloaded weights)
+
+int op_decode_seq(kev_backend_t * b, const kev_backend_decode_seq * d, char * err, size_t err_cap) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->ctx) { write_err(err, err_cap, "backend not initialized"); return 1; }
+    if (!d || d->n_tokens <= 0) { write_err(err, err_cap, "empty sequence to decode"); return 1; }
+    const int32_t n = d->n_tokens;
+
+    llama_batch batch = llama_batch_init(n, /*embd=*/0, kb->n_seq_max);
+    for (int32_t i = 0; i < n; ++i) {
+        batch.token[i]     = (llama_token) d->tokens[i];
+        batch.pos[i]       = (llama_pos)(d->start_pos + i);
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = d->seq;
+        batch.logits[i]    = 0;
+    }
+    for (int32_t k = 0; k < d->n_logits_pos; ++k) {
+        const int32_t pos = d->logits_pos[k];
+        if (pos >= 0 && pos < n) batch.logits[pos] = 1;
+    }
+    batch.n_tokens = n;
+
+    const int r = llama_decode(kb->ctx, batch);
+    selected_record_outputs(kb, batch, r);
+    llama_batch_free(batch);
+    if (r != 0) { write_err(err, err_cap, "decode failed ret=" + std::to_string(r)); return 1; }
+    return 0;
+}
+
+int op_decode_batch(kev_backend_t * b, const kev_backend_decode_branch * rows, int32_t n_rows,
+                    char * err, size_t err_cap) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->ctx) { write_err(err, err_cap, "backend not initialized"); return 1; }
+    if (!rows || n_rows <= 0) { write_err(err, err_cap, "empty batch"); return 1; }
+    const int32_t L = rows[0].n_ids;
+    if (L <= 0) { write_err(err, err_cap, "empty branch in batch"); return 1; }
+    for (int32_t s = 0; s < n_rows; ++s) {
+        if (rows[s].n_ids != L) { write_err(err, err_cap, "batch requires equal branch lengths"); return 1; }
+    }
+
+    const int32_t n = L * n_rows;
+    llama_batch batch = llama_batch_init(n, /*embd=*/0, kb->n_seq_max);
+    for (int32_t s = 0; s < n_rows; ++s) {
+        const kev_backend_decode_branch & br = rows[s];
+        const int32_t base = s * L;
+        for (int32_t t = 0; t < L; ++t) {
+            const int32_t i = base + t;
+            batch.token[i]     = (llama_token) br.ids[t];
+            batch.pos[i]       = (llama_pos)(br.start_pos + t);
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = br.seq;
+            batch.logits[i]    = 0;
+        }
+        for (int32_t k = 0; k < br.n_opts; ++k) {
+            const int32_t o = br.opts[k];
+            if (o >= 0 && o < L) batch.logits[base + o] = 1;
+        }
+        if (br.decide >= 0 && br.decide < L) batch.logits[base + br.decide] = 1;
+    }
+    batch.n_tokens = n;
+
+    const int r = llama_decode(kb->ctx, batch);
+    selected_record_outputs(kb, batch, r);
+    llama_batch_free(batch);
+    if (r != 0) { write_err(err, err_cap, "batch decode failed ret=" + std::to_string(r)); return 1; }
+    return 0;
+}
+
+// B1: decode multiple independent sequences (each its own KV slot) in ONE
+// llama_decode. Identical in intent to the CPU backend's op_decode_multi_seq —
+// under a GGML_CUDA build the SAME llama_decode serves a multi-seq batch on the
+// CUDA device, amortizing graph/prefill across the batch. seq-major token
+// layout; each seq's positions count relative to its own start_pos (independent
+// M-RoPE). For every requested output (out_seq[i], out_pos[i]) we mark
+// llama_batch.logits[row]=1 and fill out_idx[i] with the batch row of that output,
+// which read_logits() passes straight to llama_get_logits_ith().
+int op_decode_multi_seq(kev_backend_t * b, const int32_t * tokens,
+                        const int32_t * n_tokens, const int32_t * start_pos,
+                        const int32_t * seq, int32_t n_seq,
+                        const int32_t * out_seq, const int32_t * out_pos, int32_t n_out,
+                        int32_t * out_idx, int32_t out_idx_cap,
+                        char * err, size_t err_cap) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->ctx) { write_err(err, err_cap, "backend not initialized"); return 1; }
+    if (n_seq <= 0 || !tokens || !n_tokens || !start_pos || !seq) { write_err(err, err_cap, "invalid multi-seq request"); return 1; }
+    if (n_out > 0 && (!out_seq || !out_pos)) { write_err(err, err_cap, "invalid output request"); return 1; }
+    if (out_idx_cap < n_out) { write_err(err, err_cap, "out_idx buffer too small"); return 1; }
+
+    // Validate seq ids are distinct and within n_seq_max.
+    std::vector<int32_t> seen(kb->n_seq_max, 0);
+    for (int32_t s = 0; s < n_seq; ++s) {
+        if (seq[s] < 0 || seq[s] >= kb->n_seq_max) { write_err(err, err_cap, "seq id out of range"); return 1; }
+        if (seen[seq[s]]) { write_err(err, err_cap, "duplicate seq id in multi-seq batch"); return 1; }
+        seen[seq[s]] = 1;
+    }
+
+    // Total tokens; must not exceed n_batch (llama asserts n_tokens_all <= n_batch).
+    int64_t total = 0;
+    std::vector<int32_t> base(n_seq);
+    for (int32_t s = 0; s < n_seq; ++s) {
+        base[s] = (int32_t) total;
+        if (n_tokens[s] <= 0) { write_err(err, err_cap, "empty sequence in multi-seq batch"); return 1; }
+        total += n_tokens[s];
+    }
+    const int32_t nb = (int32_t) llama_n_batch(kb->ctx);
+    if (total > nb) { write_err(err, err_cap, "multi-seq batch too large: " + std::to_string(total) + " > n_batch " + std::to_string(nb)); return 1; }
+
+    llama_batch batch = llama_batch_init((int32_t) total, /*embd=*/0, kb->n_seq_max);
+    for (int32_t s = 0; s < n_seq; ++s) {
+        const int32_t n = n_tokens[s];
+        for (int32_t t = 0; t < n; ++t) {
+            const int32_t row = base[s] + t;
+            batch.token[row]     = (llama_token) tokens[row];
+            batch.pos[row]       = (llama_pos)(start_pos[s] + t);
+            batch.n_seq_id[row]  = 1;
+            batch.seq_id[row][0] = (llama_seq_id) seq[s];
+            batch.logits[row]    = 0;
+        }
+    }
+    for (int32_t i = 0; i < n_out; ++i) {
+        const int32_t s = out_seq[i];
+        const int32_t p = out_pos[i];
+        if (s < 0 || s >= n_seq || p < 0 || p >= n_tokens[s]) { write_err(err, err_cap, "output position out of range"); llama_batch_free(batch); return 1; }
+        const int32_t row = base[s] + p;
+        batch.logits[row] = 1;
+    }
+    batch.n_tokens = (int32_t) total;
+
+    const int r = llama_decode(kb->ctx, batch);
+    selected_record_outputs(kb, batch, r);
+    if (r != 0) { write_err(err, err_cap, "multi-seq decode failed ret=" + std::to_string(r)); llama_batch_free(batch); return 1; }
+
+    // Host reads each requested output via read_logits(out_idx, token, &lt), and
+    // llama_get_logits_ith treats its arg as a BATCH ROW -> contiguous logits row via
+    // ctx->output_ids[row]. Hand back the batch row base[s]+pos for each output.
+    for (int32_t i = 0; i < n_out; ++i) {
+        const int32_t s = out_seq[i];
+        out_idx[i] = base[s] + out_pos[i];
+    }
+    llama_batch_free(batch);
+    return 0;
+}
+
+int op_read_hidden(kev_backend_t * b, int32_t out_idx, float * out, size_t out_cap,
+                   char * err, size_t err_cap) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->ctx) { write_err(err, err_cap, "backend not initialized"); return 1; }
+    float * p = llama_get_embeddings_ith(kb->ctx, out_idx);
+    if (!p) { write_err(err, err_cap, "no embedding at output idx " + std::to_string(out_idx)); return 1; }
+    if (out_cap < (size_t) kb->n_embd) { write_err(err, err_cap, "output buffer too small"); return 1; }
+    std::memcpy(out, p, (size_t) kb->n_embd * sizeof(float));
+    return 0;
+}
+
+int op_read_logits(kev_backend_t * b, int32_t out_idx, int32_t token_id, float * out) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->ctx || !out || !kb->vocab) return 1;
+    if (kb->selected_lm_head) {
+        int selected = -1;
+        if (token_id == kb->selected_tokens[0]) selected = 0;
+        else if (token_id == kb->selected_tokens[1]) selected = 1;
+        if (selected < 0 || !selected_output_valid(kb, out_idx)) return 1;
+        const float * hidden = llama_get_embeddings_nextn_ith(kb->ctx, out_idx);
+        if (!hidden) return 1;
+        float logit = 0.0f;
+        for (int32_t i = 0; i < kb->n_embd; ++i) {
+            logit += hidden[i] * kb->selected_rows[selected][(size_t) i];
+        }
+        *out = logit;
+        return 0;
+    }
+    float * lt = llama_get_logits_ith(kb->ctx, out_idx);
+    if (!lt) return 1;   // position not marked for output / logits disabled
+    const int nv = llama_vocab_n_tokens(kb->vocab);
+    if (token_id < 0 || token_id >= nv) return 1;
+    *out = lt[token_id];
+    return 0;
+}
+
+int32_t op_vocab_n_tokens(kev_backend_t * b) {
+    KevCudaBackend * kb = as_cuda(b);
+    return (kb && kb->vocab) ? (int32_t) llama_vocab_n_tokens(kb->vocab) : 0;
+}
+
+int op_seq_clear(kev_backend_t * b, int32_t seq) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->ctx) return 1;
+    llama_memory_t mem = llama_get_memory(kb->ctx);
+    return llama_memory_seq_rm(mem, seq, 0, -1) ? 0 : 1;
+}
+
+int op_seq_copy(kev_backend_t * b, int32_t src, int32_t dst) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->ctx) return 1;
+    llama_memory_t mem = llama_get_memory(kb->ctx);
+    llama_memory_seq_cp(mem, src, dst, 0, -1);
+    return 0;
+}
+
+// ---- sizing ----
+
+int32_t op_n_ctx_seq_capacity(kev_backend_t * b) {
+    KevCudaBackend * kb = as_cuda(b);
+    return (kb && kb->ctx) ? (int32_t) llama_n_ctx_seq(kb->ctx) : 0;
+}
+
+int32_t op_n_batch(kev_backend_t * b) {
+    KevCudaBackend * kb = as_cuda(b);
+    return (kb && kb->ctx) ? (int32_t) llama_n_batch(kb->ctx) : 0;
+}
+
+int32_t op_count_tokens(kev_backend_t * b, const char * text) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->vocab || !text) return 0;
+    std::vector<llama_token> tokens(4096);
+    const int32_t n = llama_tokenize(kb->vocab, text, (int32_t) std::strlen(text),
+                                     tokens.data(), (int32_t) tokens.size(),
+                                     /*add_special=*/false, /*parse_special=*/false);
+    return n < 0 ? 0 : n;
+}
+
+int32_t op_model_n_embd(kev_backend_t * b) {
+    KevCudaBackend * kb = as_cuda(b);
+    return kb ? kb->n_embd : 0;
+}
+
+int32_t op_threads(kev_backend_t * b) {
+    KevCudaBackend * kb = as_cuda(b);
+    return (kb && kb->ctx) ? llama_n_threads(kb->ctx) : 0;
+}
+
+int32_t op_threads_batch(kev_backend_t * b) {
+    KevCudaBackend * kb = as_cuda(b);
+    return (kb && kb->ctx) ? llama_n_threads_batch(kb->ctx) : 0;
+}
+
+kev_backend_vocab_t * op_vocab_opaque(kev_backend_t * b) {
+    KevCudaBackend * kb = as_cuda(b);
+    return kb ? reinterpret_cast<kev_backend_vocab_t *>(const_cast<llama_vocab *>(kb->vocab)) : nullptr;
+}
+
+// ---- delegated tokenizer (B-1/B-2, mirror of cpu/gpu) ----
+int32_t op_tokenize(kev_backend_t * b, const char * text, int32_t text_len,
+                    bool add_special, bool parse_special,
+                    int32_t * out_ids, int32_t cap, char * err, size_t err_cap) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->vocab || !text) { write_err(err, err_cap, "tokenize: no vocab"); return -1; }
+    if (text_len < 0) text_len = (int32_t) std::strlen(text);
+    if (!out_ids || cap <= 0) return -1;
+    std::vector<llama_token> buf((size_t) cap);
+    const int32_t n = llama_tokenize(kb->vocab, text, text_len,
+                                     buf.data(), (int32_t) buf.size(),
+                                     add_special, parse_special);
+    if (n < 0) return n;
+    for (int32_t i = 0; i < n; ++i) out_ids[i] = (int32_t) buf[i];
+    return n;
+}
+
+int32_t op_special_token_id(kev_backend_t * b, const char * special) {
+    KevCudaBackend * kb = as_cuda(b);
+    if (!kb || !kb->vocab || !special) return -1;
+    const int len = (int) std::strlen(special);
+    std::vector<llama_token> buf((size_t) len * 4 + 16);
+    int32_t n = llama_tokenize(kb->vocab, special, len,
+                               buf.data(), (int32_t) buf.size(),
+                               /*add_special=*/false, /*parse_special=*/true);
+    if (n < 0) {
+        buf.resize((size_t) -n);
+        n = llama_tokenize(kb->vocab, special, len, buf.data(), (int32_t) buf.size(),
+                           /*add_special=*/false, /*parse_special=*/true);
+    }
+    if (n <= 0) return -1;
+    return (int32_t) buf[n - 1];
+}
+
+kev_backend_ops g_ops = {};
+
+} // namespace
+
+// ---- exported factory ----
+
+extern "C" {
+
+KEV_BACKEND_API int KEVCUDA_CHAT_DATA(kev_backend_t * b, int kind, char * out,
+                                    size_t cap, size_t * needed, char * err, size_t err_cap) {
+    const auto * kb = as_cuda(b);
+    return kev_get_chat_data(kb ? kb->model : nullptr, kind, out, cap, needed, err, err_cap);
+}
+
+KEV_BACKEND_API kev_backend_meta KEVCUDA_GET_META(void) {
+    kev_backend_meta m{};
+    m.abi_version  = KEV_BACKEND_ABI_VERSION;
+    m.name         = "cuda";
+    m.device       = "cuda";
+    m.version      = "kev-backend-cuda-0.1-static-ggml-cuda";
+    m.capabilities = KEV_BACKEND_CAP_BATCH_DECODE | KEV_BACKEND_CAP_SEQ_MEMORY | KEV_BACKEND_CAP_HIDDEN_READ
+                     | KEV_BACKEND_CAP_LOGITS_READ;
+    m.struct_size  = sizeof(kev_backend_meta);
+    return m;
+}
+
+KEV_BACKEND_API kev_backend_ops KEVCUDA_GET_OPS(void) {
+    if (g_ops.struct_size == 0) {
+        g_ops.struct_size     = sizeof(kev_backend_ops);
+        g_ops.create          = op_create;
+        g_ops.destroy         = op_destroy;
+        g_ops.init            = op_init;
+        g_ops.decode_seq      = op_decode_seq;
+        g_ops.decode_batch    = op_decode_batch;
+        g_ops.read_hidden     = op_read_hidden;
+        g_ops.seq_clear       = op_seq_clear;
+        g_ops.seq_copy        = op_seq_copy;
+        g_ops.n_ctx_seq_capacity = op_n_ctx_seq_capacity;
+        g_ops.count_tokens    = op_count_tokens;
+        g_ops.model_n_embd    = op_model_n_embd;
+        g_ops.threads         = op_threads;
+        g_ops.threads_batch   = op_threads_batch;
+        g_ops.vocab_opaque    = op_vocab_opaque;
+        g_ops.tokenize        = op_tokenize;
+        g_ops.special_token_id = op_special_token_id;
+        g_ops.read_logits     = op_read_logits;
+        g_ops.vocab_n_tokens  = op_vocab_n_tokens;
+        g_ops.n_batch         = op_n_batch;
+        g_ops.decode_multi_seq = op_decode_multi_seq;
+    }
+    return g_ops;
+}
+
+KEV_BACKEND_API kev_backend_t * KEVCUDA_CREATE(void) {
+    kev_backend_t * out = nullptr;
+    (void) op_create(&out);
+    return out;
+}
+
+KEV_BACKEND_API void KEVCUDA_DESTROY(kev_backend_t * b) {
+    op_destroy(b);
+}
+
+} // extern "C"

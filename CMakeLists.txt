@@ -37,6 +37,16 @@ if (KEV_BUILD_BACKEND_VULKAN)
     set(GGML_VULKAN ON CACHE BOOL "ggml: use Vulkan" FORCE)
 endif()
 
+# CUDA backend dll (kev-backend-cuda.dll). Same pattern as Vulkan: the SAME root
+# CMakeLists but a SEPARATE build directory (e.g. build\cuda-exp\cuda-build) on a
+# host with an NVIDIA GPU + CUDA toolkit (nvcc on PATH, MSVC host compiler).
+# Enabling this option flips the vendored llama/ggml to build WITH GGML_CUDA.
+# The gate MUST stay OFF in the default CPU / Vulkan build dirs.
+option(KEV_BUILD_BACKEND_CUDA "Build the standalone kev-backend-cuda dll with a GGML_CUDA llama" OFF)
+if (KEV_BUILD_BACKEND_CUDA)
+    set(GGML_CUDA ON CACHE BOOL "ggml: use CUDA backend" FORCE)
+endif()
+
 #
 # llama.cpp is vendored as a full copy under third_party/llama.cpp.
 # Using add_subdirectory() makes LLAMA_STANDALONE=OFF inside, so the copy's
@@ -297,5 +307,27 @@ if (KEV_BUILD_BACKEND_VULKAN)
     endif()
     set_target_properties(kev-backend-vulkan PROPERTIES
         OUTPUT_NAME "kev-backend-vulkan"
+        PREFIX "")
+endif()
+
+# CUDA backend dll: statically links the SAME llama copy built WITH GGML_CUDA.
+# ONLY compiled when KEV_BUILD_BACKEND_CUDA=ON (a dedicated GGML_CUDA build dir on
+# an NVIDIA host with the CUDA toolkit). This is the sole module containing the
+# CUDA backend (ggml-cuda, compiled by nvcc + MSVC host). Default build dir stays
+# clean (option OFF).
+if (KEV_BUILD_BACKEND_CUDA)
+    add_library(kev-backend-cuda SHARED
+        src/kev_backend_cuda.cpp
+    )
+    target_link_libraries(kev-backend-cuda PRIVATE llama ggml-cuda)
+    target_compile_definitions(kev-backend-cuda PRIVATE KEV_BACKEND_BUILD KEV_BACKEND_BUILD_SHARED)
+    target_include_directories(kev-backend-cuda PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor)
+    target_compile_features(kev-backend-cuda PRIVATE cxx_std_17)
+    if (MSVC)
+        target_compile_options(kev-backend-cuda PRIVATE /utf-8)
+    endif()
+    set_target_properties(kev-backend-cuda PROPERTIES
+        OUTPUT_NAME "kev-backend-cuda"
         PREFIX "")
 endif()

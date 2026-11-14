@@ -452,7 +452,20 @@ std::unique_ptr<Backend> BackendFactory_load(const std::string & name, std::stri
         return nullptr;
 #endif
     }
-    if (name == "gpu" || name == "cuda" || name == "cuda0" || name == "llamacpp-gpu") {
+    if (name == "cuda" || name == "cuda0") {
+#ifdef KEV_BACKEND_USE_DLL
+        // CUDA uses its OWN dll (kev-backend-cuda.dll, GGML_CUDA build), built on
+        // an NVIDIA host; distinct from the HIP gpu dll and the Vulkan dll.
+        return load_plugin_dll("kev-backend-cuda", err);
+#else
+        set_err(err,
+            "backend 'cuda' requires a plugin-dll host build (KEV_BACKEND_USE_DLL) and a "
+            "kev-backend-cuda.dll built with KEV_BUILD_BACKEND_CUDA=ON on an NVIDIA host "
+            "(CUDA toolkit + nvcc). Use --backend cpu or --backend vulkan on this host.");
+        return nullptr;
+#endif
+    }
+    if (name == "gpu" || name == "llamacpp-gpu") {
 #ifdef KEV_BACKEND_USE_DLL
         return load_plugin_dll("kev-backend-gpu", err);
 #elif defined(KEV_BACKEND_GPU_SINGLE_LLAMA)
@@ -467,7 +480,7 @@ std::unique_ptr<Backend> BackendFactory_load(const std::string & name, std::stri
 #endif
     }
 
-    set_err(err, "unknown backend: '" + name + "' (expected 'cpu', 'vulkan', or 'gpu'/'cuda' as extension point)");
+    set_err(err, "unknown backend: '" + name + "' (expected 'cpu', 'vulkan', 'cuda', or 'gpu' as extension point)");
     return nullptr;
 }
 

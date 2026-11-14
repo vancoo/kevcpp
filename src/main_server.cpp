@@ -127,7 +127,7 @@ int main(int argc, char ** argv) {
                "  --prefix-capacity N prefix cache slots (default 4)\n"
               "  --n-batch N         llama n_batch (single llama_decode logical max, default 512)\n"
               "  --n-ubatch N        llama n_ubatch (actual prefill block, default 256; must be <= n_batch)\n"
-              "  --backend <name>    inference backend: 'cpu' (default). 'vulkan'(需对应 dll 构建).\n"
+              "  --backend <name>    inference backend: 'cpu' (default). 'vulkan'(需对应 dll 构建). 'cuda'(需 NVIDIA 主机上构建的 kev-backend-cuda.dll).\n"
               "  --gpu-layers N      layers offloaded to GPU (neg=all, 0=none; default: neg for gpu backends).\n"
               "  --moe-mode <mode>   MoE expert placement: 'ram' (default, experts stay in host RAM to save\n"
               "                       VRAM, loaded on demand) or 'vram' (experts fully in VRAM). MoE only.\n"
