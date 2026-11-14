@@ -60,6 +60,10 @@ struct KevCudaBackend {
     bool                  selected_output_all = false;
     llama_token           selected_tokens[2] = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
     std::vector<float>    selected_rows[2];
+    // KEV_BINARY_LETTER=1: single-token A..Z rows so letter scoring can also run
+    // with the full LM head GEMM disabled (letter_tokens[i]==LLAMA_TOKEN_NULL = unavailable).
+    llama_token           letter_tokens[26] = {};
+    std::vector<float>    letter_rows[26];
     std::vector<int8_t>   selected_outputs;
     // MoE expert offload: tensor_buft_overrides 数组须覆盖 model 生命周期。
     std::vector<llama_model_tensor_buft_override> moe_overrides_;
@@ -141,6 +145,8 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
             write_err(err, err_cap, "selected LM head requires KEV_BINARY_SCORING=1 and rejects KEV_BINARY_TWO_POS=1");
             return 1;
         }
+        // Note: KEV_BINARY_LETTER=1 is fully compatible — letter scoring reads the
+        // cached A..Z rows extracted below via the same hidden-state dot product.
         if ((decide && (std::strcmp(decide, "hidden") == 0 || std::strcmp(decide, "hidden_state") == 0 ||
                         std::strcmp(decide, "decide") == 0)) ||
             (label && (std::strcmp(label, "abcd") == 0 || std::strcmp(label, "yn") == 0))) {
@@ -235,6 +241,26 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
                 return 1;
             }
         }
+        // Letter rows (A..Z): with KEV_BINARY_LETTER=1 the letter scoring path reads
+        // single-token uppercase letter logits; extract those rows too so the full
+        // LM head GEMM can stay disabled for letter mode as well. Vocabs that lack a
+        // single-token letter are tolerated (token stays LLAMA_TOKEN_NULL): only
+        // letter-mode requests for that letter would fail later, binary usage is
+        // unaffected.
+        int n_letter_rows = 0;
+        for (int i = 0; i < 26; ++i) {
+            const char label[2] = { (char) ('A' + i), '\0' };
+            llama_token token = LLAMA_TOKEN_NULL;
+            const int32_t n = llama_tokenize(kb->vocab, label, 1, &token, 1,
+                                             /*add_special=*/false, /*parse_special=*/false);
+            if (n != 1 || token < 0 || token >= llama_vocab_n_tokens(kb->vocab)) continue;
+            std::vector<float> row((size_t) kb->n_embd);
+            if (llama_model_get_output_row(kb->model, token, row.data(), row.size()) != 0) continue;
+            kb->letter_tokens[i] = token;
+            kb->letter_rows[i] = std::move(row);
+            ++n_letter_rows;
+        }
+        std::fprintf(stderr, "[kev] selected LM head: %d/26 uppercase letter rows extracted\n", n_letter_rows);
     }
 
     const int n_ctx   = p->n_ctx > 0 ? p->n_ctx : 2048;
@@ -436,15 +462,32 @@ int op_read_logits(kev_backend_t * b, int32_t out_idx, int32_t token_id, float *
     KevCudaBackend * kb = as_cuda(b);
     if (!kb || !kb->ctx || !out || !kb->vocab) return 1;
     if (kb->selected_lm_head) {
+        const float * hidden = nullptr;
+        const float * row = nullptr;
         int selected = -1;
         if (token_id == kb->selected_tokens[0]) selected = 0;
         else if (token_id == kb->selected_tokens[1]) selected = 1;
-        if (selected < 0 || !selected_output_valid(kb, out_idx)) return 1;
-        const float * hidden = llama_get_embeddings_nextn_ith(kb->ctx, out_idx);
-        if (!hidden) return 1;
+        if (selected >= 0) {
+            if (!selected_output_valid(kb, out_idx)) return 1;
+            hidden = llama_get_embeddings_nextn_ith(kb->ctx, out_idx);
+            if (!hidden) return 1;
+            row = kb->selected_rows[selected].data();
+        } else {
+            // Letter scoring (KEV_BINARY_LETTER=1): cached A..Z rows, same dot product.
+            for (int i = 0; i < 26; ++i) {
+                if (kb->letter_tokens[i] != LLAMA_TOKEN_NULL && token_id == kb->letter_tokens[i]) {
+                    if (!selected_output_valid(kb, out_idx)) return 1;
+                    hidden = llama_get_embeddings_nextn_ith(kb->ctx, out_idx);
+                    if (!hidden) return 1;
+                    row = kb->letter_rows[i].data();
+                    break;
+                }
+            }
+        }
+        if (!hidden || !row) return 1;
         float logit = 0.0f;
         for (int32_t i = 0; i < kb->n_embd; ++i) {
-            logit += hidden[i] * kb->selected_rows[selected][(size_t) i];
+            logit += hidden[i] * row[(size_t) i];
         }
         *out = logit;
         return 0;

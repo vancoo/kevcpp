@@ -263,7 +263,8 @@ json systemone_json(KevModel & model, const nlohmann::ordered_json & body, doubl
                 }
                 if (letter_mode) {
                     // 字母 logit 模式(2026-11-14): 每题一条 prompt, 直接读 A/B/C… 标签
-                    // token 的 logit 做候选对比, 需要完整 LM head(勿开 KEV_SELECTED_LM_HEAD)。
+                    // token 的 logit 做候选对比。KEV_SELECTED_LM_HEAD=1 时走缓存 A..Z 行点积
+                    // (免完整 LM head GEMM); 否则用完整 LM head。
                     q.letter_choice = true;
                     q.binary_messages.push_back("Context:\n" + state + "\nChoice:\n" + choices_block +
                                                 "\nQuestion:\n" + objective +

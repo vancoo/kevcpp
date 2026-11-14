@@ -893,7 +893,8 @@ KevModel::ProbsResult KevModel::probs_binary(const KevRequest & req, std::string
         const double t0 = now_ms();
 
         // 字母 logit 模式(KEV_BINARY_LETTER=1): 一条 prompt, 读 A/B/C… 大写标签
-        // token 的 logit, 对标签集 softmax 作为候选概率。需完整 LM head。
+        // token 的 logit, 对标签集 softmax 作为候选概率。完整 LM head 或
+        // KEV_SELECTED_LM_HEAD=1 的缓存 A..Z 行点积均可(后端自动选择)。
         // 注意: 必须在 binary prompt count 校验之前(此模式 binary_messages 只有 1 条)。
         if (q.letter_choice) {
             std::string prompt;
