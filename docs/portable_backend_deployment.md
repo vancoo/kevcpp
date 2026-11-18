@@ -19,22 +19,30 @@ For a **portable CPU** deployment the artifacts shipped are:
 bin/
   main_server.exe            # host executable (this tree: statically links llama — single-llama SAFE state)
   kev-backend-cpu.dll        # CPU backend plugin — the portable/dll build (NOT built in this tree; see §6/§7)
-  ggml-cpu-{x64,
-          sse42,
-          sandybridge,
-          haswell,
-          skylakex,          # <-- keep (AVX512, non-VNNI, bit-identical)
-          cannonlake}.dll    # <-- keep (AVX512+VBMI, non-VNNI, bit-identical)
-  # --- MUST BE PRUNED (numerically WRONG) ---
-  # ggml-cpu-cascadelake.dll # AVX512_VNNI vpdpbusd  -> WRONG probabilities
-  # ggml-cpu-icelake.dll     # AVX512_VNNI vpdpbusd  -> WRONG probabilities
-  # ggml-cpu-alderlake.dll   # AVX_VNNI    vpdpbusd  -> WRONG probabilities
+  ggml-cpu-{x64,sse42,sandybridge,haswell,skylakex,cannonlake,
+            alderlake,cascadelake,icelake}.dll   # full set is safe: runtime KAT gates the VNNI variants
 ```
 
-The runtime `ggml-backend-load-best("cpu")` auto-selects the highest-scoring variant
-for the host CPU. If the VNNI variants are present, a Zen5 host auto-selects
-`ggml-cpu-cascadelake.dll` and **serves wrong probabilities**. **Pruning the VNNI
-variants is product-critical** (§4).
+At backend init (`op_init`, before `llama_backend_init()`) `kev_backend_cpu.cpp`
+enumerates `ggml-cpu-*.dll` next to the exe, reads each variant's cpuid score,
+and probes candidates **from the highest score down in a fresh subprocess**
+(`<exe> --kev-probe-cpu-variant <dll>`, handled at the top of `main()` in
+`main_server.cpp`). Each probe loads the variant, runs a small known-answer test
+(F32 GEMM + Q8_0×F32 GEMM, K=256 to satisfy the tiled-GEMM `ne00 % 256`
+constraint) and prints `KAT_BEGIN..KAT_END` metrics; the parent compares them
+against the scalar `x64` reference (rel ≤1e-3 OR abs ≤1e-3 per metric). The
+first candidate that matches is pre-registered via `ggml_backend_load()`, so
+`llama_backend_init()`'s `ggml_backend_load_all()` (which only runs when the
+registry is empty) never loads the broken variants. Environment overrides:
+`KEV_CPU_VARIANT=auto` (default) | `<tag>` (force one, still KAT-gated) |
+`off` (skip selection entirely, ggml default `load_best` behaviour).
+
+Verified on Zen 5: cascadelake/icelake are auto-rejected (their Q8_0×F32 KAT
+c2 fingerprint is ~2.7× off: 1834.6 vs 674.5), `cannonlake` is selected, and
+the 231-question 0.8B benchmark matches the native control build exactly
+(121/231, 0 per-task choice differences, P50 parity). The old
+"prune the VNNI dlls from the artifact set" rule (§4) is therefore superseded
+— pruning is still harmless, but no longer required.
 
 ---
 
@@ -94,15 +102,16 @@ Verified per-variant numerics on this model (`models/kev-merged-q8.gguf`), short
 | `sandybridge` | AVX | 0.2828 | ✘ diff |
 | `cascadelake`/`icelake` | **AVX512_VNNI (vpdpbusd)** | **0.1222** | ✘ **WRONG** |
 
-**Product-critical rule:**
-> Ship ONLY `ggml-cpu-{x64,sse42,sandybridge,haswell,skylakex,cannonlake}.dll`.
-> **PRUNE `ggml-cpu-{cascadelake,icelake,alderlake}.dll`** (anything using the
-> AVX512_VNNI/AVX_VNNI `vpdpbusd` Q8×Q8 kernel). If left present, the auto-selector
-> on an AVX512-VNNI host (Zen5, many recent Intel) picks `cascadelake` and serves
-> wrong probabilities (matches `docs/F.24_Q8_DOTBUS_FAIL_AND_F16_PIVOT.md`).
-
-This is an **architectural** property of the Q8×Q8 dpbusd path on this model, not a
-per-host tuning knob — prune unconditionally in the artifact set.
+**Rule (superseded by the runtime KAT gate — kept for history):**
+> ~~Ship ONLY `ggml-cpu-{x64,sse42,sandybridge,haswell,skylakex,cannonlake}.dll`.
+> PRUNE the VNNI variants.~~ As of branch `perf/cpu-runtime-kat` the pruning is
+> enforced **at runtime** instead (see §1): the VNNI variants fail the startup
+> KAT against the `x64` reference and are never registered, so shipping the
+> full variant set is safe. The underlying failure is real and unchanged: on
+> this model the `vpdpbusd` Q8×Q8 kernel (AVX512_VNNI/AVX_VNNI) serves wrong
+> probabilities (matches `docs/F.24_Q8_DOTBUS_FAIL_AND_F16_PIVOT.md`), and an
+> ungated auto-selector on an AVX512-VNNI host (Zen5, many recent Intel) picks
+> `cascadelake` first.
 
 ---
 

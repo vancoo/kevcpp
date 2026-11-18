@@ -13,10 +13,20 @@
 //                            main_server and this TU then share the SAME llama
 //                            copy (single module), which is the current safe state.
 //
-// In the plugin-dll build the ggml CPU variant set (GGML_CPU_ALL_VARIANTS) must be
-// enabled with GGML_NATIVE OFF; the VNNI/dpbusd variants must be pruned from the
-// deployable set (see docs/portable_backend_deployment.md) because they are
-// numerically WRONG on this model.
+// In multi-variant builds (GGML_CPU_ALL_VARIANTS + GGML_BACKEND_DL) the exe dir
+// contains ggml-cpu-<tag>.dll variants. At init we enumerate them, read each
+// one's runtime score (cpuid capability check), and probe candidates from the
+// highest score down: each candidate runs a small known-answer compute (F32
+// GEMM + Q8_0 x F32 GEMM fingerprint) in a probe subprocess, and the result is
+// compared against the scalar x64 baseline variant. The first candidate whose
+// fingerprint matches the baseline is pre-registered via ggml_backend_load()
+// before llama_backend_init(), which then skips ggml_backend_load_all() (it
+// only runs when the registry is empty), so a numerically broken variant is
+// never loaded. KEV_CPU_VARIANT=off disables the auto selection,
+// KEV_CPU_VARIANT=<tag> forces a variant (still KAT-gated). This gates the
+// VNNI/dpbusd variants that are numerically WRONG on this toolchain/model
+// (see docs/portable_backend_deployment.md) while keeping faster correct
+// variants available.
 //
 // This file must compile bit-identically to the legacy single-module path:
 // the ops below call the same llama_* functions kev_model.cpp used to call
@@ -28,11 +38,26 @@
 
 #include "llama.h"
 
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
 
 namespace {
 
@@ -67,6 +92,353 @@ static void kev_cpu_log_filter(enum ggml_log_level level, const char * text, voi
     }
 }
 
+// ---- runtime CPU variant selection (multi-variant builds, Windows) ----
+// See the file header for the design. Everything below is Windows-only and
+// no-ops when no ggml-cpu-*.dll variants exist next to the executable.
+
+#ifdef _WIN32
+
+struct KatMetrics {
+    double c1_l2 = 0.0, c2_l2 = 0.0;
+    double c1_max = 0.0, c2_max = 0.0;
+    double c1_e[8] = {}, c2_e[8] = {};
+    bool   valid = false;
+};
+
+static float kat_half_to_float(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h >> 15) & 1u;
+    const uint32_t exp  = (uint32_t)(h >> 10) & 0x1Fu;
+    const uint32_t frac = (uint32_t)h & 0x3FFu;
+    float v;
+    if (exp == 0) {
+        v = (float)frac * (1.0f / 16777216.0f);          // frac * 2^-24
+    } else if (exp == 31) {
+        v = frac ? NAN : INFINITY;
+    } else {
+        v = std::ldexp((float)(frac | 0x400u), (int)exp - 25);
+    }
+    return sign ? -v : v;
+}
+
+// Runs the KAT on the variant registered in THIS process (the probe
+// subprocess) and emits machine-readable metrics on stdout. Correctness is
+// judged by the parent against the x64 baseline probe, not here.
+static int kat_run_and_report() {
+    // Deterministic inputs (LCG), exercising both the plain F32 GEMM and the
+    // Q8_0 x F32 mul_mat path used by Q8_0 model weights.
+    // K must be a multiple of 256 (tiled GEMM path constraint, ne00 % 256).
+    const int M = 128, K = 256, N = 128;
+    std::vector<float> A((size_t)M * K), B((size_t)K * N);
+    uint32_t seed = 0x12345678u;
+    auto lcg = [&seed]() { seed = seed * 1103515245u + 12345u; return (float)((int)((seed >> 16) & 0x7FFF) - 16384) / 16384.0f; };
+    for (auto & v : A) v = lcg();
+    for (auto & v : B) v = lcg();
+
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!dev) { std::fprintf(stdout, "KAT no-cpu-device\n"); std::fflush(stdout); return 1; }
+    ggml_backend_t bk = ggml_backend_dev_init(dev, nullptr);
+    if (!bk)    { std::fprintf(stdout, "KAT backend-init-failed\n"); std::fflush(stdout); return 1; }
+
+    struct ggml_init_params ip = { 8u << 20, nullptr, /*no_alloc=*/true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, M);
+    ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, N);
+    ggml_tensor * aq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, M);
+    ggml_tensor * c1 = ggml_mul_mat(ctx, a,  b);
+    ggml_tensor * c2 = ggml_mul_mat(ctx, aq, b);
+    ggml_cgraph * g  = ggml_new_graph(ctx);
+    ggml_build_forward_expand(g, c1);
+    ggml_build_forward_expand(g, c2);
+
+    ggml_backend_buffer * buf = ggml_backend_alloc_ctx_tensors(ctx, bk);
+    if (!buf) { ggml_free(ctx); ggml_backend_free(bk); std::fprintf(stdout, "KAT alloc-failed\n"); std::fflush(stdout); return 1; }
+
+    ggml_backend_tensor_set(a, A.data(), 0, A.size() * sizeof(float));
+    ggml_backend_tensor_set(b, B.data(), 0, B.size() * sizeof(float));
+    std::vector<uint8_t> qbuf(ggml_nbytes(aq));
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, A.data(), qbuf.data(), 0, M, K, nullptr);
+    ggml_backend_tensor_set(aq, qbuf.data(), 0, qbuf.size());
+
+    if (ggml_backend_graph_compute(bk, g) != GGML_STATUS_SUCCESS) {
+        ggml_backend_buffer_free(buf); ggml_free(ctx); ggml_backend_free(bk);
+        std::fprintf(stdout, "KAT compute-failed\n"); std::fflush(stdout); return 1;
+    }
+
+    std::vector<float> r1((size_t)N * M), r2((size_t)N * M);
+    ggml_backend_tensor_get(c1, r1.data(), 0, r1.size() * sizeof(float));
+    ggml_backend_tensor_get(c2, r2.data(), 0, r2.size() * sizeof(float));
+
+    KatMetrics m;
+    auto acc = [](const std::vector<float> & r, double & l2, double & mx, double e[8]) {
+        l2 = 0.0; mx = 0.0;
+        for (float v : r) { double d = (double)v; l2 += d * d; mx = std::max(mx, std::fabs(d)); }
+        l2 = std::sqrt(l2);
+        const size_t n = r.size();
+        for (int i = 0; i < 8; ++i) e[i] = (double)r[(size_t)((n * (size_t)i) / 8 + 17) % n];
+    };
+    acc(r1, m.c1_l2, m.c1_max, m.c1_e);
+    acc(r2, m.c2_l2, m.c2_max, m.c2_e);
+    m.valid = std::isfinite(m.c1_l2) && std::isfinite(m.c2_l2);
+
+    std::fprintf(stdout, "KAT_BEGIN\n");
+    std::fprintf(stdout, "c1_l2 %.9f\nc2_l2 %.9f\nc1_max %.9f\nc2_max %.9f\n",
+                 m.c1_l2, m.c2_l2, m.c1_max, m.c2_max);
+    std::fprintf(stdout, "c1_e");
+    for (int i = 0; i < 8; ++i) std::fprintf(stdout, " %.9f", m.c1_e[i]);
+    std::fprintf(stdout, "\nc2_e");
+    for (int i = 0; i < 8; ++i) std::fprintf(stdout, " %.9f", m.c2_e[i]);
+    std::fprintf(stdout, "\nKAT_END\n");
+    std::fflush(stdout);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(bk);
+    return m.valid ? 0 : 1;
+}
+
+static std::wstring exe_path_w() {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    return path;
+}
+
+static std::string wide_to_utf8(const std::wstring & w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+struct VariantCandidate {
+    std::wstring path;
+    std::string  name;   // tag between "ggml-cpu-" and ".dll"
+    int          score = 0;
+};
+
+// Reads the variant's runtime score (cpuid capability probe) without
+// registering it. Score 0 => this CPU cannot run the variant.
+static int variant_score(const std::wstring & dll_path) {
+    HMODULE h = LoadLibraryW(dll_path.c_str());
+    if (!h) return -1;
+    using score_fn_t = int (*)();
+    auto fn = (score_fn_t)GetProcAddress(h, "ggml_backend_score");
+    int s = fn ? fn() : -1;
+    FreeLibrary(h);
+    return s;
+}
+
+// Spawns `<host-exe> --kev-probe-cpu-variant <dll>` (see main_server.cpp),
+// captures its stdout and exit code. The probe loads the variant in a fresh
+// process and prints the KAT metrics, so no unloading is ever needed.
+static bool probe_variant_subprocess(const std::wstring & dll_path, int & exit_code,
+                                     std::string & stdout_text) {
+    std::wstring cmd = L"\"" + exe_path_w() + L"\" --kev-probe-cpu-variant \"" + dll_path + L"\"";
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return false;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi = {};
+    std::wstring mutable_cmd = cmd;
+    BOOL ok = CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, 0,
+                             nullptr, nullptr, &si, &pi);
+    CloseHandle(wr);
+    if (!ok) { CloseHandle(rd); return false; }
+
+    char buf[4096];
+    DWORD got = 0;
+    while (ReadFile(rd, buf, sizeof(buf), &got, nullptr) && got > 0) {
+        stdout_text.append(buf, buf + got);
+        if (stdout_text.size() > (1u << 20)) break;
+    }
+    CloseHandle(rd);
+    if (WaitForSingleObject(pi.hProcess, 120000) != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, 3);
+        WaitForSingleObject(pi.hProcess, 5000);
+    }
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    exit_code = (int)code;
+    return true;
+}
+
+static bool parse_kat_metrics(const std::string & text, KatMetrics & m) {
+    auto find_val = [&](const char * key, double & out) {
+        std::string pat = std::string(key) + " ";
+        size_t p = text.find(pat);
+        if (p == std::string::npos) return false;
+        out = std::atof(text.c_str() + p + pat.size());
+        return std::isfinite(out);
+    };
+    bool ok = true;
+    ok = ok && find_val("c1_l2", m.c1_l2);
+    ok = ok && find_val("c2_l2", m.c2_l2);
+    ok = ok && find_val("c1_max", m.c1_max);
+    ok = ok && find_val("c2_max", m.c2_max);
+    if (!ok) return false;
+    size_t p = text.find("c1_e");
+    if (p == std::string::npos) return false;
+    p += 4;
+    for (int i = 0; i < 8; ++i) { p = text.find(' ', p); if (p == std::string::npos) return false; m.c1_e[i] = std::atof(text.c_str() + p + 1); }
+    p = text.find("c2_e");
+    if (p == std::string::npos) return false;
+    p += 4;
+    for (int i = 0; i < 8; ++i) { p = text.find(' ', p); if (p == std::string::npos) return false; m.c2_e[i] = std::atof(text.c_str() + p + 1); }
+    m.valid = true;
+    return true;
+}
+
+static bool kat_metrics_match(const KatMetrics & ref, const KatMetrics & cand) {
+    // Pass if within 1e-3 relative OR 1e-3 absolute (sampled elements can sit
+    // near zero where pure relative comparison over-penalizes benign
+    // reduction-order noise; the VNNI failure moves c2 by ~3x, far above both).
+    auto close = [](double a, double b) {
+        const double d = std::fabs(a - b), s = std::max(std::fabs(a), std::fabs(b));
+        return d / std::max(s, 1e-9) <= 1e-3 || d <= 1e-3;
+    };
+    if (!ref.valid || !cand.valid) return false;
+    if (!close(ref.c1_l2, cand.c1_l2)) return false;
+    if (!close(ref.c2_l2, cand.c2_l2)) return false;
+    if (!close(ref.c1_max, cand.c1_max)) return false;
+    if (!close(ref.c2_max, cand.c2_max)) return false;
+    for (int i = 0; i < 8; ++i) {
+        if (!close(ref.c1_e[i], cand.c1_e[i])) return false;
+        if (!close(ref.c2_e[i], cand.c2_e[i])) return false;
+    }
+    return true;
+}
+
+// One-shot per process: picks the best KAT-verified variant and pre-registers
+// it so llama_backend_init() skips ggml_backend_load_all().
+static bool select_cpu_variant(std::string & err_out) {
+    static std::atomic<bool> done{false};
+    static std::atomic<bool> ok{false};
+    if (done.exchange(true)) { if (!ok) err_out = "cpu variant selection failed earlier"; return ok; }
+
+    const char * forced = std::getenv("KEV_CPU_VARIANT");
+    const std::string forced_s = forced ? forced : "";
+    if (forced_s == "off") {
+        std::fprintf(stderr, "[kev] cpu-variant: KEV_CPU_VARIANT=off, skipping auto selection\n");
+        ok = true;
+        return true;
+    }
+
+    const std::wstring exe = exe_path_w();
+    const size_t slash = exe.find_last_of(L"/\\");
+    const std::wstring dir = slash == std::wstring::npos ? L"." : exe.substr(0, slash);
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((dir + L"\\ggml-cpu-*.dll").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) { ok = true; return true; }   // no variants: plain build
+    std::vector<VariantCandidate> cands;
+    do {
+        VariantCandidate c;
+        c.path = dir + L"\\" + fd.cFileName;
+        std::wstring wname(fd.cFileName);
+        const size_t pre = wname.find(L"ggml-cpu-");
+        const size_t ext = wname.rfind(L".dll");
+        if (pre == std::string::npos || ext == std::string::npos || ext <= pre + 9) continue;
+        c.name = wide_to_utf8(wname.substr(pre + 9, ext - pre - 9));
+        c.score = variant_score(c.path);
+        if (c.score > 0) cands.push_back(std::move(c));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    if (cands.empty()) { ok = true; return true; }                // nothing usable here; let ggml default
+
+    std::sort(cands.begin(), cands.end(), [](const VariantCandidate & x, const VariantCandidate & y) {
+        if (x.score != y.score) return x.score > y.score;
+        return x.name < y.name;
+    });
+    std::fprintf(stderr, "[kev] cpu-variant: candidates:");
+    for (const auto & c : cands) std::fprintf(stderr, " %s(%d)", c.name.c_str(), c.score);
+    std::fprintf(stderr, "\n");
+
+    // Reference fingerprint: the scalar x64 baseline variant.
+    KatMetrics ref;
+    bool have_ref = false;
+    auto it_x64 = std::find_if(cands.begin(), cands.end(),
+                               [](const VariantCandidate & c) { return c.name == "x64"; });
+    if (it_x64 != cands.end()) {
+        int code = -1; std::string out;
+        if (probe_variant_subprocess(it_x64->path, code, out) && code == 0 && parse_kat_metrics(out, ref)) {
+            have_ref = true;
+            std::fprintf(stderr, "[kev] cpu-variant: reference x64 KAT ok (c1_l2=%.6f c2_l2=%.6f)\n", ref.c1_l2, ref.c2_l2);
+        }
+    }
+    if (!have_ref) {
+        err_out = "cpu-variant auto requires a working 'x64' baseline variant for the reference fingerprint";
+        std::fprintf(stderr, "[kev] cpu-variant: %s\n", err_out.c_str());
+        return false;
+    }
+
+    auto probe_one = [&](const VariantCandidate & c, KatMetrics & m) {
+        int code = -1; std::string out;
+        if (!probe_variant_subprocess(c.path, code, out)) {
+            std::fprintf(stderr, "[kev] cpu-variant: %s probe spawn failed\n", c.name.c_str());
+            return false;
+        }
+        if (code != 0 || !parse_kat_metrics(out, m)) {
+            std::fprintf(stderr, "[kev] cpu-variant: %s KAT RUN FAILED (exit=%d)\n", c.name.c_str(), code);
+            return false;
+        }
+        if (!kat_metrics_match(ref, m)) {
+            std::fprintf(stderr, "[kev] cpu-variant: %s KAT MISMATCH (c1_l2=%.6f c2_l2=%.6f vs ref %.6f/%.6f) - rejected\n",
+                         c.name.c_str(), m.c1_l2, m.c2_l2, ref.c1_l2, ref.c2_l2);
+            return false;
+        }
+        return true;
+    };
+
+    const VariantCandidate * chosen = nullptr;
+    if (!forced_s.empty() && forced_s != "auto" && forced_s != "off") {
+        auto it = std::find_if(cands.begin(), cands.end(),
+                               [&](const VariantCandidate & c) { return c.name == forced_s; });
+        if (it == cands.end()) {
+            err_out = "KEV_CPU_VARIANT='" + forced_s + "': no such cpu variant with score>0";
+            std::fprintf(stderr, "[kev] cpu-variant: %s\n", err_out.c_str());
+            return false;
+        }
+        KatMetrics m;
+        if (!probe_one(*it, m)) {
+            err_out = "KEV_CPU_VARIANT='" + forced_s + "' failed the KAT against the x64 reference";
+            return false;
+        }
+        chosen = &*it;
+    } else {
+        for (const auto & c : cands) {
+            KatMetrics m;
+            if (probe_one(c, m)) { chosen = &c; break; }
+        }
+        if (!chosen) {
+            err_out = "all cpu variants failed the KAT against the x64 reference";
+            std::fprintf(stderr, "[kev] cpu-variant: %s\n", err_out.c_str());
+            return false;
+        }
+    }
+
+    std::fprintf(stderr, "[kev] cpu-variant: selected '%s' (score=%d, KAT-verified vs x64)\n",
+                 chosen->name.c_str(), chosen->score);
+    ggml_backend_reg_t reg = ggml_backend_load(wide_to_utf8(chosen->path).c_str());
+    if (!reg) {
+        err_out = "ggml_backend_load failed for cpu variant '" + chosen->name + "'";
+        std::fprintf(stderr, "[kev] cpu-variant: %s\n", err_out.c_str());
+        return false;
+    }
+    ok = true;
+    return true;
+}
+
+#endif // _WIN32
+
 // ---- lifecycle ----
 
 int op_create(kev_backend_t ** out) {
@@ -91,6 +463,16 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
     if (!kb) { write_err(err, err_cap, "null backend"); return 1; }
     if (kb->ctx || kb->model) { write_err(err, err_cap, "backend already initialized"); return 1; }
     if (!p || !p->model_path) { write_err(err, err_cap, "model_path required"); return 1; }
+
+#ifdef _WIN32
+    // Multi-variant builds: pick + pre-register a KAT-verified ggml-cpu variant
+    // BEFORE llama_backend_init() so its load_all() (registry-empty shortcut)
+    // never sees the broken variants. No-op in plain single-variant builds.
+    {
+        std::string sel_err;
+        if (!select_cpu_variant(sel_err)) { write_err(err, err_cap, sel_err); return 1; }
+    }
+#endif
 
     llama_backend_init();
 
@@ -487,5 +869,22 @@ KEV_BACKEND_API kev_backend_t * kev_backend_create(void) {
 KEV_BACKEND_API void kev_backend_destroy(kev_backend_t * b) {
     op_destroy(b);
 }
+
+#ifdef _WIN32
+// Internal: called by the probe subprocess (main_server --kev-probe-cpu-variant).
+// Registers the given ggml-cpu variant in THIS process, runs the KAT (metrics
+// printed to stdout as KAT_BEGIN..KAT_END), and returns the KAT status. The
+// short human-readable status also lands in `report`. The parent process
+// compares the captured metrics against the x64 reference.
+KEV_BACKEND_API int kev_probe_cpu_variant(const char * variant_dll, char * report, size_t report_cap) {
+    auto wr = [&](const char * s) { if (report && report_cap) std::snprintf(report, report_cap, "%s", s); };
+    if (!variant_dll || !variant_dll[0]) { wr("probe: empty variant path"); return 2; }
+    ggml_backend_reg_t reg = ggml_backend_load(variant_dll);
+    if (!reg) { wr("probe: ggml_backend_load failed"); return 1; }
+    const int rc = kat_run_and_report();
+    wr(rc == 0 ? "KAT_OK" : "KAT_FAILED");
+    return rc;
+}
+#endif
 
 } // extern "C"

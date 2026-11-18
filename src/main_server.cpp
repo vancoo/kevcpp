@@ -75,6 +75,30 @@ static json model_card(const kev::KevModel & m, const std::string & base) {
 }
 
 int main(int argc, char ** argv) {
+#if defined(_WIN32)
+    // Internal probe mode (spawned by kev_backend_cpu.cpp's variant selection):
+    // `main_server --kev-probe-cpu-variant <ggml-cpu-*.dll>`. Loads the backend
+    // dll from the exe dir, registers the requested variant inside this fresh
+    // process, runs the KAT (metrics go to stdout), and exits with the KAT
+    // status. Never touches llama/HTTP directly — stays llama-free.
+    if (argc >= 3 && std::strcmp(argv[1], "--kev-probe-cpu-variant") == 0) {
+        wchar_t wpath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, wpath, MAX_PATH);
+        std::wstring exe(wpath);
+        const size_t slash = exe.find_last_of(L"/\\");
+        const std::wstring dir = slash == std::wstring::npos ? L"." : exe.substr(0, slash);
+        HMODULE hb = LoadLibraryW((dir + L"\\kev-backend-cpu.dll").c_str());
+        if (!hb) { std::fprintf(stdout, "probe backend-dll-load-failed gle=%lu\n", GetLastError()); std::fflush(stdout); return 2; }
+        using probe_fn_t = int (*)(const char *, char *, size_t);
+        auto fn = (probe_fn_t)GetProcAddress(hb, "kev_probe_cpu_variant");
+        if (!fn) { std::fprintf(stdout, "probe export-missing\n"); std::fflush(stdout); return 2; }
+        char report[256] = {};
+        const int rc = fn(argv[2], report, sizeof(report));
+        std::fprintf(stdout, "PROBE %s\n", report);
+        std::fflush(stdout);
+        return rc;
+    }
+#endif
     std::string model_path, lora_path, host = "127.0.0.1";
     std::string backend = "cpu";  // pluggable backend (default "cpu")
     std::string decision_config_file;   // 可选: 决策配置 JSON (模型无关 marker + 温度)
