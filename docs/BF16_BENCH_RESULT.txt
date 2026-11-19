@@ -1,6 +1,0 @@
-threads=32 torch=2.10.0+cpu
-bf16_total_MiB=1435.1 trunk_MiB=950.1
-single_token_decode_ms_best=56.396 median=61.743
-fwd161_total_ms_best=370.324 fwd161_implied_BW=4.1
-single_tok_implied_BW_total=26.7 trunk=17.7
-batch_decode_ms_total_per_token: B1=64.8/64.849 B2=178.7/89.366 B4=184.4/46.104 B8=184.4/23.049 B16=201.8/12.613

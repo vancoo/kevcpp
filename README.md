@@ -1,415 +1,264 @@
 # kevcpp
 
-> kev 的 C++17 原生实现（基于 llama.cpp），用 C++ 重新实现 kev（Python）的推理/服务行为。
-
-kevcpp 是一个纯 CPU（目前）、基于 `llama.cpp` 的 kev 推理服务。它以 kev（`E:\van\projects\kev`）的 Python
-参考实现为行为基准，把 `DecisionModel` / 状态前缀缓存 / `/v1/systemone` 服务语义用 C++/llama.cpp 重写，
-目标是：**证明 kevcpp 的稳态延迟不低于 Python kev，并持续压缩稳态延迟**（项目章程）。
-
-> 当前语言说明：本文以中文撰写，标题辅以英文，读者可对照 kev 与 llama.cpp 的术语。
+> kev 决策引擎的 C++17 原生实现（基于 llama.cpp）：多后端（CPU / CUDA / Vulkan）、跨平台（Windows / Linux）、
+> 单次 prefill 直读选项概率的高性能 Jev 式决策服务。
 
 ---
 
-## 目录（Table of Contents）
+## 致谢（Acknowledgements）
 
-1. [当前状态（Current Status）](#1-当前状态current-status)
-2. [基于 llama.cpp 与 kev（What We Reference）](#2-基于-llamacpp-与-kevwhat-we-reference)
-3. [开发环境与验证（Environment & Validation）](#3-开发环境与验证environment--validation)
-4. [相对 kev 的优势（Advantages over kev）](#4-相对-kev-的优势advantages-over-kev)
-5. [不足与限制（Limitations，诚实说明）](#5-不足与限制limitations诚实说明)
-6. [场景 / 依赖 / 环境要求（Usage, Dependencies, Requirements）](#6-场景--依赖--环境要求usage-dependencies-requirements)
-7. [Vulkan 快速使用（Vulkan Quick Start）](#7-vulkan-快速使用vulkan-quick-start)
-8. [架构说明（Architecture）](#8-架构说明architecture)
-9. [模型 / HF Hub（Model & HuggingFace）](#9-模型--hf-hubmodel--huggingface)
+kevcpp 站在两个先行项目的肩膀上，向它们致谢：
 
----
+- [**kev**](https://gitee.com/)**（Python 参考实现）**：本项目的直接前身。kev 定义了 `DecisionModel`、状态前缀缓存、
+  `/v1/systemone` 服务 schema 与 PointerHead 读出头。kevcpp 以 kev 的推理与服务行为为忠实基准，
+  用 C++/llama.cpp 重新实现其全部语义，并在 JevBench 上保持了更高的准确率（kev 4B 66.2% / 8B 71.4% → kevcpp 4B 76.6%）。
+- [**llm2jev**](../llm2jev)**（Python 编排层 + SGLang/MLX 后端）**：同赛道的开源 Jev 复现。其"零解码 prefill-only 打分 +
+  前缀缓存 + staged 批量提交"的架构验证了这条技术路线的可行性。kevcpp 与之相比把整条链路（编排 + 推理）收进单一
+  C++ 进程，去除了 Python 编排与外部引擎的依赖，并在此之上做出了自己的创新（见 [§5](#5-创新与优势)）。
 
-## 1. 当前状态（Current Status）
-
-- **稳定主线（stable mainline）：`master` @ `dd51ed7`**。稳态延迟约 **\~327 ms**（短请求），输出与参考逐位一致（bit-identical）。包含三项已落地的优化：砍掉未使用的 tied lm\_head（Rank-1，`267300f`）、ctx 默认 8192+超长 state 清晰报错（`dd51ed7`）、threaded/vectorized `ggml concat_f32`（`2607590`）。
-- **可插拔后端 / GPU（Vulkan）目标（分支 `build-portable-backends`，HEAD @ `d961b1c`）**：
-  - HTTP 服务端（原 `main_server`）产物已改名为 **`kevcpp.exe`**。
-  - 新增 **Vulkan 后端插件 `kev-backend-vulkan.dll`**（GGML\_VULKAN）——用 Windows 原生 Vulkan 加载器 + AMD 驱动即可把整个模型 offload 到 Vulkan 设备（AMD iGPU gfx1151），**不依赖 ROCm/HIP**。快速使用见 [§7](#7-vulkan-快速使用vulkan-quick-start)。
-  - CPU 后端（`kev-backend-cpu.dll` / 进程内 `cpu`）与可插拔 `kev::Backend` C-ABI 同时并存，通过 `--backend cpu|vulkan` 选择。
-- 当前 CPU 硬性要求 **AVX-512**（Zen4+/Sapphire Rapids 级别），因为主构建为 `GGML_NATIVE`（详见 §5、§6）。
+同时感谢 vendored 的 [llama.cpp](third_party/llama.cpp)（GGUF/GGML 推理栈）与 JevBench 基准。
 
 ---
 
-## 2. 基于 llama.cpp 与 kev（What We Reference）
+## 1. 性能比较（Performance & Accuracy）
 
-kevcpp 站在两个上游之上：
+JevBench 231 道公开题（easy/hard/original），letter 决策模式。
 
-### 2.1 llama.cpp（vendored，`third_party/llama.cpp`）
+### 1.1 准确率（Accuracy）
 
-llama.cpp 以完整副本 vendored 于 `third_party/llama.cpp`（`CMakeLists.txt` 通过 `add_subdirectory` 引入，
-未修改上游 `llama-graph.cpp`/`llama-context.cpp` 之外的本仓库改动之外的部分——vendored 层保持只读）。参考/复用的部分：
+| 系统 | 模型 | 准确率 |
+| --- | --- | ---: |
+| Jev 1.13.0（官方，TypeSafe AI） | - | 85.1% |
+| **kevcpp** | Qwen3.5-4B Q6\\_K | **76.6%**（177/231） |
+| LLM2Jev | Qwen3.5-4B | 76.2% |
+| **kevcpp** | Qwen3.5-2B Q8\\_0 | 65.8%（151/231） |
+| jev-local | Qwen3.5-9B | 74.9% |
+| kev（research preview） | 8B | 71.4% |
+| kev（research preview） | 4B | 66.2% |
+| Open-Jev | 2B | 64.5% |
 
-- **GGUF / GGML**：模型以 GGUF 计载（`models/kev-merged-q8.gguf`，Q8\_0 量化），`llama`/`ggml` 提供张量加载与运算。
-- **CPU 计算内核**：Q8*0 tiled GEMM（`MUL_MAT`）、`SSM_CONV`、`GATED_DELTA_NET`、`FLASH_ATTN_EXT`、`RMS_NORM` 等。*\_0 tiled GEMM（`MUL_MAT`）、`SSM_CONV`、`GATED_DELTA_NET`、`FLASH_ATTN_EXT`、`RMS_NORM` 等。
-- **混合（hybrid）模型构建器**：`src/models/qwen35.cpp` 构建 **24 层 = 18 层 Gated-DeltaNet 循环层 + 6 层全注意力层**，
-  全注意力层位于第 3、7、11、15、19、23 层（`is_recr_impl[]` 非循环层）。
-- **`llama_decode`**：核心前向入口；kevcpp 稳态每次请求恰好一次 151-token `llama_decode`。
-- **KV / 循环状态缓存**：KV cache 与 Gated-DeltaNet 的循环状态（recurrent state）实际存储/复用机制。
-- **层级化后端 / 加载机制**：`llama_model_loader` + `ggml_backend` 的加载与（便携方案下的）CPU 变体自动选择机制。
+（除 kevcpp 外的数据引自 LLM2Jev 的 [JevBench 报告](../llm2jev/docs/en/jevbench.md)。）
 
-### 2.2 kev（Python，参考实现）
+- **kevcpp 4B 准确率与 LLM2Jev 持平**（76.6% vs 76.2%），显著高于同源的 kev 4B（66.2%）与 kev 8B（71.4%）。
+- **跨平台/后端一致**：Windows（Vulkan/CPU）与 Linux（CPU/CUDA）准确率差异 ≤2 题（±1% 内，数值噪声）；
+  CUDA 后端完全确定（4B 三次复测逐题 0 差异）。
 
-kev 是位于相邻仓库 `E:\van\projects\kev\kev` 的 Python 服务实现（`model.py` / `serve.py` / `api.py`）。
-kevcpp **以 kev 的推理与服务行为为参考**，重新实现：
+### 1.2 延迟（Latency）
 
-- **`DecisionModel`**（`model.py`）：`probs` / `encode` / 状态前缀缓存接口。kevcpp 的 `KevModel`
-  （`kev_model.cpp/h`）实现其接口子集（probs / encode / prefix cache）。
-- **服务端 `serve.py`**（含状态前缀缓存）：HTTP 服务与同 state 二次请求命中语义。
-- **`systemone` 请求/响应 schema**（`api.py` 的 `render` / `option_text` / `question_keys` / `to_record` /
-  `to_answers` / `confidence` 语义）：`kev_api.cpp` 复刻并暴露为 `/v1/systemone`。
-- **PointerHead**：`model.py` 中的 PointerHead class（`head.bin` 权重）——`kev_head.cpp` 移植其前向数学
-  （`k(h_opts) · q(h_decide) * scale`，softmax，temperature）。
+Qwen3.5-4B，231 题（kevcpp 为 Linux / RTX 5090 CUDA 实测）：
 
-一句话：**kevcpp 用 C++17 在 llama.cpp 之上把 kev 的推理/服务行为忠实重实现了一遍。**
+| 系统 | P50 (s) | P95 (s) |
+| --- | ---: | ---: |
+| Jev 1.13.0（官方） | 0.652 | 0.722 |
+| **kevcpp（CUDA，RTX 5090）** | **0.043** | **0.296** |
+| LLM2Jev（自报） | 0.048 | 0.346 |
 
----
+kevcpp 各后端全量数据（correct/231 | P50 | P95，单位秒）：
 
-## 3. 开发环境与验证（Environment & Validation）
+| 配置 | 0.8B Q8\\_0 | 2B Q8\\_0 | 4B Q6\\_K |
+| --- | --- | --- | --- |
+| Win / Vulkan（Strix Halo iGPU） | 122 \| 0.089 \| 0.566 | 150 \| 0.153 \| 1.174 | 177 \| 0.477 \| 3.535 |
+| Win / CPU（KAT auto） | 121 \| 0.901 \| 8.021 | - | - |
+| Linux / CPU（9950X，32 线程） | 119 \| 0.570 \| 5.863 | 150 \| 1.111 \| 12.241 | 177 \| 1.318 \| 11.485 |
+| Linux / CUDA（RTX 5090） | 121 \| 0.024 \| 0.157 | 151 \| 0.028 \| 0.183 | 177 \| 0.043 \| 0.296 |
 
-### 3.1 开发环境
+要点：
 
-| 项 | 值 |
-| --- | --- |
-| 操作系统 | Windows（MSVC 2022，Visual Studio Community） |
-| 编译器 | MSVC 2022，`/arch:AVX512`，C++17 |
-| 构建 | CMake ≥ 3.21，**Release / x64** |
-| CPU | AMD Ryzen AI MAX+ PRO 395（Zen5，32 逻辑核，AVX-512 全宽 + AVX-VNNI `vpdpbusd`） |
-| 模型 | `models/kev-merged-q8.gguf`（Q8\\_0，约 **774 MiB**）+ `models/head.bin`（约 2 MiB） |
+- kevcpp CUDA 与 LLM2Jev（同为 GPU prefill-only 路线）延迟同量级，**无需 Python/外部推理引擎**即可达到。
+- 直接使用GGUF量化模型，准确率不降的情况下更快。
+- RTX 5090 CUDA 比 9950X 32 线程 CPU 快 20–30×；CPU 线程扩展良好（4 线程慢 \~2.4×）。
+- 诚实口径：绝对数值依赖硬件/驱动/负载，请在自己的环境重新测量。
 
-Linux 亦为可接受目标（GCC/Clang 工具链，见 §6）。
+### 1.3 分题型表现（Per-type Breakdown）
 
-### 3.2 已通过的验证（byte-faithful）
+JevBench 231 题按题型分为 **choice**（多选一，139 题）、**noul**（无选项自由决策，74 题）、**score**（数值评分，18 题）。
+各题型在不同模型下的准确率与延迟（准确率 = correct/total；延迟为该题型 P50，单位秒）：
 
-严格字节保真协议（`curl.exe --data-binary @<file>`，每次确认服务端 `input=… output=81`）：
+**Linux / CUDA（RTX 5090）**
 
-- **短请求** `tests/tmp_a_company.json`（`input=189`，state 38 + branch 151）。
-- **长请求** `tests/tmp_long_state_request.json`（`input=263`，超长 state）。
-- **已知正确的概率元组**（与 kev 参考逐位一致，作为 red-line）：
+| 题型 | 题数 | 0.8B Q8\\_0 | 2B Q8\\_0 | 4B Q6\\_K |
+| --- | ---: | --- | --- | --- |
+| choice | 139 | 52.5%（73）\| 0.016 | 66.2%（92）\| 0.018 | 77.7%（108）\| 0.027 |
+| noul | 74 | 48.6%（36）\| 0.027 | 63.5%（47）\| 0.031 | 74.3%（55）\| 0.047 |
+| score | 18 | 66.7%（12）\| 0.034 | 66.7%（12）\| 0.040 | 77.8%（14）\| 0.060 |
 
-| 类别 | 中标 | 产线产能 | 其他 | 厂房 | 投资 | 购地 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 概率 | 0.0026 | **0.3974** | 0.0272 | 0.1731 | 0.396 | 0.0037 |
+**Win / Vulkan（Strix Halo iGPU）**
 
-- 短请求 conf **0.2769**、长请求 conf **0.3691**；choice 均为 **产线产能**。
-- 注：`产线产能`（0.3974）与 `投资`（0.396）是真实近并列（gap 0.0014），是各类近似优化会在近并列处翻转的选择（见 §5.3）。
+| 题型 | 0.8B Q8\\_0 | 2B Q8\\_0 | 4B Q6\\_K |
+| --- | --- | --- | --- |
+| choice | 53.2%（74）\| 0.059 | 65.5%（91）\| 0.095 | 78.4%（109）\| 0.263 |
+| noul | 48.6%（36）\| 0.098 | 63.5%（47）\| 0.167 | 73.0%（54）\| 0.565 |
+| score | 66.7%（12）\| 0.136 | 66.7%（12）\| 0.233 | 77.8%（14）\| 0.708 |
 
-- **已落地的优化与结果**（master @ `dd51ed7`）：
-  - 砍掉未使用的 tied lm\_head（Rank-1，约 -100 ms）→ 稳态分叉前向 **\~440 ms → \~343 ms**。
-  - ctx 默认修复为 8192 + 超长 state 清晰报错。
-  - threaded/vectorized `ggml concat_f32`。
-  - 综合稳态分叉前向 **\~440 ms → \~327 ms**（短请求 median 327.5 ms；长请求 median 333.8 ms）。
+**Linux / CPU（9950X，32 线程）**
 
-- **优化前基线（authoritative）**：稳态 \~440 ms（`logs/perf_authoritative_baseline.md`），
-  MUL*MAT ≈ 335 ms（78%，\~339 GMAC/s）、CONCAT ≈ 38 ms、GATED*DELTA\_NET ≈ 31 ms。
+| 题型 | 0.8B Q8\\_0 | 2B Q8\\_0 | 4B Q6\\_K |
+| --- | --- | --- | --- |
+| choice | 51.1%（71）\| 0.414 | 65.5%（91）\| 0.901 | 79.1%（110）\| 0.896 |
+| noul | 48.6%（36）\| 0.602 | 64.9%（48）\| 1.264 | 71.6%（53）\| 1.324 |
+| score | 66.7%（12）\| 0.589 | 61.1%（11）\| 1.118 | 77.8%（14）\| 1.450 |
 
-**项目章程（objective）**：证明 kevcpp 在稳态延迟上**不低于** Python kev，并持续压缩稳态延迟。
+要点：
 
----
-
-## 4. 相对 kev 的优势（Advantages over kev）
-
-1. **原生 C++/llama.cpp**：无 Python runtime / 无 GIL；单请求开销与内存占用更低；vendored 的 llama.cpp 是成熟的
-   GGUF/Q8 推理栈（权重加载、graph、CPU 内核）。
-2. **状态前缀 LRU 缓存**：`kev_prefix.cpp` 的状态前缀（LRU）缓存让**重复 state 跳过 state prefill**；
-   稳态下每次只 decode 分叉（branch），且 graph 拓扑复用。
-3. **输出质量与参考逐位一致（硬性 red-line）**：在已测请求上，`kevcpp` 产生的概率与 Python kev 参考**逐位相同**
-   （bit-identical），确保同构替换不会改变推理结果。
-4. **正在进行的其他优势**（若真实/已落地则列入）：
-  - **merged-LoRA 单权重前向**（`e83a9be` / `src/merge_lora_tool.cpp`）：把 LoRA fold 进 Q8\_0 基础权重，
-    前向走**单份权重**，避免运行时 LoRA 叠加开销。
-  - **graph 预热（graph warmup）**（`6716f35`）：`main_server` 启动时预热 graph，消除约 \~290 ms 冷启动图形构建。
-  - **多问批量 decode**（P.4，`49b6cf9`）：等长多问批量 decode（位一致前提成立）。
-
-> **关于「比 kev 快」的诚实口径**：本项目确实通过严格的字节保真测量验证了稳态延迟优于 Python kev（数据见
-> `docs/` 日志）。但**跨仓库的绝对数值应由你在自己的硬件上重新测量**——不同机器/负载下的基准不同，本文不承诺
-> 具体绝对倍率。
+- **模型规模是准确率的主导因素**：0.8B→4B 各题型准确率普遍 +20–28pt；题型间 choice/noul 接近，score 样本小（18 题）波动大。
+- **各题型跨后端/平台一致**（±1\~2 题数值噪声），延迟与全局 P50 同比例缩放。
+- choice 题延迟最低，noul/score 稍高（观察值；与其请求 token 序列更长相符，未单独归因验证）。
 
 ---
 
-## 5. 不足与限制（Limitations，诚实说明）
+## 2. 快速使用（Quick Start）
 
-### 5.1 本机 Q8\_0 CPU GEMM 是计算受限（compute-bound）
-
-- 本盘（Zen5）上，Q8\_0 CPU GEMM 实测计算受限，速率约 **\~339 GMAC/s（约为 Zen5 int8 峰值的 \~6%）** ——这是
-  当前稳态延迟的主要构成（MUL\_MAT ≈ 78%）。
-- 所有「更快内核」的努力方向**均实测为输或端到端证伪**（见 `docs/F.24_…`）：
-  - 512-bit `vpdpbusd` Q8×Q8（\~190–256 GMAC/s，与现有 tiled 持平）——**falsified**；
-  - Q8×F16 激活对路径（FMA，微基准 \~380 GMAC/s，但集成后每 GEMM 需 F32→F16 转换吃掉收益，端到端零增益）——**falsified**；
-  - F16 预反量化权重（微基准赢，集成后端到端反而慢 \~110 ms）——**falsified**。
-
-### 5.2 VNNI/dpbusd 数值错误（Portable 分发必剪除）
-
-- **AVX512*VNNI / AVX*VNNI 版 Q8×Q8 内核在本模型上数值错误**（短 conf **0.1222** vs 正确 **0.2769**）。
-- 因此，`GGML_CPU_ALL_VARIANTS` 便携分发**必须剪除 VNNI dll**：
-  `ggml-cpu-{cascadelake,icelake,alderlake}.dll`（其余保留 `x64,sse42,sandybridge,haswell,skylakex,cannonlake`）。
-- 这是 Q8×Q8 dpbusd 路径在本模型上的**架构性属性**，非调参问题——无条件剪除。这与 `F.24` 的 Q8×Q8 dpbusd 失败一致。
-
-### 5.3 近并列高度敏感（near-tie sensitivity）
-
-- 分类器的**尖锐线性头 + 残差网络**意味着任何近似优化（SILU/SwiGLU 激活稀疏、LCP/前缀复用、低秩）都会在近并列处
-  **翻转选择**（例：`产线产能 0.353 vs 投资 0.356`）。在严守位一致红线的前提下，**没有任何一个近似方向可交付**。
-
-### 5.4 前缀/LCP 复用 与 吞吐批处理（同 state 合并）≈ 零真实收益
-
-- **LCP/前缀复用**：实测技术上可行，但真实流量下 ROI≈0（不同 state 仅共享 \~8% 前缀）；更深入的前缀槽设计
-  **破坏位一致**（batch 宽度数值依赖），均已回退（F.24 §9.4/§9.5/§9.6）。
-- **同 state 批处理（吞吐）**：批宽合并在计算受限下**无权重读复用收益**，实测 req/s 几乎无提升（\~3.07 vs 2.97），
-  且合并 >512 token 会触发 `n_batch` 断言——已回退（F.24 §11）。
-
-### 5.5 主机稳定性发现
-
-- 在开发机上，**持续请求负载下偶发堆损坏 / fast-fail**（疑为内存压力；无调试器可用以根因定位）。
-- 这**阻塞了对共享库 / 便携构建的完整负载验证**（见 `docs/portable_backend_deployment.md` §7）。
-
-### 5.6 便携后端 / GPU（Vulkan）现状与边界
-
-- **CPU：稳定、逐位一致。** 进程内 `cpu` 后端与可插拔 `kev-backend-cpu.dll` 共用同一份 llama，位一致得以保持。
-- **Vulkan：已实现，但未做完整负载与数值终验。** `kev-backend-vulkan.dll`（GGML\_VULKAN）可在本机（AMD iGPU gfx1151 + Windows 驱动）启动并接管推理，快速使用见 [§7](#7-vulkan-快速使用vulkan-quick-start)。保留诚实边界：Vulkan 路径的**逐位一致性 / 长时间负载稳定性尚未在生产负载下终验**。
-- **HIP/ROCm GPU：扩展点**。`--backend gpu/cuda` 需要 GGML\_HIP 专用构建（`KEV_BUILD_BACKEND_GPU=ON` + hipcc/clang）；在本机 ROCm 会话因 HIP/HSA blit 初始化崩溃（`0xC0000005`）而不默认启用，故以 Vulkan 作为本机 GPU 路径。
-- 便携 CPU 分发仍需**剪除 VNNI dll**（见 §5.2）。
-
----
-
-## 6. 场景 / 依赖 / 环境要求（Usage, Dependencies, Requirements）
-
-### 6.1 运行
+### 2.1 构建
 
 ```bash
-# 构建（CMake ≥ 3.21，MSVC 2022 Release/x64 或 GCC/Clang）
+# 依赖：CMake >= 3.21 + C++17 工具链（MSVC 2022 / GCC 14 / Clang）
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-
-# 运行服务（默认 CPU 后端）
-./build/bin/Release/kevcpp.exe \
-    --model models/kev-merged-q8.gguf \
-    --head  models/head.bin \
-    --port 8008 \
-    --threads 16
+cmake --build build --config Release -j
+# 产物: build/bin/Release/kevcpp(.exe)
 ```
 
-### 6.2 接口
+GPU 后端在独立构建目录编译（`n_gpu_layers=-1` 整模型 offload）：
 
-- **POST `/v1/systemone`**：与 kev 相同的 JSON schema（`state` + `questions`），见 `tests/*.json` fixtures
-  （`tmp_a_company.json` 短请求、`tmp_long_state_request.json` 长请求）。
-- **GET `/v1/models`**：模型/后端信息（含 `backend_name`/`device`/`version`，portable 分支）。
+```bash
+# CUDA（Linux，RTX 5090 / sm_120，CUDA 12.8）
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
+  -DKEV_BUILD_BACKEND_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build-cuda --config Release -j
+# 产物: build-cuda/kev-backend-cuda.so（dlopen 查找 libkev-backend-cuda.so，需符号链接或重命名）
+```
 
-### 6.3 主要 CLI 选项
+```powershell
+# Vulkan（Windows，AMD iGPU，无需 ROCm/HIP）
+cmake -S . -B build\vulkan-exp -G "Visual Studio 17 2022" -A x64 `
+  -DKEV_BUILD_BACKEND_VULKAN=ON -DGGML_NATIVE=ON
+cmake --build build\vulkan-exp --config Release
+```
+
+### 2.2 运行
+
+```bash
+# CPU 后端（默认）
+./build/bin/kevcpp --model Qwen3.5-4B-Q6_K.gguf --port 8008
+
+# CUDA 后端（把 kev-backend-cuda.so 置于可搜索路径）
+export LD_LIBRARY_PATH=./build-cuda:$LD_LIBRARY_PATH
+./build/bin/kevcpp --model Qwen3.5-4B-Q6_K.gguf --port 8008 --backend cuda
+
+# Vulkan 后端（Windows，kev-backend-vulkan.dll 与 exe 同目录）
+build\bin\Release\kevcpp.exe --model Qwen3.5-4B-Q6_K.gguf --port 8008 --backend vulkan
+```
+
+接口：
+
+- **POST `/v1/systemone`**：kev 相同的 JSON schema（`state` + `questions`），返回 `answers.decision`。
+- **GET `/v1/models`**：模型/后端信息（`backend_name`/`device`/`version`）。
+
+### 2.3 可用参数
 
 | 选项 | 说明 |
 | --- | --- |
-| `--model <gguf>` | 模型路径（必填，`kev-merged-q8.gguf`） |
-| `--head <bin>` | PointerHead `.bin` 路径 |
+| `--model <gguf>` | 模型路径（必填） |
 | `--host ip` / `--port p` | 监听地址/端口（默认 `127.0.0.1:8008`） |
+| `--backend <name>` | `cpu`（默认）/ `cuda` / `vulkan`（需对应后端插件） |
 | `--threads N` / `-t N` | 计算线程（0/未设 = 自动探测，上限 32） |
-| `--ctx N` | 上下文大小（默认 **8192**；短 state 可用 2048） |
-| `--lru N` | 状态缓存 slot 数（默认 2） |
-| `--prewarm <file>` | 启动预热一个 state（读原文、prefill 进 LRU，可选） |
-| `--backend <name>` | 推理后端：`cpu`（默认）；`vulkan`（需 `kev-backend-vulkan.dll`，见 [§7](#7-vulkan-快速使用vulkan-quick-start)）；`gpu`/`cuda` 为 HIP/ROCm 扩展点（需专用构建） |
+| `--ctx N` | 上下文大小（默认 8192；长输入可调大） |
+| `--max-concurrency N` | 最大并发（默认 8） |
+| `--prefix-capacity N` | 全局前缀 KV 缓存槽数 |
+| `--n-batch N` / `--n-ubatch N` | 批处理大小（默认 512 / 256） |
+| `--gpu-layers N` | GPU offload 层数（GPU 后端默认 -1 全部） |
+| `--decide-config <json>` / `--decide-token <t>` | 决策配置 / 决策 token |
+| `--moe-mode <m>` | MoE 专家模式 |
+| `--lora <gguf>` / `--lora-scale f` / `--temperature f` | LoRA 叠加 / 采样温度 |
+| `--opt-end <tok>` | 可选结束 token |
+| `--kev-probe-cpu-variant <dll>` | 内部：KAT 探测子进程模式（勿手动使用） |
+| `--quiet` | 静默日志 |
 
-> `--backend vulkan` 需要单独的 `GGML_VULKAN` 构建目录生成的 `kev-backend-vulkan.dll`（默认 CPU 构建目录不含 GPU/Vulkan 库），见 [§7](#7-vulkan-快速使用vulkan-quick-start)。
+环境变量：
 
-### 6.4 依赖
-
-- **CMake ≥ 3.21**
-- **C++17 工具链**（MSVC 2022 / GCC / Clang）
-- **vendored llama.cpp**（`third_party/`，无需外部下载）
-- cpp-httplib、nlohmann/json（vendored，编译期使用）
-
-### 6.5 环境要求
-
-- 操作系统：**Windows**（已测）/ **Linux**（可接受）。
-- CPU 指令集：**AVX2+ 保证正确性**；**AVX-512 以获得预期性能**（当前主构建为 `GGML_NATIVE`，故默认硬性要求 AVX-512）。
-- 内存：默认 `n_ctx=8192` 下约 **\~1.4 GB 起步**（模型 \~0.7 GiB + KV \~0.34 GiB + 计算缓冲 \~0.24 GiB）。
-  更大的输入可提高 `n_ctx` / `n_seq_max`。
+| 变量 | 说明 |
+| --- | --- |
+| `KEV_CPU_VARIANT` | CPU 变体选择：`auto`（默认，KAT 自动门控）/ `off` / `<tag>`（强制指定，仍经 KAT） |
+| `KEV_BINARY_SCORING` / `KEV_BINARY_LETTER` | letter 二分打分模式（基准测试使用） |
 
 ---
 
-## 7. Vulkan 快速使用（Vulkan Quick Start）
-
-> Vulkan 后端把**整个模型 offload 到 Vulkan 设备**（`n_gpu_layers=-1`，等价于 llama.cpp `-ngl -1`），走 Windows
-> 原生 Vulkan 加载器 + GPU 驱动，**不需要 ROCm/HIP**。本机验证平台：AMD Ryzen AI MAX+ PRO 395（iGPU gfx1151，
-> 统一内存）+ Vulkan SDK `D:\SDK\Vulkan\1.4.363.0` + AMD Windows 驱动。
-
-Vulkan 需要**两份产物**：`kevcpp.exe`（llama-free 宿主）与 `kev-backend-vulkan.dll`（GGML\_VULKAN 后端插件）。
-
-### 7.1 构建 Vulkan 后端 dll
-
-CPU 主构建目录默认不含 GPU/Vulkan 库（`KEV_BUILD_BACKEND_VULKAN` 保持 OFF，见 `scripts/build.ps1` 注释）。
-Vulkan 后端在一个**独立的 GGML\_VULKAN 构建目录**中用纯 MSVC 编译：
-
-```powershell
-# 前置：VULKAN_SDK 指向已安装的 Vulkan SDK（含 Bin\glslc.exe）
-#   $env:VULKAN_SDK = "D:\SDK\Vulkan\1.4.363.0"
-powershell -ExecutionPolicy Bypass -File build\vulkan-exp\build_vulkan.ps1 [-Clean] [-Config Release]
-```
-
-脚本内部等价于（如需手动复现）：
-
-```powershell
-# 配置独立 build 目录（GGML_VULKAN 由 -DKEV_BUILD_BACKEND_VULKAN=ON 打开）
-cmake -S . -B build\vulkan-exp\vulkan-build `
-  -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release `
-  -DKEV_BUILD_BACKEND_VULKAN=ON -DGGML_NATIVE=ON `
-  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DBUILD_SHARED_LIBS=OFF
-
-# 只构建 Vulkan 后端插件（single-node msbuild）
-msbuild build\vulkan-exp\vulkan-build\kev-backend-vulkan.vcxproj /p:Configuration=Release
-```
-
-产物落盘于 `build\vulkan-exp\vulkan-build\bin\Release\kev-backend-vulkan.dll`。
-
-### 7.2 构建宿主 kevcpp.exe
-
-`kevcpp.exe` 是不链接 llama 的宿主（`KEV_BACKEND_USE_DLL`），在**默认 CPU 构建目录**构建即可：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1 [-Config Release]
-# 产物: build\bin\Release\kevcpp.exe（main_server 目标，OUTPUT_NAME=kevcpp）
-```
-
-> 依赖链：因为插件通过 C ABI（`kev_backend.h`）加载，宿主与后端 dll 不必在同一构建目录编译，但两者的
-> `kev_backend.h` ABI 必须来自同一版本（工厂会校验 `abi_version` 与 `ops.struct_size`）。
-
-### 7.3 运行（Vulkan 后端）
-
-把 `kev-backend-vulkan.dll` 放到宿主 exe 同目录（或 PATH 可搜索的位置），用 `--backend vulkan` 启动：
-
-```powershell
-# 例：把 dll 拷到 exe 旁
-Copy-Item build\vulkan-exp\vulkan-build\bin\Release\kev-backend-vulkan.dll build\bin\Release\
-
-# 以 Vulkan 后端启动（overload 整个模型到 GPU）
-build\bin\Release\kevcpp.exe `
-    --model   models\kev-merged-q8.gguf `
-    --head    models\head.bin `
-    --port    8008 `
-    --backend vulkan
-
-# CPU 后端对比（默认，无需 dll）
-build\bin\Release\kevcpp.exe --model models\kev-merged-q8.gguf --head models\head.bin --port 8008 --backend cpu
-```
-
-启动日志会打印后端身份，例如：
-`kevcpp using backend 'vulkan' (device=vulkan, ver=kev-backend-vulkan-0.1-static-ggml-vulkan)`。
-`GET /v1/models` 的 `backend_name/device/version` 亦会同步返回。
-
-验证请求：
-```powershell
-curl.exe --data-binary "@tests/tmp_a_company.json" http://127.0.0.1:8008/v1/systemone
-```
-
-### 7.4 Vulkan 后端说明与边界
-
-- 后端实现见 `src/kev_backend_vulkan.cpp`，是对 CPU 后端（`kev_backend_cpu.cpp`）的镜像，差别仅在
-  `n_gpu_layers=-1`（整模型 offload）与 `meta.device = "vulkan"`。
-- 仅选项里勾了 `--backend vulkan` 时才会加载 `kev-backend-vulkan.dll`；否则宿主只加载 CPU 后端，Vulkan 库不参与。
-- **诚实边界**：Vulkan 路径的逐位一致性与长负载稳定性尚未生产终验；端口/线程/ctx 参数与 CPU 后端一致。
-- 本机为何选 Vulkan 而非 ROCm/HIP：AMD iGPU gfx1151 在普通 ROCm 会话中 HIP/HSA blit 初始化崩溃
-  （`Creating the executable from ISA assembly text failed / Couldn't create blit kernels!`），Vulkan 经
-  Windows 图形驱动原生栈可正常枚举设备（见 `build\vulkan-exp\hip_linkage_verify.md` 根因）。
-
----
-
-## 8. 架构说明（Architecture）
-
-### 8.1 分层（两栈：CPU 进程内 + 可插拔 dll）
-
-```
-┌────────────────────────────── kevcpp（编排层，宿主 = kevcpp.exe）──────────────┐
-│ (a) main_server.cpp   HTTP 层（cpp-httplib），服务 systemone schema；（产物名 kevcpp.exe）│
-│ (b) KevModel          kev_model.cpp/h —— 编排：LLM ctx 拥有、encode、        │
-│      kev_prefix.cpp   状态 LRU 前缀缓存、kev_head.cpp PointerHead 读出头、   │
-│      kev_encode.cpp   每问分叉 decode/批量、compute_mutex_ 串行共享 ctx      │
-│      kev_backend_factory.cpp  可插拔后端工厂：--backend cpu|vulkan 选择        │
-├────────────── 边界：kev_backend.h C-ABI（meta/params/ops，无 llama 类型）──────┤
-│     宿主 KEV_BACKEND_USE_DLL（llama-free）只经 kev::Backend* 调用算子；        │
-│     后端是进程内唯一的 llama/ggml 链接方（single-llama rule）                  │
-├────────────── vendored llama.cpp / GGML（只在后端模块内链接）────────────────┤
-│ (c) 混合 GDN+attention graph、Q8_0 内核、KV/recurrent 缓存、qwen35.cpp（24 层）│
-│ (d) kev_backend{_cpu,_vulkan}.cpp  —— C-ABI 实现：                             │
-│     cpu 后端    := 进程内（默认）或 kev-backend-cpu.dll                        │
-│     vulkan 后端 := kev-backend-vulkan.dll（GGML_VULKAN，n_gpu_layers=-1）      │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 8.2 模块职责
-
-- **(a) `main_server.cpp`**：`/v1/systemone` 的 HTTP 层（cpp-httplib），参数解析，串/并；**llama-free**，
-  经 `kev::Backend*` 调用后端算子；产物为 `kevcpp.exe`。
-- **(b) `KevModel`（`kev_model.cpp/h`）**：编排核心。
-  - LLM 上下文（ctx）拥有与生命周期；
-  - `kev_encode.cpp` 组装请求（`encode` → `KevEnc` → `KevRows`）；
-  - `kev_prefix.cpp` 状态 LRU 前缀缓存（同 state 二次请求命中）；
-  - `kev_head.cpp` `PointerHead` 读出头（`d=1024 → dp=256`，`k(h_opts)·q(h_decide)*scale`）；
-  - 每问分叉（branch）decode / 批量（`rows_from_slot` / `decode_batch`）；
-  - `compute_mutex_` 串行化所有共享 ctx 的计算段（多流安全）。
-- **`kev_backend.h` / `kev_backend_factory.cpp`（C-ABI 与工厂）**：定义 `meta/params/ops`（无 llama 类型、
-  ABI 版本化、ops 表只追加不重排）；`BackendFactory_load(name)` 负责选后端——CPU（进程内或 `kev-backend-cpu.dll`）
-  与 Vulkan（`kev-backend-vulkan.dll`）经 dll/符号动态加载。
-- **(c) vendored llama.cpp / GGML 后端**：混合 GDN+attention graph、Q8\_0 内核、KV/recurrent 缓存；仅在后端 dll
-  （或进程内 CPU 后端）中链接，宿主不链接 llama。
-- **(d) 后端实现（`kev_backend_cpu.cpp` / `kev_backend_vulkan.cpp`）**：实现 C-ABI 的算子面
-  （init / decode_seq / decode_batch / read_hidden / seq_clear / seq_copy / 尺寸 / tokenizer 委托）。
-  Vulkan 后端用 `n_gpu_layers=-1` 把整模型 offload 到 Vulkan 设备；CPU 后端与静态单 llama 一致 → 位一致保留。
-
-### 8.3 数据流
+## 3. 原理简介（How It Works）
 
 ```
 parse（/v1/systemone JSON）
-   → encode（state + branch 组装为 token 序列；经后端 tokenizer 委托）
-   → ensure_state（LRU：命中跳过 state prefill / 未命中 prefill 到 slot）
-   → rows_from_slot（branch decode，在 decide / option 位置读取 hidden）
-   → PointerHead（kev_head.cpp）
-   → probabilities（softmax z/T）
+   → encode（state + question 渲染为 token 序列）
+   → 前缀 KV 缓存（全局前缀命中则跳过 state prefill）
+   → 一次 prefill 前向
+   → selected LM head：只对决策位置读取 A/B/C/D… 有限几个 letter token 的 logits
+   → softmax → 概率 → answers.decision
 ```
 
-> 构建形态差异：默认 `scripts/build.ps1` 产**单个静态** `kevcpp.exe`（CPU 后端进程内链接）；
-> Vulkan（以及生产便携）态则让宿主 `KEV_BACKEND_USE_DLL` 只加载后端 dll、自身不链接 llama
-> （single-llama rule，见 `docs/portable_backend_deployment.md`）。
+- **单次前向决策**：多选题把全部候选渲染进同一 prompt，**一次 prefill** 同时拿到所有选项 letter 的 logits——
+  不需要像逐候选打分那样跑 N 次前向。
+- **selected LM head 剪枝**：决策只依赖词表中极少几个 letter token 的概率，只计算这些行的 lm\_head 投影
+  （`letter scoring via cached A..Z rows`，`09718b0`），跳过全词表（151k×hidden）投影。
+- **全局前缀 KV 缓存**：跨请求复用共享 state 前缀的 KV cache（`--prefix-capacity`），命中时只增量 prefill。
+- **混合架构模型**：Qwen3.5 系（Gated-DeltaNet 循环层 + 全注意力层混合，`src/models/qwen35.cpp`），
+  稳态每请求恰好一次 `llama_decode`。
+- **可插拔后端 C-ABI**（`kev_backend.h`）：宿主 `kevcpp` 不链接 llama（llama-free），经版本化 ABI 加载
+  CPU/CUDA/Vulkan 后端插件（single-llama rule）。
+- **运行时 CPU 变体选择 + KAT 门控**（v0.7.0，`8f27b4e`）：启动时枚举全部 `ggml-cpu-*` 变体，按 cpuid 分数降序
+  在子进程跑 GEMM 数值自检（KAT），与 x64 标量参考比对通过者才启用——数值错误的 VNNI 变体被自动拒绝。
 
 ---
 
-## 9. 模型 / HF Hub（Model & HuggingFace）
+## 4. 与 kev / llm2jev 的对比定位
 
-> **重要**：本项目使用的 0.8B 模型**不是现成的 Qwen-0.8B**，而是本项目**自有的、经改造/定制（modified / customized）
-> 的 0.8B 变体**。
-
-### 9.1 模型规格（已核实）
-
-- **结构**：24 混合层 = **18 层 Gated-DeltaNet（循环）+ 6 层全注意力（第 3、7、11、15、19、23 层）**。
-- `n_embd = 1024`
-- FFN：`1024 → 3584`（`ffn_up/gate [1024,3584]`，`ffn_down [3584,1024]`）
-- `ssm_d_inner = 2048`（`ssm_out [2048,1024]`）
-- `ssm_d_state = 128`、`ssm_n_group = 16`
-- `vocab = 248320`，`token_embd` 与 `output` **tied（共享）**（lm*head tied，`output_norm` 独立 F32）*\_head tied，`output_norm` 独立 F32）
-- 权重导出为 **GGUF（Q8\_0，约 774 MiB）**：`models/kev-merged-q8.gguf`
-- 外加独立的 **PointerHead**：`models/head.bin`（约 2 MiB）
-
-### 9.2 HF Hub（待上传）
-
-本项目计划将模型上传到 **Hugging Face Hub**（huggingface.co）。
-
-- **TODO（占位，待你填写）**：仓库 ID / 链接为
-  `https://huggingface.co/<your-hf-id>/<repo>`，**当前未上传，具体 ID/链接待定**。
-- 上传时会包含：**GGUF 权重**（`kev-merged-q8.gguf`）、**PointerHead**（`head.bin`）以及必要的模型卡片说明。
+| 维度 | kev（Python） | llm2jev（Python + SGLang/MLX） | **kevcpp** |
+| --- | --- | --- | --- |
+| 语言/形态 | Python 服务 | Python 编排 + 外部推理引擎 | **单一 C++ 进程（编排+推理）** |
+| 推理内核 | 自带（Python） | SGLang（CUDA）/ MLX（Metal） | vendored llama.cpp（CPU/CUDA/Vulkan） |
+| 多候选打分 | - | 每候选独立 prompt，N 次 prefill（RadixCache 缓解） | **单 prompt 一次 prefill，一次读全部选项 logits** |
+| lm\\_head | - | 最后位置全词表投影后 gather | **selected rows：只算 letter 行** |
+| 依赖 | Python runtime | Python + SGLang/flashinfer 全家桶 | **零外部运行时依赖** |
+| 部署 | - | 需装引擎+GPU 栈 | 单 exe + 后端 so/dll，复制即用 |
+| 平台 | - | Linux(NV GPU) / Apple Silicon | **Windows + Linux；CPU/CUDA/Vulkan** |
+| JevBench 4B | 66.2%（4B）/ 71.4%（8B） | 76.2% | **76.6%** |
 
 ---
 
-## 相关文档（Docs）
+## 5. 创新与优势（Innovations & Advantages）
 
-- `docs/F.24_Q8_DOTBUS_FAIL_AND_F16_PIVOT.md` — 权威性能/实验日志：稳态数值、优化结果、证伪方向、VNNI/dpbusd 发现、compute-bound 结论。
-- `docs/portable_backend_deployment.md` — 可插拔后端 C-ABI / 便携构建计划 + VNNI 剪除规则 + single-llama rule。
-- `CHANGELOG.md` — 版本变化记录（含本次：kevcpp.exe 改名、Vulkan 后端新增、架构演进）。
-- `logs/perf_authoritative_baseline.md` — 逐 op 权威预算基线。
+相对 **kev**：
+
+1. **C++ 原生重实现，无 Python runtime/GIL**：单请求开销与内存占用大幅降低；模块化（HTTP 层 / 编排层 / 后端层
+   C-ABI 边界）同时保持与 kev 参考的行为/输出一致性。
+2. **准确率反超**：kev 4B 66.2% → kevcpp 同模型系 4B **76.6%**（+10.4pt），说明工程化前向（量化/缓存/letter
+   打分路径）没有损失、反而稳定复现了模型能力。
+3. **状态前缀 LRU + 全局前缀 KV 缓存**：重复 state 跳过 prefill，稳态每请求只一次 decode。
+
+相对 **llm2jev**：
+
+1. **单进程零依赖**：llm2jev 需 Python + SGLang（及其 flashinfer/CUDA graph 全家桶）或 MLX；kevcpp 是一个 exe +
+   后端插件，复制即部署，嵌入成本近零。
+2. **单次前向多选项**：llm2jev 的 yes/no 逐候选打分对 N 个候选要 N 个 prompt（靠 RadixCache 缓解为增量 prefill）；
+   kevcpp 把候选合并进单 prompt，**一次 prefill 同时取得全部选项概率**，算法上更省。
+3. **selected LM head 剪枝**：只计算决策所需 letter 行的 lm\_head 投影，跳过 151k 全词表投影与 gather。
+4. **运行时 ISA 变体 KAT 门控**（独有）：多 ISA 分发不再依赖手工剪枝——启动时数值自检自动拒绝错误内核
+   （VNNI bug 在 Win/Linux 均复现并均被 KAT 拦截），可安全地把全部 CPU 变体一起分发。
+5. **跨平台三后端**：同一 ABI 下 CPU/CUDA/Vulkan 可插拔，覆盖 Windows（AMD iGPU Vulkan）与 Linux
+   （9950X CPU / RTX CUDA），llm2jev 不支持 Windows/AMD iGPU 路径。
+6. **确定性**：CUDA 后端多次复测逐题 0 差异，利于回归测试与结果审计。
+
+---
+
+## 版本与变更（Versions & Changelog）
+
+- 本仓库为**发版仓库**：只包含已确定的发布版本内容；研发过程、实验记录与调研材料保留在 kevcpp 研发仓库
+  （`E:\van\projects\kevcpp`），确认发版后才同步到此处。
+- 当前版本：`v0.7.0-cpu-runtime-kat`（运行时 CPU 变体选择 + KAT 门控）。
+- 历史版本：`v0.6.0-cuda-backend`（CUDA 后端）；`v0.5.1-letter-selected-rows`（letter + selected-head 基线）；
+  `v0.5.0-letter-logit`；`v0.4.0-binary-prefix-reuse`；`v0.3.0-logist`。
+- `CHANGELOG.md` — 版本变化记录。
 
 ---
 
 ## 许可 / 说明（License / Notes）
 
-（TODO：项目许可证待定。kevcpp 仅引用与本仓库使用的 vendored llama.cpp 与 kev（`E:\van\projects\kev`）
-的参考行为，两者的许可以其各自上游为准。）
+（项目许可证待定。kevcpp 引用的 vendored llama.cpp 许可以其上游为准；kev 与 llm2jev 为独立项目，
+本文仅作学术/工程对比引用。）
