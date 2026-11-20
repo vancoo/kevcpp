@@ -19,6 +19,7 @@
 // to prefix them to kev_backend_cuda_*.
 #include "kev_backend.h"
 
+#include "kev_backend_dynload.h"
 #include "kev_backend_moe.h"
 #include "kev_chat_data.h"
 
@@ -163,6 +164,13 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
 
     // Host is llama-free; log filter installed here inside the single-llama module.
     llama_log_set(kev_cuda_log_filter, nullptr);
+
+    // Registry may already be non-empty (e.g. a CPU-variant pre-registration),
+    // which makes llama_backend_init() skip ggml_backend_load_all() and
+    // silently miss the ggml-cuda library. Explicitly load it so the CUDA
+    // device is registered (see kev_backend_dynload.h). No-op when a GPU
+    // device is already registered.
+    kev_dynload::ensure_gpu_backend("cuda", "ggml_backend_cuda_reg");
 
     // CUDA backend: offload 层数由参数决定(默认 -1 = all layers to GPU, 与 legacy 一致)。
     // Under a GGML_CUDA build, n_gpu_layers < 0 steers the whole model onto the

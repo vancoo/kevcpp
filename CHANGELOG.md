@@ -11,6 +11,29 @@
 
 ---
 
+## [0.7.1] — 2026-11-20
+
+### Fixed
+
+- **修复 Windows 包 Vulkan 后端静默回退 CPU 的严重 bug**（v0.7.0 回归）：
+  - 根因：v0.7.0 的 CPU 变体 KAT 探测在 GPU 插件初始化前通过 `ggml_backend_load()`
+    预注册了 `ggml-cpu-*.dll`，使后端 registry 非空；而 `llama_backend_init()` 只在
+    registry 为空时才调用 `ggml_backend_load_all()`（`third_party/llama.cpp/src/llama.cpp`），
+    导致随包分发的 `ggml-vulkan.dll` 永不被发现、`vulkan-1.dll` 永不加载，模型全部落在
+    CPU 上且无任何告警（实测 GPU 引擎零活动）。
+  - 修复：新增 `src/kev_backend_dynload.h`，在 Vulkan/CUDA 插件 `llama_backend_init()`
+    之后若无已注册 GPU 设备，则显式 `LoadLibrary`/`dlopen` GPU 库、解析 reg getter
+    （`ggml_backend_vk_reg` / `ggml_backend_cuda_reg`）并 `ggml_backend_register()` 注册
+    （本构建布局下 GPU 库导出 reg getter 而非 `ggml_backend_init`，故不能用
+    `ggml_backend_load()`）；已注册 GPU 设备时为 no-op，失败时给出明确告警而非静默降级。
+  - `kev_backend_vulkan.cpp` / `kev_backend_cuda.cpp` 接入该 helper；未来 Windows CUDA
+    构建同样免疫。
+  - 实测（AMD Radeon 8060S iGPU，Gemma E2B IQ4_XS，JevBench 231 题）：
+    GPU offload 恢复生效，P50 1.003s → 0.204s（~5×），P95 11.91s → 2.27s，
+    正确率 145/231 → 146/231（数值路径差异）。
+
+---
+
 ## [未发布]（build-portable-backends 分支，HEAD `d961b1c`）
 
 > 本版本围绕**可插拔后端**落地：把 HTTP 服务端产物统一命名为 `kevcpp.exe`，并新增 Vulkan 后端插件，

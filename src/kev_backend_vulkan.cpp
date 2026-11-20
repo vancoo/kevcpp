@@ -24,6 +24,7 @@
 // to prefix them to kev_backend_vulkan_*.
 #include "kev_backend.h"
 
+#include "kev_backend_dynload.h"
 #include "kev_backend_moe.h"
 #include "kev_chat_data.h"
 
@@ -168,6 +169,13 @@ int op_init(kev_backend_t * b, const kev_backend_params * p, char * err, size_t 
 
     // Host is llama-free; log filter installed here inside the single-llama module.
     llama_log_set(kev_vulkan_log_filter, nullptr);
+
+    // Registry may already be non-empty (e.g. the Windows CPU-variant KAT
+    // pre-registration), which makes llama_backend_init() skip
+    // ggml_backend_load_all() and silently miss the ggml-vulkan library.
+    // Explicitly load it so the Vulkan device is registered (see
+    // kev_backend_dynload.h). No-op when a GPU device is already registered.
+    kev_dynload::ensure_gpu_backend("vulkan", "ggml_backend_vk_reg");
 
     // Vulkan backend: offload 层数由参数决定(默认 -1 = all layers to GPU, 与 legacy 一致)。
     // Under a GGML_VULKAN build, n_gpu_layers < 0 steers the whole model onto the
