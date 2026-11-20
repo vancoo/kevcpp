@@ -32,7 +32,7 @@ JevBench 231 道公开题（easy/hard/original），letter 决策模式。
 | **kevcpp** | Qwen3.5-4B Q6\\_K | **76.6%**（177/231） |
 | LLM2Jev | Qwen3.5-4B | 76.2% |
 | **kevcpp** | Qwen3.5-2B Q8\\_0 | 65.8%（151/231） |
-| **kevcpp** | Gemma E2B IQ4\\_XS（Vulkan） | 63.2%（146/231） |
+| **kevcpp** | Gemma E2B IQ4\\_XS | 63.2%（146/231） |
 | jev-local | Qwen3.5-9B | 74.9% |
 | kev（research preview） | 8B | 71.4% |
 | kev（research preview） | 4B | 66.2% |
@@ -107,10 +107,10 @@ JevBench 231 题按题型分为 **choice**（多选一，139 题）、**noul**�
 
 ### 1.4 跨模型族验证：Gemma E2B（Win / Vulkan）
 
-用 **Gemma E2B it（IQ4_XS，2.8 GB）** 验证 kevcpp 决策管线对非 Qwen 架构的可用性
+用 **Gemma E2B it（IQ4\_XS，2.8 GB）** 验证 kevcpp 决策管线对非 Qwen 架构的可用性
 （Win / Vulkan，Strix Halo iGPU，v0.7.1）：
 
-| 指标 | Vulkan（GPU，v0.7.1 修复后） | 同机 CPU 对照 |
+| 指标 | Vulkan | 同机 CPU 对照 |
 | --- | ---: | ---: |
 | 正确 | **146/231（63.2%）** | 145/231（62.8%） |
 | P50 | **0.204s** | 1.003s |
@@ -121,20 +121,20 @@ JevBench 231 题按题型分为 **choice**（多选一，139 题）、**noul**�
 | family | 正确/题数 | family | 正确/题数 |
 | --- | --- | --- | --- |
 | fact | 12/12 | ordinal | 11/12 |
-| tool_selection | 12/12 | routing | 8/12 |
-| routing_hard | 5/5 | multi_hop | 8/18 |
-| intent | 22/24 | long_policy | 8/19 |
+| tool\\_selection | 12/12 | routing | 8/12 |
+| routing\\_hard | 5/5 | multi\\_hop | 8/18 |
+| intent | 22/24 | long\\_policy | 8/19 |
 | extraction | 20/24 | policy | 6/12 |
 | adequacy | 9/12 | trap | 6/8 |
-| judge_hard | 9/17 | adversarial | 4/6 |
-| temporal_numeric | 1/15 | probability | 2/10 |
+| judge\\_hard | 9/17 | adversarial | 4/6 |
+| temporal\\_numeric | 1/15 | probability | 2/10 |
 | ambiguous | 2/7 | tradeoff | 1/6 |
 
 要点：
 
 - **管线对非 Qwen 架构同样可用**：Gemma E2B 单次决策 63.2%，接近同量级 Qwen 2B（65.8%），
   无需改动任何模型相关代码。
-- **GPU/CPU 准确率一致（±1 题）**，延迟差距 ~5×，与 §1.2 各后端规律相符。
+- **GPU/CPU 准确率一致（±1 题）**，延迟差距 \~5×，与 §1.2 各后端规律相符。
 - 优势题型（fact/tool_selection/routing_hard 满分）与短板题型（temporal_numeric/probability）
   与 Qwen 系分布不同，属模型能力差异，非管线问题。
 
